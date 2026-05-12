@@ -1,0 +1,21 @@
+[package]
+name = "aura"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aura"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_tests"
+path = "src/bin/gen_tests.rs"
+
+[dependencies]
+foster-core   = { path = "../../crates/foster-core" }
+foster-server = { path = "../../crates/foster-server" }
+foster-testgen = { path = "../../crates/foster-testgen" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tower-http = { version = "0.5", features = ["fs"] }

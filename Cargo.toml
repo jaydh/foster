@@ -6,6 +6,7 @@ members = [
     "examples/counter",
     "examples/player",
     "examples/kanban",
+    "examples/aura",
 ]
 # foster-client is wasm-only — build it separately with wasm-pack
 exclude = ["crates/foster-client"]

@@ -29,6 +29,7 @@ features = [
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
+    "DomTokenList",
     "Node",
     "NodeList",
     "Request",

@@ -50,6 +50,7 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) {
     apply_fx_disable(root, &snap.state);
     apply_fx_state_label(root, &snap.state);
     apply_fx_value(root, &snap.context);
+    apply_fx_class(root, &snap.state);
     apply_fx_for(document, root, &snap.context);
 }
 
@@ -100,6 +101,28 @@ fn apply_fx_state_label(root: &Element, state: &str) {
     for i in 0..els.length() {
         let el: Element = els.item(i).unwrap().dyn_into().unwrap();
         el.set_text_content(Some(state));
+    }
+}
+
+/// `fx-class="calm:gentle energized:vivid"` — toggle CSS classes based on state.
+///
+/// Space-separated pairs of `state:classname`. Adds the class when active, removes it otherwise.
+fn apply_fx_class(root: &Element, state: &str) {
+    let els = root.query_selector_all("[fx-class]").unwrap();
+    for i in 0..els.length() {
+        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+        let attr = el.get_attribute("fx-class").unwrap_or_default();
+        let class_list = el.class_list();
+        for pair in attr.split_whitespace() {
+            let mut parts = pair.splitn(2, ':');
+            if let (Some(st), Some(cls)) = (parts.next(), parts.next()) {
+                if st == state {
+                    let _ = class_list.add_1(cls);
+                } else {
+                    let _ = class_list.remove_1(cls);
+                }
+            }
+        }
     }
 }
 
