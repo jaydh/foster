@@ -1,10 +1,17 @@
-# How Foster Works
+# Foster
 
-Three diagrams: architecture, runtime request cycle, and test generation.
+A Rust web UI framework where UI is a pure function of server-managed state.
+Designed so an LLM can write, test, and iterate on a full-stack app with no
+hidden state, no framework magic, and a Playwright suite generated automatically
+from the machine definition.
+
+See [`CLAUDE.md`](CLAUDE.md) for the full reference (architecture, API, DSL, deployment).
 
 ---
 
-## Architecture
+## How it works
+
+### Components
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -44,14 +51,11 @@ Three diagrams: architecture, runtime request cycle, and test generation.
 │       fx-on        → addEventListener → POST /trans.    │
 │       fx-for       → clone template per item            │
 │       fx-collect   → read input into payload            │
-│       …                                                 │
 │  5. On SSE snapshot → apply_snapshot_if_newer()         │
 └─────────────────────────────────────────────────────────┘
 ```
 
----
-
-## Runtime: what happens when you click a button
+### What happens when you click a button
 
 ```
 Browser                    foster-client (WASM)         foster-server
@@ -59,38 +63,28 @@ Browser                    foster-client (WASM)         foster-server
    │  click [fx-on="click->focus"]│                           │
    │─────────────────────────────►│                           │
    │                              │  POST /transition         │
-   │                              │  { machine:"aura",        │
-   │                              │    event:"focus",         │
-   │                              │    session:"abc123",      │
-   │                              │    payload:{} }  (msgpack)│
+   │                              │  { machine, event,        │
+   │                              │    session, payload }     │
    │                              │──────────────────────────►│
    │                              │                           │ machine.send("focus")
    │                              │                           │ → reducer(ctx, payload)
-   │                              │                           │ → new Snapshot {
-   │                              │                           │     state:"focused",
-   │                              │                           │     context:{...},
-   │                              │                           │     version: N+1 }
-   │                              │  Snapshot (msgpack) ◄─────│
-   │                              │◄──────────────────────────│
-   │                              │                           │ broadcast to SSE subscribers
-   │                              │  SSE: snapshot ◄──────────│ (same session)
-   │                              │◄──────────────────────────│
+   │                              │                           │ → Snapshot { state,
+   │                              │                           │     context, version }
+   │                              │◄──────────────────────────│ Snapshot (msgpack)
+   │                              │◄──────────────────────────│ SSE broadcast
    │                              │                           │
-   │                              │ apply_snapshot_if_newer() │
-   │                              │  data-fx-state="focused"  │
-   │                              │  fx-class buttons sync    │
-   │                              │  fx-text updates          │
+   │                              │  apply_snapshot_if_newer()│
+   │                              │  data-fx-state, fx-class, │
+   │                              │  fx-text all update       │
    │◄─────────────────────────────│                           │
    │  DOM updated (no reload)     │                           │
 ```
 
-**Version ordering:** `apply_snapshot_if_newer` drops any snapshot with `version ≤ current`,
-so out-of-order SSE messages can't roll state backwards. `restore()` (test injection) always
-increments version, so injected state always wins over any in-flight response.
+Version ordering prevents out-of-order SSE messages from rolling state backwards.
+The WASM client subscribes to SSE *before* the initial fetch, so test-injected
+state is never missed.
 
----
-
-## Testgen: machine definition → full Playwright suite
+### Test generation
 
 ```
 Machine definition (gen_tests.rs)
@@ -101,29 +95,50 @@ Machine definition (gen_tests.rs)
   ▼
 foster_testgen::generate()
   │
-  ├── injectState helper (with WASM bootstrap wait baked in)
-  │
   ├── Transition coverage  (1 test per directed edge)
-  │     inject source state → click [fx-on="click->EVENT"] → assert data-fx-state
+  │     inject source → click [fx-on="click->EVENT"] → assert data-fx-state
   │
-  ├── Multi-step walk  (1 test, greedy graph traversal)
-  │     at each step: pick transition to least-visited state
-  │     stops when every state visited ≥ 2×
-  │     catches: SSE ordering bugs, stale data-fx-state
+  ├── Multi-step walk  (1 test)
+  │     greedy walk visiting every state ≥2× in sequence
+  │     catches SSE ordering bugs and stale data-fx-state
   │
   ├── Rapid toggle pairs  (1 test per bidirectional pair)
-  │     find all (A→B, B→A) pairs (excluding self-loops)
-  │     ping-pong 4× each, assert state each step
-  │     catches: fx-class / animation sync bugs
+  │     ping-pong 4× per pair — catches fx-class sync bugs
   │
   └── Snapshot injection  (1 test per state)
-        POST /test/state → assert data-fx-state (sanity baseline)
+        POST /test/state → assert data-fx-state
   │
   ▼
-aura.spec.ts  (23 tests for a 4-state fully-connected graph)
-  12 edge  +  1 walk  +  6 toggle pairs  +  4 injection
+aura.spec.ts  (23 tests for 4 states, 12 edges)
 ```
 
-**Why no test IDs needed:** `[fx-on="click->EVENT"]` is the universal button locator and
-`data-fx-state` on the machine root is the universal assertion target. Both come from the
-framework, so testgen produces valid locators and assertions without reading the HTML.
+No test IDs needed. `[fx-on="click->EVENT"]` is the universal locator;
+`data-fx-state` is the universal assertion target. Both come from the framework.
+
+---
+
+## Quick start
+
+```bash
+# Build the WASM client
+./scripts/build-wasm.sh
+
+# Start all demos
+./scripts/demo.sh
+#   http://localhost:3000  counter
+#   http://localhost:3001  player
+#   http://localhost:3002  kanban
+#   http://localhost:3003  aura
+
+# Run tests for one example
+cd examples/aura && npx playwright test
+```
+
+## Examples
+
+| Example | Port | What it demonstrates |
+|---------|------|----------------------|
+| `counter` | 3000 | Minimal idle/error machine, increment/decrement |
+| `player`  | 3001 | 6-state media player, `fx-show` per state |
+| `kanban`  | 3002 | Multi-column board, `fx-for` list rendering |
+| `aura`    | 3003 | CSS animation showcase, `fx-class` state highlighting |
