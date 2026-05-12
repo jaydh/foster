@@ -13,21 +13,27 @@ const BASE_URL   = 'http://localhost:3000';
 const MACHINE_ID = 'counter';
 const ROOT       = `[fx-machine="${MACHINE_ID}"]`;
 
-/// Inject a snapshot server-side, then reload so the WASM client reflects it.
-/// Playwright retries the `toHaveAttribute` assertion until the WASM runtime
-/// has fetched and applied the snapshot (handles the async init race).
-async function injectAndReload(
+/// Inject a snapshot server-side.
+/// The WASM client subscribes to SSE — the server pushes the new snapshot
+/// immediately, so `page.reload()` is not needed.  The assertion waits up to
+/// 3 s for the SSE push to arrive and be applied to the DOM.
+///
+/// `data-fx-session` on the machine root carries the session ID that was
+/// assigned when the page loaded, so each test tab gets its own isolated state.
+async function injectState(
   request : APIRequestContext,
   page    : Page,
   state   : string,
   context : Record<string, unknown>,
   version = 0
 ): Promise<void> {
-  await request.post(`${BASE_URL}/test/state`, {
+  const root = page.locator(ROOT);
+  const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
+  await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
   });
-  await page.reload();
-  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', state);
+  // SSE delivers the snapshot without a reload.
+  await expect(root).toHaveAttribute('data-fx-state', state, { timeout: 3000 });
 }
 
 // ── transition coverage ─────────────────────────────────────────────────────
@@ -35,7 +41,7 @@ async function injectAndReload(
 
 test('counter | error →[recover]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'error', {"count":0});
+  await injectState(request, page, 'error', {"count":0});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -46,7 +52,7 @@ test('counter | error →[recover]→ idle', async ({ page, request }) => {
 
 test('counter | idle →[break_it]→ error', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'idle', {"count":0});
+  await injectState(request, page, 'idle', {"count":0});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -57,7 +63,7 @@ test('counter | idle →[break_it]→ error', async ({ page, request }) => {
 
 test('counter | idle →[decrement]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'idle', {"count":0});
+  await injectState(request, page, 'idle', {"count":0});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -68,7 +74,7 @@ test('counter | idle →[decrement]→ idle', async ({ page, request }) => {
 
 test('counter | idle →[increment]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'idle', {"count":0});
+  await injectState(request, page, 'idle', {"count":0});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -79,7 +85,7 @@ test('counter | idle →[increment]→ idle', async ({ page, request }) => {
 
 test('counter | idle →[reset]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'idle', {"count":0});
+  await injectState(request, page, 'idle', {"count":0});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -94,13 +100,13 @@ test('counter | idle →[reset]→ idle', async ({ page, request }) => {
 
 test('counter | inject state: error', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'error', {"count":0});
+  await injectState(request, page, 'error', {"count":0});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'error');
 });
 
 test('counter | inject state: idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'idle', {"count":0});
+  await injectState(request, page, 'idle', {"count":0});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'idle');
 });
 

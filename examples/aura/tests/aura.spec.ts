@@ -13,21 +13,27 @@ const BASE_URL   = 'http://localhost:3003';
 const MACHINE_ID = 'aura';
 const ROOT       = `[fx-machine="${MACHINE_ID}"]`;
 
-/// Inject a snapshot server-side, then reload so the WASM client reflects it.
-/// Playwright retries the `toHaveAttribute` assertion until the WASM runtime
-/// has fetched and applied the snapshot (handles the async init race).
-async function injectAndReload(
+/// Inject a snapshot server-side.
+/// The WASM client subscribes to SSE — the server pushes the new snapshot
+/// immediately, so `page.reload()` is not needed.  The assertion waits up to
+/// 3 s for the SSE push to arrive and be applied to the DOM.
+///
+/// `data-fx-session` on the machine root carries the session ID that was
+/// assigned when the page loaded, so each test tab gets its own isolated state.
+async function injectState(
   request : APIRequestContext,
   page    : Page,
   state   : string,
   context : Record<string, unknown>,
   version = 0
 ): Promise<void> {
-  await request.post(`${BASE_URL}/test/state`, {
+  const root = page.locator(ROOT);
+  const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
+  await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
   });
-  await page.reload();
-  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', state);
+  // SSE delivers the snapshot without a reload.
+  await expect(root).toHaveAttribute('data-fx-state', state, { timeout: 3000 });
 }
 
 // ── transition coverage ─────────────────────────────────────────────────────
@@ -35,7 +41,7 @@ async function injectAndReload(
 
 test('aura | calm →[energize]→ energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'calm', {});
+  await injectState(request, page, 'calm', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -46,7 +52,7 @@ test('aura | calm →[energize]→ energized', async ({ page, request }) => {
 
 test('aura | calm →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'calm', {});
+  await injectState(request, page, 'calm', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -57,7 +63,7 @@ test('aura | calm →[focus]→ focused', async ({ page, request }) => {
 
 test('aura | calm →[overwhelm]→ overwhelmed', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'calm', {});
+  await injectState(request, page, 'calm', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -68,7 +74,7 @@ test('aura | calm →[overwhelm]→ overwhelmed', async ({ page, request }) => {
 
 test('aura | energized →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'energized', {});
+  await injectState(request, page, 'energized', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -79,7 +85,7 @@ test('aura | energized →[calm]→ calm', async ({ page, request }) => {
 
 test('aura | energized →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'energized', {});
+  await injectState(request, page, 'energized', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -90,7 +96,7 @@ test('aura | energized →[focus]→ focused', async ({ page, request }) => {
 
 test('aura | energized →[overwhelm]→ overwhelmed', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'energized', {});
+  await injectState(request, page, 'energized', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -101,7 +107,7 @@ test('aura | energized →[overwhelm]→ overwhelmed', async ({ page, request })
 
 test('aura | focused →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'focused', {});
+  await injectState(request, page, 'focused', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -112,7 +118,7 @@ test('aura | focused →[calm]→ calm', async ({ page, request }) => {
 
 test('aura | focused →[energize]→ energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'focused', {});
+  await injectState(request, page, 'focused', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -123,7 +129,7 @@ test('aura | focused →[energize]→ energized', async ({ page, request }) => {
 
 test('aura | focused →[overwhelm]→ overwhelmed', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'focused', {});
+  await injectState(request, page, 'focused', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -134,7 +140,7 @@ test('aura | focused →[overwhelm]→ overwhelmed', async ({ page, request }) =
 
 test('aura | overwhelmed →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'overwhelmed', {});
+  await injectState(request, page, 'overwhelmed', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -145,7 +151,7 @@ test('aura | overwhelmed →[calm]→ calm', async ({ page, request }) => {
 
 test('aura | overwhelmed →[energize]→ energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'overwhelmed', {});
+  await injectState(request, page, 'overwhelmed', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -156,7 +162,7 @@ test('aura | overwhelmed →[energize]→ energized', async ({ page, request }) 
 
 test('aura | overwhelmed →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'overwhelmed', {});
+  await injectState(request, page, 'overwhelmed', {});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -171,25 +177,25 @@ test('aura | overwhelmed →[focus]→ focused', async ({ page, request }) => {
 
 test('aura | inject state: calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'calm', {});
+  await injectState(request, page, 'calm', {});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'calm');
 });
 
 test('aura | inject state: energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'energized', {});
+  await injectState(request, page, 'energized', {});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'energized');
 });
 
 test('aura | inject state: focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'focused', {});
+  await injectState(request, page, 'focused', {});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused');
 });
 
 test('aura | inject state: overwhelmed', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, 'overwhelmed', {});
+  await injectState(request, page, 'overwhelmed', {});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'overwhelmed');
 });
 

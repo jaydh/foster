@@ -12,6 +12,8 @@ pub enum MachineError {
     InvalidTransition { state: String, event: String },
     #[error("reducer failed: {0}")]
     ReducerError(String),
+    #[error("context schema violation in state '{state}': {message}")]
+    SchemaViolation { state: String, message: String },
 }
 
 /// A single edge in the state graph.
@@ -32,6 +34,8 @@ pub struct Machine {
     pub initial_context: Value,
     /// state_name → event_name → TransitionDef
     pub(crate) states: HashMap<String, HashMap<String, TransitionDef>>,
+    /// Optional JSON Schema per state, validated on every state entry.
+    pub(crate) state_schemas: HashMap<String, Value>,
 }
 
 impl Machine {
@@ -59,6 +63,7 @@ pub struct MachineBuilder {
     initial_state: String,
     initial_context: Value,
     states: HashMap<String, HashMap<String, TransitionDef>>,
+    state_schemas: HashMap<String, Value>,
 }
 
 impl MachineBuilder {
@@ -69,13 +74,13 @@ impl MachineBuilder {
     ) -> Self {
         let initial_state = initial_state.into();
         let mut states: HashMap<String, HashMap<String, TransitionDef>> = HashMap::new();
-        // Pre-register the initial state so it shows up even with no transitions defined.
         states.entry(initial_state.clone()).or_default();
         Self {
             id: id.into(),
             initial_state,
             initial_context,
             states,
+            state_schemas: HashMap::new(),
         }
     }
 
@@ -85,10 +90,18 @@ impl MachineBuilder {
         self
     }
 
-    /// Register a transition edge.
+    /// Attach a JSON Schema to a state.  The context is validated against the schema every time
+    /// the machine enters that state (via `send` or `restore`).  An invalid context is rejected
+    /// with `MachineError::SchemaViolation`.
     ///
-    /// `reduce` receives `(current_context, event_payload)` and returns the next context.
-    /// Pass `None` to leave context unchanged.
+    /// Supported keywords: `type`, `required`, `properties`, `minimum`, `maximum`,
+    /// `minLength`, `maxLength`, `enum`.
+    pub fn schema(mut self, state: impl Into<String>, schema: Value) -> Self {
+        self.state_schemas.insert(state.into(), schema);
+        self
+    }
+
+    /// Register a transition edge.
     pub fn on(
         mut self,
         from: impl Into<String>,
@@ -111,6 +124,7 @@ impl MachineBuilder {
             initial_state: self.initial_state,
             initial_context: self.initial_context,
             states: self.states,
+            state_schemas: self.state_schemas,
         })
     }
 }
@@ -132,8 +146,6 @@ impl MachineInstance {
     }
 
     /// Send an event, advance state, return the resulting snapshot.
-    /// Returns `MachineError::InvalidTransition` for events not valid in the current state —
-    /// the caller decides whether to propagate or ignore.
     pub fn send(&mut self, event: &str, payload: Value) -> Result<Snapshot, MachineError> {
         let transitions = self
             .machine
@@ -150,6 +162,9 @@ impl MachineInstance {
             Some(f) => f(self.context.clone(), payload)?,
             None => self.context.clone(),
         };
+
+        // Validate against the target state's schema before committing.
+        validate_context(&self.machine, &def.target, &next_context)?;
 
         self.current_state = def.target.clone();
         self.context = next_context;
@@ -168,19 +183,19 @@ impl MachineInstance {
     }
 
     /// Overwrite the instance's state from an arbitrary snapshot.
-    /// Used by `POST /test/state` to inject test fixtures without replaying interactions.
     pub fn restore(&mut self, snap: Snapshot) -> Result<(), MachineError> {
         if !self.machine.states.contains_key(&snap.state) {
             return Err(MachineError::UnknownState(snap.state));
         }
+
+        validate_context(&self.machine, &snap.state, &snap.context)?;
+
         self.current_state = snap.state;
         self.context = snap.context;
         self.version = snap.version;
         Ok(())
     }
 
-    /// Events valid from the current state — exposed so the server can surface them
-    /// in responses and test generators can enumerate reachable transitions.
     pub fn valid_events(&self) -> Vec<&str> {
         self.machine
             .states
@@ -191,6 +206,114 @@ impl MachineInstance {
 
     pub fn machine(&self) -> &Machine {
         &self.machine
+    }
+}
+
+// ── Schema validation ─────────────────────────────────────────────────────────
+//
+// Minimal inline JSON Schema validator — no external dependencies, compiles to WASM.
+// Supported keywords: type, required, properties, minimum, maximum,
+//                     minLength, maxLength, enum.
+
+fn validate_context(machine: &Machine, state: &str, context: &Value) -> Result<(), MachineError> {
+    if let Some(schema) = machine.state_schemas.get(state) {
+        validate_schema(schema, context).map_err(|msg| MachineError::SchemaViolation {
+            state: state.to_string(),
+            message: msg,
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
+    // type
+    if let Some(ty) = schema.get("type").and_then(Value::as_str) {
+        let ok = match ty {
+            "object"  => instance.is_object(),
+            "array"   => instance.is_array(),
+            "string"  => instance.is_string(),
+            "number"  => instance.is_number(),
+            "integer" => instance.is_i64() || instance.is_u64(),
+            "boolean" => instance.is_boolean(),
+            "null"    => instance.is_null(),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("expected type '{ty}' but got {}", type_name(instance)));
+        }
+    }
+
+    // required
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required {
+            if let Some(k) = key.as_str() {
+                if instance.get(k).is_none() {
+                    return Err(format!("missing required field '{k}'"));
+                }
+            }
+        }
+    }
+
+    // properties — recurse
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        for (key, sub_schema) in props {
+            if let Some(val) = instance.get(key) {
+                validate_schema(sub_schema, val)
+                    .map_err(|e| format!("{key}: {e}"))?;
+            }
+        }
+    }
+
+    // numeric bounds
+    if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
+        if let Some(n) = instance.as_f64() {
+            if n < min {
+                return Err(format!("{n} is less than minimum {min}"));
+            }
+        }
+    }
+    if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
+        if let Some(n) = instance.as_f64() {
+            if n > max {
+                return Err(format!("{n} is greater than maximum {max}"));
+            }
+        }
+    }
+
+    // string length
+    if let Some(min_len) = schema.get("minLength").and_then(Value::as_u64) {
+        if let Some(s) = instance.as_str() {
+            if (s.len() as u64) < min_len {
+                return Err(format!("string length {} < minLength {min_len}", s.len()));
+            }
+        }
+    }
+    if let Some(max_len) = schema.get("maxLength").and_then(Value::as_u64) {
+        if let Some(s) = instance.as_str() {
+            if (s.len() as u64) > max_len {
+                return Err(format!("string length {} > maxLength {max_len}", s.len()));
+            }
+        }
+    }
+
+    // enum
+    if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
+        if !variants.contains(instance) {
+            return Err(format!("{instance} is not one of the allowed enum values"));
+        }
+    }
+
+    Ok(())
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null    => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) => if n.is_i64() || n.is_u64() { "integer" } else { "number" },
+        Value::String(_) => "string",
+        Value::Array(_)  => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -247,7 +370,6 @@ mod tests {
 
         let s = m.send("recover", json!(null)).unwrap();
         assert_eq!(s.state, "idle");
-        // context passes through on recover
         assert_eq!(s.context["count"], 2);
     }
 
@@ -286,9 +408,62 @@ mod tests {
         let machine = counter_machine();
         let mut triples = machine.transitions();
         triples.sort();
-        // Should include all defined edges
         assert!(triples.contains(&("idle", "increment", "idle")));
         assert!(triples.contains(&("idle", "break_it", "error")));
         assert!(triples.contains(&("error", "recover", "idle")));
+    }
+
+    #[test]
+    fn schema_rejects_invalid_context() {
+        let machine = MachineBuilder::new("m", "ready", json!({ "count": 0 }))
+            .schema("ready", json!({
+                "type": "object",
+                "required": ["count"],
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0 }
+                }
+            }))
+            .on("ready", "tick", "ready", Some(|ctx, _| {
+                Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
+            }))
+            .build();
+
+        let mut inst = MachineInstance::new(machine);
+        assert!(inst.send("tick", json!(null)).is_ok());
+
+        // Injecting a context that violates the schema is rejected
+        let bad_snap = Snapshot {
+            machine_id: "m".into(),
+            state: "ready".into(),
+            context: json!({ "count": -1 }),
+            version: 0,
+        };
+        assert!(inst.restore(bad_snap).is_err());
+    }
+
+    #[test]
+    fn schema_allows_valid_context() {
+        let machine = MachineBuilder::new("m", "ready", json!({ "count": 0 }))
+            .schema("ready", json!({
+                "type": "object",
+                "required": ["count"],
+                "properties": {
+                    "count": { "type": "integer", "minimum": 0 }
+                }
+            }))
+            .on("ready", "tick", "ready", Some(|ctx, _| {
+                Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
+            }))
+            .build();
+
+        let mut inst = MachineInstance::new(machine);
+        let good_snap = Snapshot {
+            machine_id: "m".into(),
+            state: "ready".into(),
+            context: json!({ "count": 5 }),
+            version: 10,
+        };
+        assert!(inst.restore(good_snap).is_ok());
+        assert_eq!(inst.version, 10);
     }
 }

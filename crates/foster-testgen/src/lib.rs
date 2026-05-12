@@ -48,21 +48,27 @@ pub fn generate(machine: &Machine, base_url: &str) -> String {
 
     // ── helper ───────────────────────────────────────────────────────────────
     write!(out, "\
-/// Inject a snapshot server-side, then reload so the WASM client reflects it.
-/// Playwright retries the `toHaveAttribute` assertion until the WASM runtime
-/// has fetched and applied the snapshot (handles the async init race).
-async function injectAndReload(
+/// Inject a snapshot server-side.
+/// The WASM client subscribes to SSE — the server pushes the new snapshot
+/// immediately, so `page.reload()` is not needed.  The assertion waits up to
+/// 3 s for the SSE push to arrive and be applied to the DOM.
+///
+/// `data-fx-session` on the machine root carries the session ID that was
+/// assigned when the page loaded, so each test tab gets its own isolated state.
+async function injectState(
   request : APIRequestContext,
   page    : Page,
   state   : string,
   context : Record<string, unknown>,
   version = 0
 ): Promise<void> {{
-  await request.post(`${{BASE_URL}}/test/state`, {{
+  const root = page.locator(ROOT);
+  const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
+  await request.post(`${{BASE_URL}}/test/state?session=${{sid}}`, {{
     data: {{ machine_id: MACHINE_ID, state, context, version }},
   }});
-  await page.reload();
-  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', state);
+  // SSE delivers the snapshot without a reload.
+  await expect(root).toHaveAttribute('data-fx-state', state, {{ timeout: 3000 }});
 }}
 
 ").unwrap();
@@ -82,7 +88,7 @@ async function injectAndReload(
         write!(out, "\
 test('{machine_id} | {from} →[{event}]→ {to}', async ({{ page, request }}) => {{
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, '{from}', {ctx});
+  await injectState(request, page, '{from}', {ctx});
 
   // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
@@ -111,7 +117,7 @@ test('{machine_id} | {from} →[{event}]→ {to}', async ({{ page, request }}) =
         write!(out, "\
 test('{machine_id} | inject state: {state}', async ({{ page, request }}) => {{
   await page.goto(BASE_URL);
-  await injectAndReload(request, page, '{state}', {ctx});
+  await injectState(request, page, '{state}', {ctx});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', '{state}');
 }});
 
