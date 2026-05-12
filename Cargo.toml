@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/foster-macros",
     "crates/foster-core",
     "crates/foster-server",
     "crates/foster-testgen",

@@ -11,11 +11,11 @@ The React implementations are embedded inline in `measure.sh` — not committed 
 ## What is measured
 
 **Included:** application-specific logic only.
-**Excluded:** CSS (equal for both sides), server boilerplate (`fn main` / `tokio::main`), config files (`package.json`, `Cargo.toml`, `tsconfig.json`, `vite.config.ts`, `playwright.config.ts`), generated test files (`*.spec.ts`, `gen_tests.rs`).
+**Excluded:** CSS, server boilerplate (axum setup, `tokio::main`, `HashMap` wiring), config files (`package.json`, `Cargo.toml`, `tsconfig.json`), generated test files (`*.spec.ts`, `gen_tests.rs`), `use`/`import` statements.
 
 | Side | Files counted |
 |---|---|
-| Foster | `main.rs` (reducers + machine, stops before `fn main`) · `index.html` (structure only, no `<style>` block) |
+| Foster | `main.rs` — structs, reducers, machine builder + `html!` template; stops before `let mut machines = HashMap::new()` |
 | React | `App.tsx` · `types.ts` · `App.test.tsx` |
 
 Token estimate: `file_size_bytes ÷ 4`. Consistent across runs; within ~15% of tiktoken for code.
@@ -28,27 +28,27 @@ Token estimate: `file_size_bytes ÷ 4`. Consistent across runs; within ~15% of t
 
 |  | LOC | ~Tokens |
 |---|---|---|
-| Foster implementation | 69 | 860 |
+| Foster implementation | 43 | 544 |
 | Foster tests | 0 | **0** (generated) |
 | React implementation | 56 | 515 |
 | React tests | 61 | 590 |
-| **Net Foster vs React** | | **−245 tokens** |
+| **Net Foster vs React** | | **−561 tokens** |
 
 ### Kanban
 
 |  | LOC | ~Tokens |
 |---|---|---|
-| Foster implementation | 201 | 2484 |
+| Foster implementation | 182 | 2209 |
 | Foster tests | 0 | **0** (generated) |
 | React implementation | 165 | 1671 |
 | React tests | 70 | 725 |
-| **Net Foster vs React** | | **+88 tokens (impl) / −725 tokens (tests)** |
+| **Net Foster vs React** | | **−187 tokens** |
 
 ---
 
 ## Interpretation
 
-**Foster costs fewer tokens to author in aggregate.** The HTML template is still the largest single cost on the Foster side — JSX collocates markup and logic while Foster separates them — but typed context structs, inline closures, and generated tests more than offset that.
+**Foster costs fewer tokens to author in aggregate.** Implementation is slightly more expensive on complex apps (typed Rust structs + reducers take more lines than TypeScript arrow functions) but generated tests more than offset that.
 
 **Where Foster wins:**
 
@@ -74,7 +74,7 @@ React has no equivalent — a misnamed handler silently does nothing.
 Adding a new transition in Foster:
 - One `.on()` / `.pass()` / `.typed_on()` call
 - One reducer (or inline closure for simple cases)
-- One HTML attribute (`fx-on="click->event"`)
+- One `html!` attribute (`button[on="click->event"]`)
 - Run `./scripts/check.sh` — new test appears automatically
 
 Adding a new transition in React:
@@ -87,8 +87,6 @@ Adding a new transition in React:
 
 React requires the LLM to reason correctly about hook dependency arrays, re-render batching, key prop stability, and test rendering lifecycle. None of these exist in Foster. The state machine is a pure function of `(state, event, payload) → next_state`.
 
----
+### 5. Inline templates eliminate file-switching
 
-## What would change these numbers
-
-The implementation token gap would narrow further if Foster gains a JSX-like template syntax — the HTML file is the dominant remaining cost.
+With `html!` + `page()`, the entire app — state machine, reducers, and template — lives in one `main.rs`. No separate HTML file to keep in sync, no risk of a template referencing an event that was renamed in the machine.

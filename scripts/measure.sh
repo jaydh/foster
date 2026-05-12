@@ -495,13 +495,15 @@ tok_html() {
 }
 
 loc_rust_app() {
-    awk '/^#\[tokio::main\]|^async fn main\(\)/{exit} 1' "$1" \
-        | grep -cEv '^\s*(//|/\*|\*|$)' 2>/dev/null || echo 0
+    # Stop at server setup boilerplate; exclude imports, tokio attr, fn main decl, blanks, comments
+    awk '/^\s*let mut machines = HashMap::new\(\)/{exit} 1' "$1" \
+        | grep -cEv '^\s*(use |#\[tokio|async fn main\(\)|//|/\*|\*|$)' 2>/dev/null || echo 0
 }
 
 tok_rust_app() {
     local chars
-    chars=$(awk '/^#\[tokio::main\]|^async fn main\(\)/{exit} 1' "$1" | wc -c)
+    chars=$(awk '/^\s*let mut machines = HashMap::new\(\)/{exit} 1' "$1" \
+        | grep -Ev '^\s*(use |#\[tokio|async fn main\(\)|//|/\*|\*|$)' | wc -c)
     echo $(( chars / 4 ))
 }
 
@@ -545,13 +547,10 @@ for app in counter kanban; do
     echo "── $app ──────────────────────────────────────────────────────────────"
     echo ""
 
-    echo "  Foster (implementation — machine + reducers + HTML structure)"
-    row "main.rs (reducers + machine, no server setup)" \
+    echo "  Foster (implementation — machine + reducers + inline template)"
+    row "main.rs (reducers + machine + html! template, no server setup)" \
         "$(loc_rust_app "$REPO/examples/$app/src/main.rs")" \
         "$(tok_rust_app "$REPO/examples/$app/src/main.rs")"
-    row "index.html (structure, no CSS)" \
-        "$(loc_html "$REPO/examples/$app/static/index.html")" \
-        "$(tok_html "$REPO/examples/$app/static/index.html")"
     total_row
     foster_impl_loc=$LAST_LOC; foster_impl_tok=$LAST_TOK
 

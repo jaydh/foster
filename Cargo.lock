@@ -171,9 +171,18 @@ dependencies = [
 name = "foster-core"
 version = "0.1.0"
 dependencies = [
+ "foster-macros",
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "foster-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
 ]
 
 [[package]]

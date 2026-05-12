@@ -1,4 +1,4 @@
-use foster_core::{MachineBuilder, MachineError};
+use foster_core::{html, page, MachineBuilder, MachineError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -112,7 +112,89 @@ async fn main() {
     .typed_on("editing",           "cancel",       "viewing",           cancel)
     .typed_on("confirming_delete", "confirm",      "viewing",           confirm_delete)
     .typed_on("confirming_delete", "cancel",       "viewing",           cancel)
-    .template(include_str!("../static/index.html"))
+    .template(page("Foster · Kanban", include_str!("../static/style.css"), html! {
+        div[machine="kanban"] {
+            h1 { "Foster Kanban · state: " span[class="badge", state_label] { "…" } }
+            div[class="toolbar", show="viewing"] {
+                button[class="btn-add", on="click->start_create"] { "+ New task" }
+            }
+            div[class="board", show="viewing"] {
+                div {
+                    div[class="col-header"] { "Todo" }
+                    div[each="tasks", filter=r#"{"column":"todo"}"#] {
+                        div[class="task-card", data_template, style="display:none"] {
+                            div[class="task-title", field="title"] { "—" }
+                            div[class="card-actions"] {
+                                button[class="btn", on="click->start_edit"] { "edit" }
+                                button[class="btn btn-danger", on="click->start_delete"] { "del" }
+                                button[class="btn btn-safe", on="click->move_task", payload=r#"{"column":"in_progress"}"#] { "→ IP" }
+                            }
+                        }
+                    }
+                }
+                div {
+                    div[class="col-header"] { "In Progress" }
+                    div[each="tasks", filter=r#"{"column":"in_progress"}"#] {
+                        div[class="task-card", data_template, style="display:none"] {
+                            div[class="task-title", field="title"] { "—" }
+                            div[class="card-actions"] {
+                                button[class="btn", on="click->start_edit"] { "edit" }
+                                button[class="btn btn-danger", on="click->start_delete"] { "del" }
+                                button[class="btn btn-safe", on="click->move_task", payload=r#"{"column":"done"}"#] { "→ Done" }
+                                button[class="btn", on="click->move_task", payload=r#"{"column":"todo"}"#] { "← Todo" }
+                            }
+                        }
+                    }
+                }
+                div {
+                    div[class="col-header"] { "Done" }
+                    div[each="tasks", filter=r#"{"column":"done"}"#] {
+                        div[class="task-card", data_template, style="display:none"] {
+                            div[class="task-title", field="title"] { "—" }
+                            div[class="card-actions"] {
+                                button[class="btn btn-danger", on="click->start_delete"] { "del" }
+                                button[class="btn", on="click->move_task", payload=r#"{"column":"in_progress"}"#] { "← IP" }
+                            }
+                        }
+                    }
+                }
+            }
+            div[class="modal", show="creating"] {
+                div[class="modal-box"] {
+                    div[class="modal-title"] { "New task" }
+                    input[type="text", placeholder="Task title…", collect="draft_title", autofocus]
+                    div[class="modal-actions"] {
+                        button[class="btn", on="click->cancel"] { "Cancel" }
+                        button[class="btn btn-safe", on="click->save"] { "Save" }
+                    }
+                }
+            }
+            div[class="modal", show="editing"] {
+                div[class="modal-box"] {
+                    div[class="modal-title"] { "Edit task" }
+                    input[type="text", placeholder="Task title…", value="draft_title", collect="draft_title"]
+                    div[class="modal-actions"] {
+                        button[class="btn", on="click->cancel"] { "Cancel" }
+                        button[class="btn btn-safe", on="click->save"] { "Save" }
+                    }
+                }
+            }
+            div[class="modal", show="confirming_delete"] {
+                div[class="modal-box"] {
+                    div[class="modal-title"] { "Delete task?" }
+                    p[style="color:#888;font-size:0.82rem;margin-bottom:1rem"] { "This cannot be undone." }
+                    div[class="modal-actions"] {
+                        button[class="btn", on="click->cancel"] { "Cancel" }
+                        button[class="btn btn-danger", on="click->confirm"] { "Delete" }
+                    }
+                }
+            }
+        }
+        details {
+            summary { "snapshot" }
+            pre[id="debug-snapshot"] { "{}" }
+        }
+    }))
     .build();
 
     let mut machines = HashMap::new();

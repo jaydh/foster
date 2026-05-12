@@ -8,6 +8,7 @@ design rationale, and deployment see [`README.md`](README.md).
 ```
 foster/
 ├── crates/
+│   ├── foster-macros/     # Proc macro: html! DSL for inline templates
 │   ├── foster-core/       # State machine primitives, serialization, schema validation
 │   ├── foster-server/     # Axum HTTP router (4 routes) + SSE broadcast
 │   ├── foster-client/     # WASM runtime — processes fx-* attributes
@@ -51,7 +52,7 @@ cd examples/kanban && npx playwright test --reporter=line
 1. Add a transition in `src/main.rs`:
    `.on("from", "event", "to", reducer_fn)` or `.pass(...)` for no-op
 2. Add the reducer (if not a passthrough)
-3. Add the HTML: `<button fx-on="click->event_name">label</button>`
+3. Add the `html!` element: `button[on="click->event_name"] { "label" }`
 4. Run `./scripts/check.sh` — tests for the new edge appear automatically
 
 No test file to edit. No type file to update. The machine definition is the
@@ -83,7 +84,17 @@ MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
     })
     .pass("idle",  "break_it", "error")   // context unchanged
     .pass("error", "recover",  "idle")
-    .template(include_str!("../static/index.html"))  // served at GET /, validated at startup
+    .template(page("Counter", include_str!("../static/style.css"), html! {
+        div[machine="counter"] {
+            div[show="idle"] {
+                span[text="count"] {}
+                button[on="click->increment"] { "+" }
+            }
+            div[show="error"] {
+                button[on="click->recover"] { "recover" }
+            }
+        }
+    }))
     .build()  // → Arc<Machine>
 ```
 
@@ -118,6 +129,44 @@ builder.typed_on("viewing", "start_edit", "editing", begin_edit)
 - `Snapshot` — unit of everything: wire format, test injection, state diffing
 
 **Invariant: state transitions are the only way state changes.** The server owns instances; the client is a render layer.
+
+### Inline templates — `html!` + `page()`
+
+`foster_core::html!` is a compile-time DSL that generates HTML strings with shorthand `fx-*` attributes:
+
+```rust
+use foster_core::{html, page};
+
+// Shorthand → HTML attribute
+// machine="id"   → fx-machine="id"
+// show="states"  → fx-show="states"
+// text="key"     → fx-text="key"
+// on="evt->act"  → fx-on="evt->act"
+// each="key"     → fx-for="key"
+// filter=r#"..."# → fx-where="..."
+// collect="key"  → fx-collect="key"
+// disable="s"    → fx-disable="s"
+// value="key"    → fx-value="key"
+// payload=r#"..."# → fx-payload="..."
+// field="key"    → fx-field="key"
+// state_label    → fx-state-label (boolean)
+// foo_bar="v"    → foo-bar="v"  (underscore → hyphen for everything else)
+
+.template(page("My App", include_str!("../static/style.css"), html! {
+    div[machine="counter"] {
+        span[state_label] {}
+        div[show="idle"] {
+            span[text="count"] { "0" }
+            button[on="click->increment"] { "+" }
+        }
+        div[show="error"] {
+            button[on="click->recover"] { "recover" }
+        }
+    }
+}))
+```
+
+`page(title, style, body)` wraps the body in a complete HTML shell: DOCTYPE, `<head>`, the `[fx-show]{display:none}` rule, the CSS, and the WASM `<script>` tag. Raw string literals (`r#"..."#`) are useful for JSON in `filter=` and `payload=` attributes.
 
 ### Template validation
 

@@ -1,4 +1,4 @@
-use foster_core::MachineBuilder;
+use foster_core::{html, page, MachineBuilder};
 use serde_json::json;
 use std::collections::HashMap;
 use tower_http::services::ServeDir;
@@ -12,7 +12,32 @@ async fn main() {
         .on("idle", "reset",     "idle", |_, _|   Ok(json!({ "count": 0 })))
         .pass("idle",  "break_it", "error")
         .pass("error", "recover",  "idle")
-        .template(include_str!("../static/index.html"))
+        .template(page("Foster • Counter", include_str!("../static/style.css"), html! {
+            h1 { "Foster UI · Counter" }
+            div[machine="counter"] {
+                p[class="meta"] { "state: " span[class="badge", state_label] { "…" } }
+                div[show="idle"] {
+                    div[class="count-display"] { span[text="count"] { "0" } }
+                    div[class="controls"] {
+                        button[on="click->decrement"] { "−" }
+                        button[on="click->increment"] { "+" }
+                        button[on="click->reset"] { "reset" }
+                        button[class="btn-danger", on="click->break_it"] { "break" }
+                    }
+                }
+                div[show="error", class="error-box"] {
+                    p { "Machine entered error state. Count was: "
+                        span[class="error-count", text="count"] { "—" }
+                    }
+                    button[class="btn-safe", on="click->recover"] { "recover" }
+                }
+            }
+            hr {}
+            details {
+                summary { "snapshot" }
+                pre[id="debug-snapshot"] { "{}" }
+            }
+        }))
         .build();
 
     let mut machines = HashMap::new();
