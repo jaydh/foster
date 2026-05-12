@@ -29,12 +29,19 @@ async fn bootstrap() {
 
         save_for_templates(&root);
 
+        // Subscribe to SSE and attach the click listener *before* fetching
+        // the initial snapshot.  This closes the race window where a Playwright
+        // test-inject fires its SSE broadcast before the client is listening,
+        // causing the inject to be silently lost.
+        attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
+        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
+
         match fetch_snapshot(&machine_id, &session_id).await {
             Ok(snap) => {
-                apply_snapshot(&document, &root, &snap);
+                // Use _if_newer so a concurrent inject (version ≥ 1 after the
+                // restore() bump) is not clobbered by this v0 initial response.
+                apply_snapshot_if_newer(&document, &root, &snap);
                 update_debug(&document, &snap);
-                attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
-                attach_sse_listener(document.clone(), root, machine_id, session_id.clone());
             }
             Err(e) => web_sys::console::error_1(&e),
         }

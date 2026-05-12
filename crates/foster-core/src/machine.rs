@@ -192,7 +192,11 @@ impl MachineInstance {
 
         self.current_state = snap.state;
         self.context = snap.context;
-        self.version = snap.version;
+        // Bump past the incoming version so the restored snapshot is always
+        // "newer" than any in-flight GET /state response the client may still
+        // be waiting for.  This prevents a late-arriving initial-fetch response
+        // from clobbering an injected state when the client uses version ordering.
+        self.version = self.version.max(snap.version) + 1;
         Ok(())
     }
 
@@ -388,7 +392,7 @@ mod tests {
 
         assert_eq!(m.current_state, "error");
         assert_eq!(m.context["count"], 99);
-        assert_eq!(m.version, 42);
+        assert_eq!(m.version, 43); // max(0, 42) + 1
     }
 
     #[test]
@@ -464,6 +468,6 @@ mod tests {
             version: 10,
         };
         assert!(inst.restore(good_snap).is_ok());
-        assert_eq!(inst.version, 10);
+        assert_eq!(inst.version, 11); // max(0, 10) + 1
     }
 }

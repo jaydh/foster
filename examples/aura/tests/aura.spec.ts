@@ -28,6 +28,10 @@ async function injectState(
   version = 0
 ): Promise<void> {
   const root = page.locator(ROOT);
+  // Wait for WASM to finish its initial bootstrap (data-fx-state is stamped
+  // after the first snapshot is applied, and the SSE listener is wired up
+  // before that fetch — so by this point the SSE channel is live).
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
   const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
   await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
@@ -169,6 +173,101 @@ test('aura | overwhelmed →[focus]→ focused', async ({ page, request }) => {
   await page.locator('[fx-on="click->focus"]').first().click();
 
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused');
+});
+
+// ── multi-step / rapid-transition tests ──────────────────────────────────────
+// These cover bugs that only surface when cycling between states repeatedly:
+//   - fx-class (is-active) stuck on wrong button
+//   - fx-text showing stale description
+//   - SSE snapshot ordering rolling state backwards
+
+/** Expected description text per state (matches server reducers). */
+const DESCRIPTIONS: Record<string, string> = {
+  calm:       'Still. Quiet. Present.',
+  focused:    'Sharp. Clear. Directed.',
+  energized:  'Alive. Bright. Flowing.',
+  overwhelmed:'Scattered. Heavy. Much.',
+};
+
+/**
+ * Assert the full rendered state: data-fx-state, the active button class,
+ * no other button has is-active, and the description text is correct.
+ */
+async function assertFullState(page: Page, expected: string): Promise<void> {
+  const root = page.locator(ROOT);
+  await expect(root).toHaveAttribute('data-fx-state', expected, { timeout: 3000 });
+  await expect(page.locator('.btn.is-active')).toHaveCount(1);
+  await expect(page.locator(`.btn[fx-class="${expected}:is-active"]`)).toHaveClass(/is-active/);
+  await expect(page.locator('[fx-text="description"]')).toHaveText(DESCRIPTIONS[expected], { timeout: 3000 });
+}
+
+test('aura | cycling all 4 states in order leaves correct final state', async ({ page }) => {
+  await page.goto(BASE_URL);
+  const sequence = ['energize', 'overwhelm', 'calm', 'focus', 'energize', 'calm'];
+  const expected = ['energized','overwhelmed','calm','focused','energized','calm'];
+  for (let i = 0; i < sequence.length; i++) {
+    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
+    await assertFullState(page, expected[i]);
+  }
+});
+
+test('aura | rapid ping-pong calm↔overwhelmed keeps fx-class in sync', async ({ page }) => {
+  await page.goto(BASE_URL);
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->overwhelm"]').first().click();
+    await assertFullState(page, 'overwhelmed');
+    await page.locator('[fx-on="click->calm"]').first().click();
+    await assertFullState(page, 'calm');
+  }
+});
+
+test('aura | rapid ping-pong focused↔energized keeps fx-class in sync', async ({ page }) => {
+  await page.goto(BASE_URL);
+  await page.locator('[fx-on="click->focus"]').first().click();
+  await assertFullState(page, 'focused');
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->energize"]').first().click();
+    await assertFullState(page, 'energized');
+    await page.locator('[fx-on="click->focus"]').first().click();
+    await assertFullState(page, 'focused');
+  }
+});
+
+test('aura | only one button has is-active at any time', async ({ page }) => {
+  await page.goto(BASE_URL);
+  const events = ['focus', 'overwhelm', 'energize', 'calm', 'overwhelm', 'focus'];
+  for (const event of events) {
+    await page.locator(`[fx-on="click->${event}"]`).first().click();
+    // Exactly one button should carry is-active — never zero, never two.
+    await expect(page.locator('.btn.is-active')).toHaveCount(1, { timeout: 3000 });
+  }
+});
+
+test('aura | description text updates on every transition', async ({ page }) => {
+  await page.goto(BASE_URL);
+  const steps: Array<[string, string]> = [
+    ['focus',     'focused'],
+    ['energize',  'energized'],
+    ['calm',      'calm'],
+    ['overwhelm', 'overwhelmed'],
+    ['focus',     'focused'],
+  ];
+  for (const [event, state] of steps) {
+    await page.locator(`[fx-on="click->${event}"]`).first().click();
+    await expect(page.locator('[fx-text="description"]')).toHaveText(
+      DESCRIPTIONS[state], { timeout: 3000 }
+    );
+  }
+});
+
+test('aura | inject state sets description text and active button', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  for (const [state, desc] of Object.entries(DESCRIPTIONS)) {
+    await injectState(request, page, state, { description: desc, intensity: 0.5 });
+    await expect(page.locator('[fx-text="description"]')).toHaveText(desc, { timeout: 3000 });
+    await expect(page.locator('.btn.is-active')).toHaveCount(1);
+    await expect(page.locator(`.btn[fx-class="${state}:is-active"]`)).toHaveClass(/is-active/);
+  }
 });
 
 // ── snapshot injection (no interaction) ──────────────────────────────────────
