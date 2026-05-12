@@ -1,4 +1,6 @@
 use crate::snapshot::Snapshot;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,16 +16,19 @@ pub enum MachineError {
     ReducerError(String),
     #[error("context schema violation in state '{state}': {message}")]
     SchemaViolation { state: String, message: String },
+    #[error("context parse error: {0}")]
+    ContextParse(String),
 }
+
+type ReducerFn = Arc<dyn Fn(Value, Value) -> Result<Value, MachineError> + Send + Sync>;
 
 /// A single edge in the state graph.
 pub struct TransitionDef {
     /// Target state name after this transition fires.
     pub target: String,
-    /// Optional pure function that produces new context from (old_context, event_payload).
-    /// `None` means context passes through unchanged.
-    /// `fn` pointers only — no closures — so the machine definition is Send + Sync.
-    pub reduce: Option<fn(Value, Value) -> Result<Value, MachineError>>,
+    /// Reducer: `(old_context, event_payload) → new_context`.
+    /// `None` passes context through unchanged.
+    pub reduce: Option<ReducerFn>,
 }
 
 /// The static, shared definition of a machine.  Construct via `MachineBuilder`.
@@ -36,6 +41,9 @@ pub struct Machine {
     pub(crate) states: HashMap<String, HashMap<String, TransitionDef>>,
     /// Optional JSON Schema per state, validated on every state entry.
     pub(crate) state_schemas: HashMap<String, Value>,
+    /// Optional HTML template.  When present, `foster_server::router` serves it at `GET /`
+    /// and validates all `fx-show` / `fx-on` attributes at startup.
+    pub template: Option<String>,
 }
 
 impl Machine {
@@ -55,6 +63,78 @@ impl Machine {
             })
             .collect()
     }
+
+    /// Validate `fx-show` and `fx-on` attribute values in the template against the machine.
+    ///
+    /// Returns `Ok(())` when there is no template or all references are valid.
+    /// Returns `Err(errors)` listing every unknown state or event name found.
+    ///
+    /// Called automatically by `foster_server::router` at startup — a misconfigured template
+    /// panics the server immediately rather than silently misbehaving at runtime.
+    pub fn validate_template(&self) -> Result<(), Vec<String>> {
+        let html = match &self.template {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+
+        let valid_states: std::collections::HashSet<&str> =
+            self.states.keys().map(|s| s.as_str()).collect();
+        let valid_events: std::collections::HashSet<&str> = self
+            .states
+            .values()
+            .flat_map(|events| events.keys().map(|e| e.as_str()))
+            .collect();
+
+        let mut errors = Vec::new();
+
+        for val in extract_attr_values(html, "fx-show") {
+            for state in val.split(',') {
+                let state = state.trim();
+                if !state.is_empty() && !valid_states.contains(state) {
+                    errors.push(format!(
+                        "fx-show=\"{val}\": state '{state}' not defined in machine '{}'",
+                        self.id
+                    ));
+                }
+            }
+        }
+
+        for val in extract_attr_values(html, "fx-on") {
+            if let Some(event) = val.splitn(2, "->").nth(1) {
+                let event = event.trim();
+                if !event.is_empty() && !valid_events.contains(event) {
+                    errors.push(format!(
+                        "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
+                        self.id
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Extract all values of a named attribute from an HTML string.
+/// Handles `attr="value"` (double-quoted).  Fast string scan, no parser dependency.
+fn extract_attr_values(html: &str, attr: &str) -> Vec<String> {
+    let needle = format!("{attr}=\"");
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(needle.as_str()) {
+        rest = &rest[i + needle.len()..];
+        if let Some(j) = rest.find('"') {
+            out.push(rest[..j].to_string());
+            rest = &rest[j + 1..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 /// Builder for `Machine`.  All methods consume and return `Self` for chaining.
@@ -64,6 +144,7 @@ pub struct MachineBuilder {
     initial_context: Value,
     states: HashMap<String, HashMap<String, TransitionDef>>,
     state_schemas: HashMap<String, Value>,
+    template: Option<String>,
 }
 
 impl MachineBuilder {
@@ -81,6 +162,7 @@ impl MachineBuilder {
             initial_context,
             states,
             state_schemas: HashMap::new(),
+            template: None,
         }
     }
 
@@ -90,32 +172,80 @@ impl MachineBuilder {
         self
     }
 
-    /// Attach a JSON Schema to a state.  The context is validated against the schema every time
-    /// the machine enters that state (via `send` or `restore`).  An invalid context is rejected
-    /// with `MachineError::SchemaViolation`.
-    ///
-    /// Supported keywords: `type`, `required`, `properties`, `minimum`, `maximum`,
-    /// `minLength`, `maxLength`, `enum`.
+    /// Attach a JSON Schema to a state.  Validated on every entry via `send` or `restore`.
     pub fn schema(mut self, state: impl Into<String>, schema: Value) -> Self {
         self.state_schemas.insert(state.into(), schema);
         self
     }
 
-    /// Register a transition edge.
+    /// Embed an HTML template served at `GET /` by `foster_server::router`.
+    /// All `fx-show` and `fx-on` attribute values are validated against the machine at startup.
+    ///
+    /// Use `include_str!("../static/index.html")` to keep the template in a separate file
+    /// while still co-locating the reference in the machine definition.
+    pub fn template(mut self, html: impl Into<String>) -> Self {
+        self.template = Some(html.into());
+        self
+    }
+
+    /// Register a transition with a reducer.
+    ///
+    /// Accepts named `fn` pointers and non-capturing closures.
+    /// For typed context structs use `.typed_on()`.  For passthrough use `.pass()`.
     pub fn on(
         mut self,
         from: impl Into<String>,
         event: impl Into<String>,
         to: impl Into<String>,
-        reduce: Option<fn(Value, Value) -> Result<Value, MachineError>>,
+        reduce: impl Fn(Value, Value) -> Result<Value, MachineError> + Send + Sync + 'static,
     ) -> Self {
         let from = from.into();
         let event = event.into();
         self.states
             .entry(from)
             .or_default()
-            .insert(event, TransitionDef { target: to.into(), reduce });
+            .insert(event, TransitionDef { target: to.into(), reduce: Some(Arc::new(reduce)) });
         self
+    }
+
+    /// Register a passthrough transition — context is forwarded unchanged.
+    pub fn pass(
+        mut self,
+        from: impl Into<String>,
+        event: impl Into<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        let from = from.into();
+        let event = event.into();
+        self.states
+            .entry(from)
+            .or_default()
+            .insert(event, TransitionDef { target: to.into(), reduce: None });
+        self
+    }
+
+    /// Register a transition with a typed-context reducer.
+    ///
+    /// The reducer receives a deserialized `Ctx` struct and returns an updated one.
+    /// Serialization round-trips are handled automatically; a failure is reported as
+    /// `MachineError::ContextParse`.
+    pub fn typed_on<Ctx>(
+        self,
+        from: impl Into<String>,
+        event: impl Into<String>,
+        to: impl Into<String>,
+        reduce: fn(Ctx, Value) -> Result<Ctx, MachineError>,
+    ) -> Self
+    where
+        Ctx: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
+        self.on(from, event, to, move |ctx: Value, payload: Value| {
+            let typed: Ctx = serde_json::from_value(ctx)
+                .map_err(|e| MachineError::ContextParse(e.to_string()))?;
+            let result = reduce(typed, payload)?;
+            serde_json::to_value(result)
+                .map_err(|e| MachineError::ContextParse(e.to_string()))
+        })
     }
 
     pub fn build(self) -> Arc<Machine> {
@@ -125,6 +255,7 @@ impl MachineBuilder {
             initial_context: self.initial_context,
             states: self.states,
             state_schemas: self.state_schemas,
+            template: self.template,
         })
     }
 }
@@ -158,12 +289,11 @@ impl MachineInstance {
             event: event.to_string(),
         })?;
 
-        let next_context = match def.reduce {
+        let next_context = match &def.reduce {
             Some(f) => f(self.context.clone(), payload)?,
             None => self.context.clone(),
         };
 
-        // Validate against the target state's schema before committing.
         validate_context(&self.machine, &def.target, &next_context)?;
 
         self.current_state = def.target.clone();
@@ -192,10 +322,6 @@ impl MachineInstance {
 
         self.current_state = snap.state;
         self.context = snap.context;
-        // Bump past the incoming version so the restored snapshot is always
-        // "newer" than any in-flight GET /state response the client may still
-        // be waiting for.  This prevents a late-arriving initial-fetch response
-        // from clobbering an injected state when the client uses version ordering.
         self.version = self.version.max(snap.version) + 1;
         Ok(())
     }
@@ -214,10 +340,6 @@ impl MachineInstance {
 }
 
 // ── Schema validation ─────────────────────────────────────────────────────────
-//
-// Minimal inline JSON Schema validator — no external dependencies, compiles to WASM.
-// Supported keywords: type, required, properties, minimum, maximum,
-//                     minLength, maxLength, enum.
 
 fn validate_context(machine: &Machine, state: &str, context: &Value) -> Result<(), MachineError> {
     if let Some(schema) = machine.state_schemas.get(state) {
@@ -230,7 +352,6 @@ fn validate_context(machine: &Machine, state: &str, context: &Value) -> Result<(
 }
 
 fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
-    // type
     if let Some(ty) = schema.get("type").and_then(Value::as_str) {
         let ok = match ty {
             "object"  => instance.is_object(),
@@ -247,7 +368,6 @@ fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
         }
     }
 
-    // required
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for key in required {
             if let Some(k) = key.as_str() {
@@ -258,17 +378,14 @@ fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
         }
     }
 
-    // properties — recurse
     if let Some(props) = schema.get("properties").and_then(Value::as_object) {
         for (key, sub_schema) in props {
             if let Some(val) = instance.get(key) {
-                validate_schema(sub_schema, val)
-                    .map_err(|e| format!("{key}: {e}"))?;
+                validate_schema(sub_schema, val).map_err(|e| format!("{key}: {e}"))?;
             }
         }
     }
 
-    // numeric bounds
     if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
         if let Some(n) = instance.as_f64() {
             if n < min {
@@ -284,7 +401,6 @@ fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
         }
     }
 
-    // string length
     if let Some(min_len) = schema.get("minLength").and_then(Value::as_u64) {
         if let Some(s) = instance.as_str() {
             if (s.len() as u64) < min_len {
@@ -300,7 +416,6 @@ fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
         }
     }
 
-    // enum
     if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
         if !variants.contains(instance) {
             return Err(format!("{instance} is not one of the allowed enum values"));
@@ -312,8 +427,8 @@ fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
 
 fn type_name(v: &Value) -> &'static str {
     match v {
-        Value::Null    => "null",
-        Value::Bool(_) => "boolean",
+        Value::Null      => "null",
+        Value::Bool(_)   => "boolean",
         Value::Number(n) => if n.is_i64() || n.is_u64() { "integer" } else { "number" },
         Value::String(_) => "string",
         Value::Array(_)  => "array",
@@ -329,14 +444,14 @@ mod tests {
     fn counter_machine() -> Arc<Machine> {
         MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
             .state("error")
-            .on("idle", "increment", "idle", Some(|ctx, _| {
+            .on("idle", "increment", "idle", |ctx, _| {
                 Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-            }))
-            .on("idle", "decrement", "idle", Some(|ctx, _| {
+            })
+            .on("idle", "decrement", "idle", |ctx, _| {
                 Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) - 1 }))
-            }))
-            .on("idle", "break_it", "error", None)
-            .on("error", "recover", "idle", Some(|ctx, _| Ok(ctx)))
+            })
+            .pass("idle", "break_it", "error")
+            .pass("error", "recover", "idle")
             .build()
     }
 
@@ -392,7 +507,7 @@ mod tests {
 
         assert_eq!(m.current_state, "error");
         assert_eq!(m.context["count"], 99);
-        assert_eq!(m.version, 43); // max(0, 42) + 1
+        assert_eq!(m.version, 43);
     }
 
     #[test]
@@ -423,19 +538,16 @@ mod tests {
             .schema("ready", json!({
                 "type": "object",
                 "required": ["count"],
-                "properties": {
-                    "count": { "type": "integer", "minimum": 0 }
-                }
+                "properties": { "count": { "type": "integer", "minimum": 0 } }
             }))
-            .on("ready", "tick", "ready", Some(|ctx, _| {
+            .on("ready", "tick", "ready", |ctx, _| {
                 Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-            }))
+            })
             .build();
 
         let mut inst = MachineInstance::new(machine);
         assert!(inst.send("tick", json!(null)).is_ok());
 
-        // Injecting a context that violates the schema is rejected
         let bad_snap = Snapshot {
             machine_id: "m".into(),
             state: "ready".into(),
@@ -451,13 +563,11 @@ mod tests {
             .schema("ready", json!({
                 "type": "object",
                 "required": ["count"],
-                "properties": {
-                    "count": { "type": "integer", "minimum": 0 }
-                }
+                "properties": { "count": { "type": "integer", "minimum": 0 } }
             }))
-            .on("ready", "tick", "ready", Some(|ctx, _| {
+            .on("ready", "tick", "ready", |ctx, _| {
                 Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-            }))
+            })
             .build();
 
         let mut inst = MachineInstance::new(machine);
@@ -468,6 +578,64 @@ mod tests {
             version: 10,
         };
         assert!(inst.restore(good_snap).is_ok());
-        assert_eq!(inst.version, 11); // max(0, 10) + 1
+        assert_eq!(inst.version, 11);
+    }
+
+    #[test]
+    fn typed_on_reduces_typed_context() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Clone)]
+        struct Ctx {
+            count: i64,
+        }
+
+        fn increment(mut ctx: Ctx, _: Value) -> Result<Ctx, MachineError> {
+            ctx.count += 1;
+            Ok(ctx)
+        }
+
+        let machine = MachineBuilder::new("typed", "idle", json!({ "count": 0 }))
+            .typed_on("idle", "increment", "idle", increment)
+            .build();
+
+        let mut inst = MachineInstance::new(machine);
+        let snap = inst.send("increment", json!(null)).unwrap();
+        assert_eq!(snap.context["count"], 1);
+    }
+
+    #[test]
+    fn validate_template_catches_unknown_state() {
+        let machine = MachineBuilder::new("counter", "idle", json!({}))
+            .state("error")
+            .pass("idle", "break_it", "error")
+            .template(r#"<div fx-machine="counter"><div fx-show="typo"></div></div>"#)
+            .build();
+
+        let errs = machine.validate_template().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'typo'")));
+    }
+
+    #[test]
+    fn validate_template_catches_unknown_event() {
+        let machine = MachineBuilder::new("counter", "idle", json!({}))
+            .pass("idle", "reset", "idle")
+            .template(r#"<button fx-on="click->typo_event">x</button>"#)
+            .build();
+
+        let errs = machine.validate_template().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'typo_event'")));
+    }
+
+    #[test]
+    fn validate_template_passes_valid() {
+        let machine = MachineBuilder::new("counter", "idle", json!({}))
+            .state("error")
+            .pass("idle", "break_it", "error")
+            .pass("error", "recover", "idle")
+            .template(r#"<div fx-show="idle"><button fx-on="click->break_it">x</button></div>"#)
+            .build();
+
+        assert!(machine.validate_template().is_ok());
     }
 }

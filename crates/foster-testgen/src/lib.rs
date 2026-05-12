@@ -164,9 +164,9 @@ mod tests {
     fn counter_machine() -> std::sync::Arc<Machine> {
         MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
             .state("error")
-            .on("idle", "increment", "idle", None)
-            .on("idle", "break_it", "error", None)
-            .on("error", "recover", "idle", None)
+            .pass("idle", "increment", "idle")
+            .pass("idle", "break_it", "error")
+            .pass("error", "recover", "idle")
             .build()
     }
 

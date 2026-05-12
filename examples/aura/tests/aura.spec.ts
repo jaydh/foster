@@ -270,6 +270,49 @@ test('aura | inject state sets description text and active button', async ({ pag
   }
 });
 
+test('aura | rings have pointer-events:none so buttons are always hoverable', async ({ page }) => {
+  await page.goto(BASE_URL);
+  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+
+  // The rings expand to 2.6× their container (572px), extending ~176px below
+  // the orb-wrap and physically overlapping the buttons.  Without
+  // pointer-events:none they intercept hover/click, especially right after
+  // a state change resets the animation cycle.
+  const ringPointerEvents = await page.evaluate(() =>
+    window.getComputedStyle(document.querySelector('.ring')!).pointerEvents
+  );
+  expect(ringPointerEvents).toBe('none');
+});
+
+test('aura | focus button is hoverable and shows hover style after returning to calm', async ({ page }) => {
+  await page.goto(BASE_URL);
+  const root = page.locator(ROOT);
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+
+  await page.locator('[fx-on="click->focus"]').first().click();
+  await expect(root).toHaveAttribute('data-fx-state', 'focused');
+
+  await page.locator('[fx-on="click->calm"]').first().click();
+  await expect(root).toHaveAttribute('data-fx-state', 'calm');
+
+  const focusBtn = page.locator('.btn[fx-on="click->focus"]');
+  await expect(focusBtn).toBeVisible();
+
+  // Confirm nothing is covering the button — would throw if occluded.
+  // Previously failed intermittently because the expanding .ring elements
+  // extend ~176px below the orb-wrap, covering the button row.
+  await focusBtn.hover();
+
+  // Verify hover style: border-color should shift to --color-label (calm blue
+  // #3a5a8a) rather than staying at the near-invisible default #1c1c2a.
+  const borderColor = await page.evaluate(() => {
+    const btn = document.querySelector('.btn[fx-on="click->focus"]') as HTMLElement;
+    btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    return window.getComputedStyle(btn).borderColor;
+  });
+  expect(borderColor).not.toBe('rgb(28, 28, 42)');
+});
+
 // ── snapshot injection (no interaction) ──────────────────────────────────────
 // Verify that POST /test/state correctly sets the DOM state.
 // These are the building blocks; transition tests depend on them being correct.

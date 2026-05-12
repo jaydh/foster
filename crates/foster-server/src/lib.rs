@@ -2,7 +2,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
     http::{header, StatusCode},
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
+    response::{Html, sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -76,6 +76,21 @@ impl AppState {
 ///   GET  /events?machine=<id>&session=<sid> → SSE stream of JSON Snapshots
 ///   POST /test/state?session=<sid>           → JSON Snapshot in/out  (debug only)
 pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
+    // Validate all templates at startup — unknown fx-show states or fx-on events panic immediately
+    // rather than silently misbehaving at runtime.
+    for (id, machine) in &machines {
+        if let Err(errors) = machine.validate_template() {
+            panic!(
+                "Machine '{}' template validation failed:\n{}",
+                id,
+                errors.join("\n")
+            );
+        }
+    }
+
+    // Collect template HTML before machines are moved into AppState.
+    let index_html = machines.values().find_map(|m| m.template.clone());
+
     let test_mode = cfg!(debug_assertions)
         || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);
 
@@ -86,13 +101,21 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
         test_mode,
     };
 
-    Router::new()
+    let mut router = Router::new()
         .route("/state", get(get_state))
         .route("/transition", post(post_transition))
         .route("/events", get(get_events))
         .route("/test/state", post(post_test_state))
-        .layer(DefaultBodyLimit::max(256 * 1024)) // 256 KB max body
-        .with_state(app)
+        .layer(DefaultBodyLimit::max(256 * 1024))
+        .with_state(app);
+
+    // If a machine provides a template, register GET / so examples need no explicit index handler.
+    // Explicit routes take priority over any ServeDir the caller nests afterward.
+    if let Some(html) = index_html {
+        router = router.route("/", get(move || async move { Html(html) }));
+    }
+
+    router
 }
 
 // ── wire helpers ──────────────────────────────────────────────────────────────

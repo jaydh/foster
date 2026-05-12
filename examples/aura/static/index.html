@@ -97,6 +97,7 @@
       border: 1px solid var(--color-ring);
       animation: expand-ring var(--pulse-speed) ease-out infinite;
       transition: border-color 1.2s ease, animation-duration 0.8s ease;
+      pointer-events: none;
     }
     .ring:nth-child(1) { width: 100%; height: 100%; animation-delay: 0s; }
     .ring:nth-child(2) { width: 100%; height: 100%; animation-delay: calc(var(--pulse-speed) / 3); }

@@ -1,47 +1,7 @@
-use foster_core::{MachineBuilder, MachineError};
-use serde_json::{json, Value};
+use foster_core::MachineBuilder;
+use serde_json::json;
 use std::fs;
 use std::path::Path;
-
-// Mirror of main.rs reducers — gen_tests is a standalone binary.
-fn load_track(_: Value, _: Value) -> Result<Value, MachineError> {
-    Ok(json!({ "title": "", "artist": "", "position": 0, "duration": 213, "error": "" }))
-}
-fn seek_forward(c: Value, _: Value) -> Result<Value, MachineError> {
-    let pos = c["position"].as_i64().unwrap_or(0);
-    let dur = c["duration"].as_i64().unwrap_or(0);
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("position".into(), json!((pos + 10).min(dur)));
-    Ok(Value::Object(m))
-}
-fn seek_back(c: Value, _: Value) -> Result<Value, MachineError> {
-    let pos = c["position"].as_i64().unwrap_or(0);
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("position".into(), json!((pos - 10).max(0)));
-    Ok(Value::Object(m))
-}
-fn set_ended(c: Value, _: Value) -> Result<Value, MachineError> {
-    let dur = c["duration"].as_i64().unwrap_or(0);
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("position".into(), json!(dur));
-    Ok(Value::Object(m))
-}
-fn reset_position(c: Value, _: Value) -> Result<Value, MachineError> {
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("position".into(), json!(0));
-    Ok(Value::Object(m))
-}
-fn set_error(c: Value, p: Value) -> Result<Value, MachineError> {
-    let msg = p["message"].as_str().unwrap_or("Playback failed").to_string();
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("error".into(), json!(msg));
-    Ok(Value::Object(m))
-}
-fn clear_error(c: Value, _: Value) -> Result<Value, MachineError> {
-    let mut m = c.as_object().cloned().unwrap_or_default();
-    m.insert("error".into(), json!(""));
-    Ok(Value::Object(m))
-}
 
 fn main() {
     let machine = MachineBuilder::new(
@@ -50,20 +10,20 @@ fn main() {
         json!({ "title": "", "artist": "", "position": 0, "duration": 0, "error": "" }),
     )
     .state("loading").state("playing").state("paused").state("ended").state("error")
-    .on("idle",    "load",       "loading", Some(load_track))
-    .on("loading", "ready",      "playing", None)
-    .on("loading", "fail",       "error",   Some(set_error))
-    .on("playing", "pause",      "paused",  None)
-    .on("playing", "forward_10", "playing", Some(seek_forward))
-    .on("playing", "back_10",    "playing", Some(seek_back))
-    .on("playing", "end",        "ended",   Some(set_ended))
-    .on("paused",  "play",       "playing", None)
-    .on("paused",  "forward_10", "paused",  Some(seek_forward))
-    .on("paused",  "back_10",    "paused",  Some(seek_back))
-    .on("ended",   "replay",     "playing", Some(reset_position))
-    .on("ended",   "load",       "loading", Some(load_track))
-    .on("error",   "retry",      "loading", Some(clear_error))
-    .on("error",   "dismiss",    "idle",    None)
+    .pass("idle",    "load",       "loading")
+    .pass("loading", "ready",      "playing")
+    .pass("loading", "fail",       "error")
+    .pass("playing", "pause",      "paused")
+    .pass("playing", "forward_10", "playing")
+    .pass("playing", "back_10",    "playing")
+    .pass("playing", "end",        "ended")
+    .pass("paused",  "play",       "playing")
+    .pass("paused",  "forward_10", "paused")
+    .pass("paused",  "back_10",    "paused")
+    .pass("ended",   "replay",     "playing")
+    .pass("ended",   "load",       "loading")
+    .pass("error",   "retry",      "loading")
+    .pass("error",   "dismiss",    "idle")
     .build();
 
     let base_url  = "http://localhost:3001";

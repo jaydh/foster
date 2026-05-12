@@ -1,14 +1,8 @@
-use foster_core::{MachineBuilder, MachineError};
+use foster_core::MachineBuilder;
 use foster_server::router;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::HashMap;
 use tower_http::services::ServeDir;
-
-// fn-pointer reducers (not closures) so they are Send + Sync
-fn to_calm(_ctx: Value, _: Value)       -> Result<Value, MachineError> { Ok(json!({ "description": "Still. Quiet. Present.", "intensity": 0.2 })) }
-fn to_focused(_ctx: Value, _: Value)    -> Result<Value, MachineError> { Ok(json!({ "description": "Sharp. Clear. Directed.", "intensity": 0.5 })) }
-fn to_energized(_ctx: Value, _: Value)  -> Result<Value, MachineError> { Ok(json!({ "description": "Alive. Bright. Flowing.", "intensity": 0.85 })) }
-fn to_overwhelmed(_ctx: Value, _: Value)-> Result<Value, MachineError> { Ok(json!({ "description": "Scattered. Heavy. Much.", "intensity": 1.0 })) }
 
 #[tokio::main]
 async fn main() {
@@ -20,33 +14,34 @@ async fn main() {
     .state("focused")
     .state("energized")
     .state("overwhelmed")
-    // complete graph: every state can transition to every other state
-    .on("calm",       "focus",     "focused",    Some(to_focused))
-    .on("calm",       "energize",  "energized",  Some(to_energized))
-    .on("calm",       "overwhelm", "overwhelmed",Some(to_overwhelmed))
-    .on("focused",    "calm",      "calm",        Some(to_calm))
-    .on("focused",    "energize",  "energized",  Some(to_energized))
-    .on("focused",    "overwhelm", "overwhelmed",Some(to_overwhelmed))
-    .on("energized",  "calm",      "calm",        Some(to_calm))
-    .on("energized",  "focus",     "focused",    Some(to_focused))
-    .on("energized",  "overwhelm", "overwhelmed",Some(to_overwhelmed))
-    .on("overwhelmed","calm",      "calm",        Some(to_calm))
-    .on("overwhelmed","focus",     "focused",    Some(to_focused))
-    .on("overwhelmed","energize",  "energized",  Some(to_energized))
+    .on("calm",       "focus",     "focused",     |_, _| Ok(json!({ "description": "Sharp. Clear. Directed.", "intensity": 0.5  })))
+    .on("calm",       "energize",  "energized",   |_, _| Ok(json!({ "description": "Alive. Bright. Flowing.", "intensity": 0.85 })))
+    .on("calm",       "overwhelm", "overwhelmed", |_, _| Ok(json!({ "description": "Scattered. Heavy. Much.", "intensity": 1.0  })))
+    .on("focused",    "calm",      "calm",        |_, _| Ok(json!({ "description": "Still. Quiet. Present.", "intensity": 0.2  })))
+    .on("focused",    "energize",  "energized",   |_, _| Ok(json!({ "description": "Alive. Bright. Flowing.", "intensity": 0.85 })))
+    .on("focused",    "overwhelm", "overwhelmed", |_, _| Ok(json!({ "description": "Scattered. Heavy. Much.", "intensity": 1.0  })))
+    .on("energized",  "calm",      "calm",        |_, _| Ok(json!({ "description": "Still. Quiet. Present.", "intensity": 0.2  })))
+    .on("energized",  "focus",     "focused",     |_, _| Ok(json!({ "description": "Sharp. Clear. Directed.", "intensity": 0.5  })))
+    .on("energized",  "overwhelm", "overwhelmed", |_, _| Ok(json!({ "description": "Scattered. Heavy. Much.", "intensity": 1.0  })))
+    .on("overwhelmed","calm",      "calm",        |_, _| Ok(json!({ "description": "Still. Quiet. Present.", "intensity": 0.2  })))
+    .on("overwhelmed","focus",     "focused",     |_, _| Ok(json!({ "description": "Sharp. Clear. Directed.", "intensity": 0.5  })))
+    .on("overwhelmed","energize",  "energized",   |_, _| Ok(json!({ "description": "Alive. Bright. Flowing.", "intensity": 0.85 })))
+    .template(include_str!("../static/index.html"))
     .build();
 
-    let pkg_dir  = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
+    let pkg_dir    = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
 
     let mut machines = HashMap::new();
     machines.insert("aura".to_string(), machine);
 
+    // ServeDir at "/" serves CSS and other static assets; explicit GET / from the template
+    // registered by router() takes priority for the root path.
     let app = router(machines)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
         .nest_service("/", ServeDir::new(static_dir));
 
-    let addr = "0.0.0.0:3003";
-    println!("aura  →  http://localhost:3003");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3003").await.unwrap();
+    println!("Foster aura → http://localhost:3003");
     axum::serve(listener, app).await.unwrap();
 }

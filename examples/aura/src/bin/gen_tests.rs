@@ -1,27 +1,25 @@
-use foster_core::{MachineBuilder, MachineError};
-use serde_json::{json, Value};
+use foster_core::MachineBuilder;
+use serde_json::json;
 use std::fs;
 use std::path::Path;
-
-fn stub(c: Value, _: Value) -> Result<Value, MachineError> { Ok(c) }
 
 fn main() {
     let machine = MachineBuilder::new("aura", "calm", json!({}))
         .state("focused")
         .state("energized")
         .state("overwhelmed")
-        .on("calm",       "focus",     "focused",    Some(stub))
-        .on("calm",       "energize",  "energized",  Some(stub))
-        .on("calm",       "overwhelm", "overwhelmed",Some(stub))
-        .on("focused",    "calm",      "calm",        Some(stub))
-        .on("focused",    "energize",  "energized",  Some(stub))
-        .on("focused",    "overwhelm", "overwhelmed",Some(stub))
-        .on("energized",  "calm",      "calm",        Some(stub))
-        .on("energized",  "focus",     "focused",    Some(stub))
-        .on("energized",  "overwhelm", "overwhelmed",Some(stub))
-        .on("overwhelmed","calm",      "calm",        Some(stub))
-        .on("overwhelmed","focus",     "focused",    Some(stub))
-        .on("overwhelmed","energize",  "energized",  Some(stub))
+        .pass("calm",       "focus",     "focused")
+        .pass("calm",       "energize",  "energized")
+        .pass("calm",       "overwhelm", "overwhelmed")
+        .pass("focused",    "calm",      "calm")
+        .pass("focused",    "energize",  "energized")
+        .pass("focused",    "overwhelm", "overwhelmed")
+        .pass("energized",  "calm",      "calm")
+        .pass("energized",  "focus",     "focused")
+        .pass("energized",  "overwhelm", "overwhelmed")
+        .pass("overwhelmed","calm",      "calm")
+        .pass("overwhelmed","focus",     "focused")
+        .pass("overwhelmed","energize",  "energized")
         .build();
 
     let base_url  = "http://localhost:3003";

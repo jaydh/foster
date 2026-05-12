@@ -1,122 +1,94 @@
 # Foster vs React — LLM Surface Area Benchmarks
 
-## How to read these numbers
+## Run it
 
-The goal is not to minimize lines of code. It's to minimize **what an LLM must reason about** to implement or modify a feature correctly. That's a different metric.
-
-```
+```bash
 ./scripts/measure.sh
 ```
 
-## Latest results
+## What is measured
 
-```
-App               LOC    ~Tokens
-counter/foster    187     2259     (includes full CSS in index.html)
-counter/react     120     1225     (no styling)
-kanban/foster     359     4483     (includes full CSS in index.html)
-kanban/react      244     2602     (no styling)
-```
+**Included:** application-specific logic only.
+**Excluded:** CSS (equal for both sides), server boilerplate (`fn main` / `tokio::main`), config files (`package.json`, `Cargo.toml`, `tsconfig.json`, `vite.config.ts`, `playwright.config.ts`), generated test files (`*.spec.ts`, `gen_tests.rs`).
 
-Raw token counts favor React slightly. But the benchmark captures three things the numbers miss:
-
----
-
-## What the numbers don't capture
-
-### 1. Test coverage is not comparable
-
-React tests cover only what the developer remembered to write. The kanban RTL test suite covers ~8 of 10 transitions — two were omitted for brevity. If you asked an LLM to "add full test coverage," it would need to enumerate all transitions manually, possibly miss some, and write brittle DOM-shape-dependent assertions.
-
-Foster tests are generated from the machine definition. Coverage is always 100% of edges, by construction, with zero authoring cost. The LLM writes the machine (which it was going to write anyway) and gets a complete test suite as a side effect.
-
-**Effective test-writing cost:**
-- React: ~60–100 tokens per transition tested
-- Foster: 0 tokens per transition (generated)
-
-For kanban's 10 transitions, that's ~600–1000 tokens the LLM never writes.
-
-### 2. Conceptual load per feature addition
-
-When adding a new feature (e.g., "add an 'archive' column to the kanban"):
-
-**React requires reasoning about:**
-- Update the `Column` type union
-- Add the column to the `KanbanAction` union
-- Handle it in the reducer switch statement (in the right case)
-- Update all three `Column` components to conditionally render the new move button
-- Update tests — which tests break? Which new ones to write?
-- Worry about re-render correctness, stale closures, key prop stability
-
-**Foster requires reasoning about:**
-- Add one `on("viewing", "move_task", "viewing", Some(move_task))` call (already exists, just add the column value)
-- Add one `<button fx-on="click->move_task" fx-payload='{"column":"archive"}'>` in HTML
-- Run `gen_tests` — new tests appear automatically
-
-The change is localized to exactly one place per concern. There is no fan-out.
-
-### 3. The LLM cannot make implicit React mistakes in Foster
-
-In React, an LLM can write code that:
-- Triggers unnecessary re-renders (missing `useCallback`, wrong `key` prop)
-- Creates stale closures in `useEffect` (missing deps array entry)
-- Causes state update batching surprises
-- Makes tests pass in isolation but fail under concurrent rendering
-
-None of these failure modes exist in Foster. There is no reconciler, no hook dependency graph, no closure capture. The state machine is a pure function. If the LLM writes a correct reducer and a correct transition, the behavior is correct.
-
-These bugs don't show up in token counts — they show up in production.
-
----
-
-## What Foster costs more
-
-### Initial setup tokens
-
-Foster requires the LLM to understand:
-- `MachineBuilder` API (~20 tokens of pattern)
-- `fn` pointer reducers vs closures (one sentence)
-- `fx-*` attribute DSL (~10 attributes)
-
-React requires understanding React itself (much larger, but the LLM already knows it from training data). For a novel framework, Foster has higher *first-time* cost. For an LLM already loaded with CLAUDE.md, it's negligible.
-
-### HTML verbosity
-
-Foster's templates include CSS. If you separate styling from structure, Foster's application-logic HTML is comparable to React JSX. The CSS is the same cost either way — React apps also have it, just in a different file.
-
----
-
-## The iteration loop comparison
-
-**React feature cycle:**
-1. LLM updates type definitions
-2. LLM updates reducer
-3. LLM updates component(s) — possibly multiple
-4. LLM writes new tests, manually enumerating what to test
-5. Run tests, iterate on failures
-6. Possibly fix re-render bugs that tests don't catch
-
-**Foster feature cycle:**
-1. LLM adds `.on()` transition + reducer function
-2. LLM adds `fx-on` attribute in HTML
-3. `./scripts/check.sh` — type-check + unit tests + gen_tests
-4. Run Playwright tests, iterate on failures
-
-Step 4 in Foster generates tests for the new transition automatically. The LLM never writes a test that covers a transition it added — it's always covered.
-
----
-
-## Methodology
-
-Files measured (application-specific, excludes config and generated code):
-
-| Implementation | Files included |
+| Side | Files counted |
 |---|---|
-| Foster counter | `examples/counter/src/main.rs`, `static/index.html` |
-| Foster kanban | `examples/kanban/src/main.rs`, `static/index.html` |
-| React counter | `App.tsx`, `App.test.tsx` |
-| React kanban | `App.tsx`, `types.ts`, `App.test.tsx` |
+| Foster | `main.rs` (reducers + machine, stops before `fn main`) · `index.html` (structure only, no `<style>` block) |
+| React | `App.tsx` · `types.ts` · `App.test.tsx` |
 
-Files excluded from both sides: `package.json`, `Cargo.toml`, `tsconfig.json`, `vite.config.ts`, `playwright.config.ts`, `gen_tests.rs`, generated `*.spec.ts`.
+Token estimate: `file_size_bytes ÷ 4`. Consistent across runs; within ~15% of tiktoken for code.
 
-Token estimate: `file_size_bytes ÷ 4`. This is within ~15% of tiktoken for typical TypeScript/Rust code and is consistent across runs.
+---
+
+## Results (as of last run)
+
+### Counter
+
+|  | LOC | ~Tokens |
+|---|---|---|
+| Foster implementation | 97 | 1385 |
+| Foster tests | 0 | **0** (generated) |
+| React implementation | 56 | 599 |
+| React tests | 61 | 626 |
+| **Net Foster vs React** | | **+160 tokens** |
+
+### Kanban
+
+|  | LOC | ~Tokens |
+|---|---|---|
+| Foster implementation | 280 | 3468 |
+| Foster tests | 0 | **0** (generated) |
+| React implementation | 169 | 1806 |
+| React tests | 71 | 796 |
+| **Net Foster vs React** | | **+866 tokens** |
+
+---
+
+## Honest interpretation
+
+**Foster costs more tokens to author in aggregate.** Rust + a separate HTML template is more verbose than JSX that collocates markup and logic. For the kanban app, Foster's implementation is roughly 2× the token cost of React's before tests are factored in. Generated tests recover ~800 tokens, leaving Foster ~866 tokens more expensive net.
+
+**Where Foster wins is not token count — it's these three things:**
+
+### 1. Test coverage is structural, not probabilistic
+
+The React test suite covers ~8 of 10 kanban transitions — the two easiest to forget were omitted. This is typical: an LLM writing tests manually enumerates what it thinks to cover.
+
+Foster tests are derived from `Machine::transitions()`. Every edge is covered by construction. Coverage can never drift below 100% because the test generator and the machine definition are the same artefact. There is no "forgot to test" failure mode.
+
+### 2. Feature deltas are fully localized
+
+Adding a new transition in Foster:
+- One `.on("from", "event", "to", Some(reducer))` call
+- One reducer function
+- One HTML attribute (`fx-on="click->event"`)
+- Run `./scripts/check.sh` — new test appears automatically
+
+Adding a new transition in React:
+- Update the action union type
+- Handle the new case in the reducer switch
+- Modify the component JSX (possibly in multiple places)
+- Write a new test, remembering to cover it
+
+The React change has five touch points across three files. The Foster change has three touch points in two files, and the test is not a touch point at all.
+
+### 3. No implicit failure modes
+
+React requires the LLM to reason correctly about:
+- Hook dependency arrays (stale closures are silent bugs)
+- Re-render batching (state updates may not apply immediately in event handlers)
+- Key prop stability in lists (wrong keys cause subtle identity bugs)
+- Test rendering lifecycle (effects may not fire in `@testing-library/react` without `act()`)
+
+None of these exist in Foster. The state machine is a pure function of `(state, event, payload) → next_state`. If the reducer is correct, the behavior is correct. There is no hidden runtime to reason about.
+
+---
+
+## What would change these numbers
+
+The implementation token gap would narrow if:
+- Foster gains a JSX-like template syntax (eliminating the verbose `fx-*` attribute verbosity)
+- The Rust reducers are written more concisely (currently idiomatic but verbose)
+- The HTML is stripped further (comments, blank lines)
+
+The test token gap is structural and won't change: Foster tests are always generated; React tests are always written.
