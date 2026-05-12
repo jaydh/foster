@@ -1,3 +1,6 @@
+pub mod store;
+pub use store::{InMemoryPubSub, InMemoryStore, PubSub, StateStore, StoreError};
+
 use axum::{
     body::{Body, Bytes},
     extract::{Query, State},
@@ -8,54 +11,20 @@ use axum::{
 };
 use axum::extract::DefaultBodyLimit;
 use foster_core::{Machine, MachineInstance, Snapshot};
-use futures_util::stream;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use std::sync::Arc;
 
 // ── state ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
-    /// Static machine definitions — keyed by machine_id.
     machines: Arc<HashMap<String, Arc<Machine>>>,
-    /// Live instances — keyed by (session_id, machine_id), created on first access.
-    instances: Arc<Mutex<HashMap<(String, String), MachineInstance>>>,
-    /// SSE broadcast channels — keyed by (session_id, machine_id).
-    broadcasts: Arc<Mutex<HashMap<(String, String), broadcast::Sender<Snapshot>>>>,
-    /// When false, `POST /test/state` returns 403.  Defaults to true in debug builds.
+    store: InMemoryStore,
+    pubsub: InMemoryPubSub,
     test_mode: bool,
-}
-
-impl AppState {
-    fn session_instance<T>(
-        &self,
-        session_id: &str,
-        machine_id: &str,
-        f: impl FnOnce(&mut MachineInstance) -> T,
-    ) -> Option<T> {
-        let mut instances = self.instances.lock().unwrap();
-        let key = (session_id.to_string(), machine_id.to_string());
-        if !instances.contains_key(&key) {
-            let machine = self.machines.get(machine_id)?.clone();
-            instances.insert(key.clone(), MachineInstance::new(machine));
-        }
-        instances.get_mut(&key).map(f)
-    }
-
-    fn broadcast(&self, session_id: &str, machine_id: &str, snap: &Snapshot) {
-        let tx = self
-            .broadcasts
-            .lock()
-            .unwrap()
-            .get(&(session_id.to_string(), machine_id.to_string()))
-            .cloned();
-        if let Some(tx) = tx {
-            let _ = tx.send(snap.clone());
-        }
-    }
 }
 
 // ── router ────────────────────────────────────────────────────────────────────
@@ -96,8 +65,8 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
 
     let app = AppState {
         machines: Arc::new(machines),
-        instances: Arc::new(Mutex::new(HashMap::new())),
-        broadcasts: Arc::new(Mutex::new(HashMap::new())),
+        store: InMemoryStore::default(),
+        pubsub: InMemoryPubSub::default(),
         test_mode,
     };
 
@@ -178,10 +147,14 @@ async fn get_state(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState>,
 ) -> Response {
-    match app.session_instance(q.session_id(), &q.machine, |inst| inst.snapshot()) {
-        Some(snap) => msgpack(&snap),
-        None => msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine)),
-    }
+    let Some(machine) = app.machines.get(&q.machine).cloned() else {
+        return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine));
+    };
+    let snap = match app.store.load(q.session_id(), &q.machine).await {
+        Some(s) => s,
+        None => MachineInstance::new(machine).snapshot(),
+    };
+    msgpack(&snap)
 }
 
 async fn post_transition(
@@ -193,56 +166,48 @@ async fn post_transition(
         Err(e) => return msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
     };
 
-    let session_id = if req.session.is_empty() { "default".to_string() } else { req.session.clone() };
+    let session_id = if req.session.is_empty() { "default".to_string() } else { req.session };
+    let Some(machine) = app.machines.get(&req.machine).cloned() else {
+        return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", req.machine));
+    };
 
-    let result = app.session_instance(&session_id, &req.machine, |inst| {
-        inst.send(&req.event, req.payload.clone())
-    });
-
-    match result {
-        None => msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", req.machine)),
-        Some(Err(e)) => msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
-        Some(Ok(snap)) => {
-            app.broadcast(&session_id, &req.machine, &snap);
-            msgpack(&snap)
+    let current = app.store.load(&session_id, &req.machine).await;
+    let mut inst = match current {
+        Some(snap) => {
+            let mut i = MachineInstance::new(machine);
+            if let Err(e) = i.restore(snap) {
+                return msgpack_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+            i
         }
+        None => MachineInstance::new(machine),
+    };
+
+    let snap = match inst.send(&req.event, req.payload) {
+        Err(e) => return msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
+        Ok(s) => s,
+    };
+
+    if let Err(e) = app.store.store(&session_id, &req.machine, &snap).await {
+        return msgpack_err(StatusCode::CONFLICT, e.to_string());
     }
+
+    app.pubsub.publish(&session_id, &req.machine, snap.clone()).await;
+    msgpack(&snap)
 }
 
 /// Server-Sent Events stream — one channel per (session_id, machine_id).
-/// After any state change (`POST /transition` or `POST /test/state`), the new
-/// snapshot is pushed here so the WASM client can update without a page reload.
+/// After any state change, the new snapshot is pushed here so the WASM client
+/// can update without a page reload.
 async fn get_events(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState>,
 ) -> impl IntoResponse {
-    let key = (q.session_id().to_string(), q.machine.clone());
-
-    let rx = {
-        let mut broadcasts = app.broadcasts.lock().unwrap();
-        broadcasts
-            .entry(key)
-            .or_insert_with(|| broadcast::channel(64).0)
-            .subscribe()
-    };
-
-    // Drive the broadcast Receiver as an SSE stream.
-    // stream::unfold avoids pulling in a StreamExt import that may conflict.
-    let sse_stream = stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(snap) => {
-                    if let Ok(event) = Event::default().json_data(snap) {
-                        return Some((Ok::<_, std::convert::Infallible>(event), rx));
-                    }
-                    // json_data failed (shouldn't happen) — skip this item
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed)    => return None,
-            }
-        }
+    let stream = app.pubsub.subscribe(q.session_id(), &q.machine);
+    let sse_stream = stream.map(|snap| {
+        Event::default().json_data(snap)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
-
     Sse::new(sse_stream).keep_alive(KeepAlive::default())
 }
 
@@ -267,16 +232,17 @@ async fn post_test_state(
     let session_id = q.session_id().to_string();
     let machine_id = snap.machine_id.clone();
 
-    let result = app.session_instance(&session_id, &machine_id, |inst| {
-        inst.restore(snap.clone()).map(|()| inst.snapshot())
-    });
-
-    let restored = match result {
-        None => return Err((StatusCode::NOT_FOUND, format!("machine '{machine_id}' not found"))),
-        Some(Err(e)) => return Err((StatusCode::BAD_REQUEST, e.to_string())),
-        Some(Ok(s)) => s,
+    let Some(machine) = app.machines.get(&machine_id).cloned() else {
+        return Err((StatusCode::NOT_FOUND, format!("machine '{machine_id}' not found")));
     };
 
-    app.broadcast(&session_id, &machine_id, &restored);
+    let mut inst = MachineInstance::new(machine);
+    inst.restore(snap.clone()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let restored = inst.snapshot();
+
+    app.store.store(&session_id, &machine_id, &restored).await
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    app.pubsub.publish(&session_id, &machine_id, restored.clone()).await;
+
     Ok(Json(restored))
 }
