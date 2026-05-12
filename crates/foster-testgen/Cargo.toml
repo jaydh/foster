@@ -1,0 +1,8 @@
+[package]
+name = "foster-testgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+foster-core = { path = "../foster-core" }
+serde_json = "1"
