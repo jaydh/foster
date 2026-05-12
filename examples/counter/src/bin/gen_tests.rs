@@ -23,7 +23,7 @@ fn main() {
     println!("wrote  {spec_path}");
 
     if !Path::new(cfg_path).exists() {
-        fs::write(cfg_path, foster_testgen::generate_playwright_config(base_url)).unwrap();
+        fs::write(cfg_path, foster_testgen::generate_playwright_config(base_url, "counter")).unwrap();
         println!("wrote  {cfg_path}");
     } else {
         println!("kept   {cfg_path}  (already exists)");

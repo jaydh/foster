@@ -35,11 +35,9 @@ async fn main() {
     let mut machines = HashMap::new();
     machines.insert("aura".to_string(), machine);
 
-    // ServeDir at "/" serves CSS and other static assets; explicit GET / from the template
-    // registered by router() takes priority for the root path.
     let app = router(machines)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
-        .nest_service("/", ServeDir::new(static_dir));
+        .fallback_service(ServeDir::new(static_dir));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3003").await.unwrap();
     println!("Foster aura → http://localhost:3003");

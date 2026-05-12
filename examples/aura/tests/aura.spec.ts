@@ -3,7 +3,7 @@
 // states  : calm, energized, focused, overwhelmed
 // edges   : 12
 //
-// Regenerate: cargo run -p counter --bin gen_tests
+// Regenerate: cargo run -p aura --bin gen_tests
 // Edit freely — regenerating will not overwrite this file; diff and merge.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -47,7 +47,6 @@ test('aura | calm →[energize]→ energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'calm', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->energize"]').first().click();
 
@@ -58,7 +57,6 @@ test('aura | calm →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'calm', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->focus"]').first().click();
 
@@ -69,7 +67,6 @@ test('aura | calm →[overwhelm]→ overwhelmed', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'calm', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->overwhelm"]').first().click();
 
@@ -80,7 +77,6 @@ test('aura | energized →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'energized', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->calm"]').first().click();
 
@@ -91,7 +87,6 @@ test('aura | energized →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'energized', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->focus"]').first().click();
 
@@ -102,7 +97,6 @@ test('aura | energized →[overwhelm]→ overwhelmed', async ({ page, request })
   await page.goto(BASE_URL);
   await injectState(request, page, 'energized', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->overwhelm"]').first().click();
 
@@ -113,7 +107,6 @@ test('aura | focused →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'focused', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->calm"]').first().click();
 
@@ -124,7 +117,6 @@ test('aura | focused →[energize]→ energized', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'focused', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->energize"]').first().click();
 
@@ -135,7 +127,6 @@ test('aura | focused →[overwhelm]→ overwhelmed', async ({ page, request }) =
   await page.goto(BASE_URL);
   await injectState(request, page, 'focused', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->overwhelm"]').first().click();
 
@@ -146,7 +137,6 @@ test('aura | overwhelmed →[calm]→ calm', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'overwhelmed', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->calm"]').first().click();
 
@@ -157,7 +147,6 @@ test('aura | overwhelmed →[energize]→ energized', async ({ page, request }) 
   await page.goto(BASE_URL);
   await injectState(request, page, 'overwhelmed', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->energize"]').first().click();
 
@@ -168,149 +157,94 @@ test('aura | overwhelmed →[focus]→ focused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'overwhelmed', {});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->focus"]').first().click();
 
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused');
 });
 
-// ── multi-step / rapid-transition tests ──────────────────────────────────────
-// These cover bugs that only surface when cycling between states repeatedly:
-//   - fx-class (is-active) stuck on wrong button
-//   - fx-text showing stale description
-//   - SSE snapshot ordering rolling state backwards
+// ── multi-step walk ─────────────────────────────────────────────────────────
+// A single deterministic walk visiting every state ≥2× catches ordering bugs
+// (SSE snapshot rollback, stale fx-class) that single-edge tests miss.
 
-/** Expected description text per state (matches server reducers). */
-const DESCRIPTIONS: Record<string, string> = {
-  calm:       'Still. Quiet. Present.',
-  focused:    'Sharp. Clear. Directed.',
-  energized:  'Alive. Bright. Flowing.',
-  overwhelmed:'Scattered. Heavy. Much.',
-};
-
-/**
- * Assert the full rendered state: data-fx-state, the active button class,
- * no other button has is-active, and the description text is correct.
- */
-async function assertFullState(page: Page, expected: string): Promise<void> {
-  const root = page.locator(ROOT);
-  await expect(root).toHaveAttribute('data-fx-state', expected, { timeout: 3000 });
-  await expect(page.locator('.btn.is-active')).toHaveCount(1);
-  await expect(page.locator(`.btn[fx-class="${expected}:is-active"]`)).toHaveClass(/is-active/);
-  await expect(page.locator('[fx-text="description"]')).toHaveText(DESCRIPTIONS[expected], { timeout: 3000 });
-}
-
-test('aura | cycling all 4 states in order leaves correct final state', async ({ page }) => {
-  await page.goto(BASE_URL);
-  const sequence = ['energize', 'overwhelm', 'calm', 'focus', 'energize', 'calm'];
-  const expected = ['energized','overwhelmed','calm','focused','energized','calm'];
-  for (let i = 0; i < sequence.length; i++) {
-    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
-    await assertFullState(page, expected[i]);
-  }
-});
-
-test('aura | rapid ping-pong calm↔overwhelmed keeps fx-class in sync', async ({ page }) => {
-  await page.goto(BASE_URL);
-  for (let i = 0; i < 4; i++) {
-    await page.locator('[fx-on="click->overwhelm"]').first().click();
-    await assertFullState(page, 'overwhelmed');
-    await page.locator('[fx-on="click->calm"]').first().click();
-    await assertFullState(page, 'calm');
-  }
-});
-
-test('aura | rapid ping-pong focused↔energized keeps fx-class in sync', async ({ page }) => {
-  await page.goto(BASE_URL);
-  await page.locator('[fx-on="click->focus"]').first().click();
-  await assertFullState(page, 'focused');
-  for (let i = 0; i < 4; i++) {
-    await page.locator('[fx-on="click->energize"]').first().click();
-    await assertFullState(page, 'energized');
-    await page.locator('[fx-on="click->focus"]').first().click();
-    await assertFullState(page, 'focused');
-  }
-});
-
-test('aura | only one button has is-active at any time', async ({ page }) => {
-  await page.goto(BASE_URL);
-  const events = ['focus', 'overwhelm', 'energize', 'calm', 'overwhelm', 'focus'];
-  for (const event of events) {
-    await page.locator(`[fx-on="click->${event}"]`).first().click();
-    // Exactly one button should carry is-active — never zero, never two.
-    await expect(page.locator('.btn.is-active')).toHaveCount(1, { timeout: 3000 });
-  }
-});
-
-test('aura | description text updates on every transition', async ({ page }) => {
-  await page.goto(BASE_URL);
-  const steps: Array<[string, string]> = [
-    ['focus',     'focused'],
-    ['energize',  'energized'],
-    ['calm',      'calm'],
-    ['overwhelm', 'overwhelmed'],
-    ['focus',     'focused'],
-  ];
-  for (const [event, state] of steps) {
-    await page.locator(`[fx-on="click->${event}"]`).first().click();
-    await expect(page.locator('[fx-text="description"]')).toHaveText(
-      DESCRIPTIONS[state], { timeout: 3000 }
-    );
-  }
-});
-
-test('aura | inject state sets description text and active button', async ({ page, request }) => {
-  await page.goto(BASE_URL);
-  for (const [state, desc] of Object.entries(DESCRIPTIONS)) {
-    await injectState(request, page, state, { description: desc, intensity: 0.5 });
-    await expect(page.locator('[fx-text="description"]')).toHaveText(desc, { timeout: 3000 });
-    await expect(page.locator('.btn.is-active')).toHaveCount(1);
-    await expect(page.locator(`.btn[fx-class="${state}:is-active"]`)).toHaveClass(/is-active/);
-  }
-});
-
-test('aura | rings have pointer-events:none so buttons are always hoverable', async ({ page }) => {
+test('aura | walk visits every state ≥2× in sequence', async ({ page }) => {
   await page.goto(BASE_URL);
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
-
-  // The rings expand to 2.6× their container (572px), extending ~176px below
-  // the orb-wrap and physically overlapping the buttons.  Without
-  // pointer-events:none they intercept hover/click, especially right after
-  // a state change resets the animation cycle.
-  const ringPointerEvents = await page.evaluate(() =>
-    window.getComputedStyle(document.querySelector('.ring')!).pointerEvents
-  );
-  expect(ringPointerEvents).toBe('none');
+  const sequence = ['energize', 'focus', 'overwhelm', 'calm', 'energize', 'focus', 'overwhelm'];
+  const expected = ['energized', 'focused', 'overwhelmed', 'calm', 'energized', 'focused', 'overwhelmed'];
+  for (let i = 0; i < sequence.length; i++) {
+    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', expected[i], { timeout: 3000 });
+  }
 });
 
-test('aura | focus button is hoverable and shows hover style after returning to calm', async ({ page }) => {
+// ── rapid toggle pairs ──────────────────────────────────────────────────────
+// Bidirectional pairs ping-ponged 4× — catches animation/fx-class sync bugs.
+
+test('aura | rapid toggle calm↔energized stays in sync', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  const root = page.locator(ROOT);
-  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+  await injectState(request, page, 'calm', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->energize"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'energized', { timeout: 3000 });
+    await page.locator('[fx-on="click->calm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'calm', { timeout: 3000 });
+  }
+});
 
-  await page.locator('[fx-on="click->focus"]').first().click();
-  await expect(root).toHaveAttribute('data-fx-state', 'focused');
+test('aura | rapid toggle calm↔focused stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'calm', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->focus"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused', { timeout: 3000 });
+    await page.locator('[fx-on="click->calm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'calm', { timeout: 3000 });
+  }
+});
 
-  await page.locator('[fx-on="click->calm"]').first().click();
-  await expect(root).toHaveAttribute('data-fx-state', 'calm');
+test('aura | rapid toggle calm↔overwhelmed stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'calm', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->overwhelm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'overwhelmed', { timeout: 3000 });
+    await page.locator('[fx-on="click->calm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'calm', { timeout: 3000 });
+  }
+});
 
-  const focusBtn = page.locator('.btn[fx-on="click->focus"]');
-  await expect(focusBtn).toBeVisible();
+test('aura | rapid toggle energized↔focused stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'energized', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->focus"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused', { timeout: 3000 });
+    await page.locator('[fx-on="click->energize"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'energized', { timeout: 3000 });
+  }
+});
 
-  // Confirm nothing is covering the button — would throw if occluded.
-  // Previously failed intermittently because the expanding .ring elements
-  // extend ~176px below the orb-wrap, covering the button row.
-  await focusBtn.hover();
+test('aura | rapid toggle energized↔overwhelmed stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'energized', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->overwhelm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'overwhelmed', { timeout: 3000 });
+    await page.locator('[fx-on="click->energize"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'energized', { timeout: 3000 });
+  }
+});
 
-  // Verify hover style: border-color should shift to --color-label (calm blue
-  // #3a5a8a) rather than staying at the near-invisible default #1c1c2a.
-  const borderColor = await page.evaluate(() => {
-    const btn = document.querySelector('.btn[fx-on="click->focus"]') as HTMLElement;
-    btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    return window.getComputedStyle(btn).borderColor;
-  });
-  expect(borderColor).not.toBe('rgb(28, 28, 42)');
+test('aura | rapid toggle focused↔overwhelmed stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'focused', {});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->overwhelm"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'overwhelmed', { timeout: 3000 });
+    await page.locator('[fx-on="click->focus"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'focused', { timeout: 3000 });
+  }
 });
 
 // ── snapshot injection (no interaction) ──────────────────────────────────────

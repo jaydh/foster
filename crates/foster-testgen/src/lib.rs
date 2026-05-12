@@ -1,19 +1,21 @@
 use foster_core::Machine;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// Generate a TypeScript Playwright test file from a machine definition.
 ///
-/// Each edge in the state graph gets exactly one test:
-///   1. Inject the source state via `POST /test/state`
-///   2. Reload the page so the client reflects the injected state
-///   3. Assert `data-fx-state` matches the source state
-///   4. Trigger the transition via the `[fx-on="click-><event>"]` element
-///   5. Assert `data-fx-state` matches the target state
+/// Produces four suites entirely from the machine graph — no manual test writing:
+///
+/// 1. **Transition coverage** — one test per directed edge (inject source → click → assert target)
+/// 2. **Snapshot injection** — one test per state (POST /test/state → assert data-fx-state)
+/// 3. **Multi-step walk** — a single deterministic walk that visits every state ≥2× in sequence,
+///    asserting data-fx-state at each step (catches stale state, SSE ordering bugs)
+/// 4. **Rapid toggle pairs** — for every pair of states connected by edges in both directions,
+///    ping-pong 4× and assert data-fx-state each time (catches fx-class/animation sync bugs)
 ///
 /// Deterministic output — no randomness — so regenerating is safe to diff.
 pub fn generate(machine: &Machine, base_url: &str) -> String {
     let mut transitions = machine.transitions();
-    // Sort for stable output
     transitions.sort_by_key(|&(from, event, to)| (from, event, to));
 
     let state_names = {
@@ -33,7 +35,7 @@ pub fn generate(machine: &Machine, base_url: &str) -> String {
     writeln!(out, "// states  : {}", state_names.join(", ")).unwrap();
     writeln!(out, "// edges   : {}", transitions.len()).unwrap();
     writeln!(out, "//").unwrap();
-    writeln!(out, "// Regenerate: cargo run -p counter --bin gen_tests").unwrap();
+    writeln!(out, "// Regenerate: cargo run -p {} --bin gen_tests", machine.id).unwrap();
     writeln!(out, "// Edit freely — regenerating will not overwrite this file; diff and merge.").unwrap();
     writeln!(out, "// ─────────────────────────────────────────────────────────────────────────────").unwrap();
     writeln!(out).unwrap();
@@ -46,7 +48,7 @@ pub fn generate(machine: &Machine, base_url: &str) -> String {
     writeln!(out, "const ROOT       = `[fx-machine=\"${{MACHINE_ID}}\"]`;").unwrap();
     writeln!(out).unwrap();
 
-    // ── helper ───────────────────────────────────────────────────────────────
+    // ── helpers ──────────────────────────────────────────────────────────────
     write!(out, "\
 /// Inject a snapshot server-side.
 /// The WASM client subscribes to SSE — the server pushes the new snapshot
@@ -63,6 +65,10 @@ async function injectState(
   version = 0
 ): Promise<void> {{
   const root = page.locator(ROOT);
+  // Wait for WASM to finish its initial bootstrap (data-fx-state is stamped
+  // after the first snapshot is applied, and the SSE listener is wired up
+  // before that fetch — so by this point the SSE channel is live).
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, {{ timeout: 5000 }});
   const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
   await request.post(`${{BASE_URL}}/test/state?session=${{sid}}`, {{
     data: {{ machine_id: MACHINE_ID, state, context, version }},
@@ -73,24 +79,17 @@ async function injectState(
 
 ").unwrap();
 
-    // ── transition tests ─────────────────────────────────────────────────────
+    // ── section 1: transition coverage ───────────────────────────────────────
     writeln!(out, "// ── transition coverage ─────────────────────────────────────────────────────").unwrap();
     writeln!(out, "// One test per edge.  All edge permutations are covered by construction.").unwrap();
     writeln!(out).unwrap();
 
-    // Build a map of context values per state.  We only have initial_context
-    // from the machine definition; use it for every source state as a scaffold.
-    // The LLM or human can specialize per state if needed.
-    let ctx_for_state = |_state: &str| -> &str { &initial_ctx };
-
-    for (from, event, to) in &transitions {
-        let ctx = ctx_for_state(from);
+    for &(from, event, to) in &transitions {
         write!(out, "\
 test('{machine_id} | {from} →[{event}]→ {to}', async ({{ page, request }}) => {{
   await page.goto(BASE_URL);
   await injectState(request, page, '{from}', {ctx});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on=\"click->{event}\"]').first().click();
 
@@ -102,18 +101,79 @@ test('{machine_id} | {from} →[{event}]→ {to}', async ({{ page, request }}) =
             from = from,
             event = event,
             to = to,
-            ctx = ctx,
+            ctx = initial_ctx,
         ).unwrap();
     }
 
-    // ── state snapshot injection tests ───────────────────────────────────────
+    // ── section 2: multi-step walk ────────────────────────────────────────────
+    let walk = compute_walk(machine, &transitions);
+    if walk.len() >= 2 {
+        writeln!(out, "// ── multi-step walk ─────────────────────────────────────────────────────────").unwrap();
+        writeln!(out, "// A single deterministic walk visiting every state ≥2× catches ordering bugs").unwrap();
+        writeln!(out, "// (SSE snapshot rollback, stale fx-class) that single-edge tests miss.").unwrap();
+        writeln!(out).unwrap();
+
+        // Build the sequence strings for the TS literal
+        let seq_events: Vec<String> = walk.iter().map(|(e, _)| format!("'{e}'")).collect();
+        let seq_states: Vec<String> = walk.iter().map(|(_, s)| format!("'{s}'")).collect();
+
+        write!(out, "\
+test('{machine_id} | walk visits every state ≥2× in sequence', async ({{ page }}) => {{
+  await page.goto(BASE_URL);
+  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, {{ timeout: 5000 }});
+  const sequence = [{events}];
+  const expected = [{states}];
+  for (let i = 0; i < sequence.length; i++) {{
+    await page.locator(`[fx-on=\"click->${{sequence[i]}}\"]`).first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', expected[i], {{ timeout: 3000 }});
+  }}
+}});
+
+",
+            machine_id = machine.id,
+            events = seq_events.join(", "),
+            states = seq_states.join(", "),
+        ).unwrap();
+    }
+
+    // ── section 3: rapid toggle pairs ────────────────────────────────────────
+    let toggle_pairs = find_toggle_pairs(&transitions);
+    if !toggle_pairs.is_empty() {
+        writeln!(out, "// ── rapid toggle pairs ──────────────────────────────────────────────────────").unwrap();
+        writeln!(out, "// Bidirectional pairs ping-ponged 4× — catches animation/fx-class sync bugs.").unwrap();
+        writeln!(out).unwrap();
+
+        for (state_a, event_a, state_b, event_b) in &toggle_pairs {
+            write!(out, "\
+test('{machine_id} | rapid toggle {state_a}↔{state_b} stays in sync', async ({{ page, request }}) => {{
+  await page.goto(BASE_URL);
+  await injectState(request, page, '{state_a}', {ctx});
+  for (let i = 0; i < 4; i++) {{
+    await page.locator('[fx-on=\"click->{event_a}\"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', '{state_b}', {{ timeout: 3000 }});
+    await page.locator('[fx-on=\"click->{event_b}\"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', '{state_a}', {{ timeout: 3000 }});
+  }}
+}});
+
+",
+                machine_id = machine.id,
+                state_a = state_a,
+                event_a = event_a,
+                state_b = state_b,
+                event_b = event_b,
+                ctx = initial_ctx,
+            ).unwrap();
+        }
+    }
+
+    // ── section 4: snapshot injection (no interaction) ───────────────────────
     writeln!(out, "// ── snapshot injection (no interaction) ──────────────────────────────────────").unwrap();
     writeln!(out, "// Verify that POST /test/state correctly sets the DOM state.").unwrap();
     writeln!(out, "// These are the building blocks; transition tests depend on them being correct.").unwrap();
     writeln!(out).unwrap();
 
-    for state in &state_names {
-        let ctx = ctx_for_state(state);
+    for &state in &state_names {
         write!(out, "\
 test('{machine_id} | inject state: {state}', async ({{ page, request }}) => {{
   await page.goto(BASE_URL);
@@ -124,15 +184,115 @@ test('{machine_id} | inject state: {state}', async ({{ page, request }}) => {{
 ",
             machine_id = machine.id,
             state = state,
-            ctx = ctx,
+            ctx = initial_ctx,
         ).unwrap();
     }
 
     out
 }
 
-/// Generate a minimal `playwright.config.ts` pointing at `base_url`.
-pub fn generate_playwright_config(base_url: &str) -> String {
+/// Deterministic walk visiting every state at least `min_visits` times.
+///
+/// Algorithm: greedy — at each step pick the transition whose target state has
+/// been visited the fewest times (ties broken by event name for stability).
+/// Stops when every state has been visited ≥ `min_visits` times or no progress
+/// can be made.
+fn compute_walk<'a>(
+    machine: &'a Machine,
+    sorted_transitions: &[(&'a str, &'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let min_visits = 2usize;
+
+    // Build adjacency: from → sorted [(event, to)]
+    let mut adj: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    for &(from, event, to) in sorted_transitions {
+        adj.entry(from).or_default().push((event, to));
+    }
+
+    let state_names: Vec<&str> = {
+        let mut v = machine.state_names();
+        v.sort();
+        v
+    };
+
+    let mut visit_count: HashMap<&str, usize> =
+        state_names.iter().map(|&s| (s, 0usize)).collect();
+
+    let mut walk: Vec<(&str, &str)> = Vec::new();
+    let mut current = machine.initial_state.as_str();
+    *visit_count.entry(current).or_insert(0) += 1;
+
+    let max_steps = state_names.len() * min_visits * 4;
+
+    for _ in 0..max_steps {
+        if visit_count.values().all(|&c| c >= min_visits) {
+            break;
+        }
+
+        let edges = match adj.get(current) {
+            Some(e) if !e.is_empty() => e,
+            _ => break,
+        };
+
+        // Pick transition to least-visited target (ties: lex by event name)
+        let best = edges
+            .iter()
+            .min_by_key(|&&(event, to)| (visit_count.get(to).copied().unwrap_or(0), event));
+
+        match best {
+            Some(&(event, to)) => {
+                walk.push((event, to));
+                current = to;
+                *visit_count.entry(to).or_insert(0) += 1;
+            }
+            None => break,
+        }
+    }
+
+    walk
+}
+
+/// Find all bidirectional state pairs: (A, event_A→B, B, event_B→A).
+///
+/// Only the lexicographically first orientation is returned to avoid duplicates.
+fn find_toggle_pairs<'a>(
+    sorted_transitions: &[(&'a str, &'a str, &'a str)],
+) -> Vec<(&'a str, &'a str, &'a str, &'a str)> {
+    let edge_map: HashMap<(&str, &str), &str> = sorted_transitions
+        .iter()
+        .map(|&(from, event, to)| ((from, to), event))
+        .collect();
+
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut pairs: Vec<(&str, &str, &str, &str)> = Vec::new();
+
+    for &(from, event, to) in sorted_transitions {
+        if from == to {
+            continue; // skip self-loops
+        }
+        if seen.contains(&(from, to)) || seen.contains(&(to, from)) {
+            continue;
+        }
+        if let Some(&rev_event) = edge_map.get(&(to, from)) {
+            // Canonical order: lexicographically smaller state first
+            let (a, ev_a, b, ev_b) = if from <= to {
+                (from, event, to, rev_event)
+            } else {
+                (to, rev_event, from, event)
+            };
+            seen.insert((a, b));
+            pairs.push((a, ev_a, b, ev_b));
+        }
+    }
+
+    pairs.sort();
+    pairs
+}
+
+/// Generate a `playwright.config.ts` pointing at `base_url`.
+///
+/// `package_name` is the Cargo package that runs the server (used in `webServer.command`).
+pub fn generate_playwright_config(base_url: &str, package_name: &str) -> String {
     format!(
         r#"import {{ defineConfig }} from '@playwright/test';
 
@@ -146,7 +306,7 @@ export default defineConfig({{
   }},
   // Run against a locally started server.  Adjust command/port as needed.
   webServer: {{
-    command : 'cargo run -p counter',
+    command : 'cargo run -p {package_name} --bin {package_name}',
     url     : '{base_url}',
     reuseExistingServer: !process.env.CI,
   }},
@@ -167,6 +327,26 @@ mod tests {
             .pass("idle", "increment", "idle")
             .pass("idle", "break_it", "error")
             .pass("error", "recover", "idle")
+            .build()
+    }
+
+    fn aura_machine() -> std::sync::Arc<Machine> {
+        MachineBuilder::new("aura", "calm", json!({}))
+            .state("focused")
+            .state("energized")
+            .state("overwhelmed")
+            .pass("calm",        "focus",     "focused")
+            .pass("calm",        "energize",  "energized")
+            .pass("calm",        "overwhelm", "overwhelmed")
+            .pass("focused",     "calm",      "calm")
+            .pass("focused",     "energize",  "energized")
+            .pass("focused",     "overwhelm", "overwhelmed")
+            .pass("energized",   "calm",      "calm")
+            .pass("energized",   "focus",     "focused")
+            .pass("energized",   "overwhelm", "overwhelmed")
+            .pass("overwhelmed", "calm",      "calm")
+            .pass("overwhelmed", "focus",     "focused")
+            .pass("overwhelmed", "energize",  "energized")
             .build()
     }
 
@@ -199,14 +379,76 @@ mod tests {
     fn playwright_assertions_use_data_attribute() {
         let m = counter_machine();
         let out = generate(&m, "http://localhost:3000");
-        // Every test assertion goes through data-fx-state
         assert!(out.contains("toHaveAttribute('data-fx-state'"));
     }
 
     #[test]
-    fn config_contains_base_url() {
-        let cfg = generate_playwright_config("http://localhost:3000");
+    fn injectstate_waits_for_wasm_bootstrap() {
+        let m = counter_machine();
+        let out = generate(&m, "http://localhost:3000");
+        // The helper must wait for WASM init before firing the inject POST
+        assert!(out.contains("toHaveAttribute('data-fx-state', /.+/"));
+    }
+
+    #[test]
+    fn walk_test_generated_for_multi_state_machine() {
+        let m = aura_machine();
+        let out = generate(&m, "http://localhost:3003");
+        assert!(out.contains("walk visits every state"));
+    }
+
+    #[test]
+    fn walk_visits_each_state_twice() {
+        let m = aura_machine();
+        let mut transitions = m.transitions();
+        transitions.sort_by_key(|&(from, event, to)| (from, event, to));
+        let walk = compute_walk(&m, &transitions);
+        // Build visit counts from the walk (starting at initial state "calm")
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        *counts.entry("calm").or_insert(0) += 1;
+        for (_, to) in &walk {
+            *counts.entry(to).or_insert(0) += 1;
+        }
+        for state in m.state_names() {
+            assert!(
+                counts.get(state).copied().unwrap_or(0) >= 2,
+                "state '{state}' visited fewer than 2 times"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_pairs_found_for_bidirectional_graph() {
+        let m = aura_machine();
+        let mut transitions = m.transitions();
+        transitions.sort_by_key(|&(f, e, t)| (f, e, t));
+        let pairs = find_toggle_pairs(&transitions);
+        // 4 states fully connected = C(4,2) = 6 bidirectional pairs
+        assert_eq!(pairs.len(), 6);
+    }
+
+    #[test]
+    fn toggle_pairs_empty_for_one_way_machine() {
+        // counter has idle→error but NOT error→idle directly (recover goes idle)
+        // Actually recover does go error→idle, so there IS a pair idle↔error
+        let m = counter_machine();
+        let mut transitions = m.transitions();
+        transitions.sort_by_key(|&(f, e, t)| (f, e, t));
+        let pairs = find_toggle_pairs(&transitions);
+        assert_eq!(pairs.len(), 1); // idle↔error via break_it/recover
+    }
+
+    #[test]
+    fn config_contains_package_name() {
+        let cfg = generate_playwright_config("http://localhost:3000", "counter");
+        assert!(cfg.contains("cargo run -p counter"));
         assert!(cfg.contains("http://localhost:3000"));
-        assert!(cfg.contains("defineConfig"));
+    }
+
+    #[test]
+    fn config_uses_correct_package_name() {
+        let cfg = generate_playwright_config("http://localhost:3003", "aura");
+        assert!(cfg.contains("cargo run -p aura"));
+        assert!(!cfg.contains("cargo run -p counter"));
     }
 }
