@@ -51,6 +51,51 @@ foster/
 
 `Cargo.toml` includes native crates.  `crates/foster-client` is **excluded** because it targets `wasm32-unknown-unknown` and must be built separately with `wasm-pack`.
 
+## LLM iteration loop
+
+Foster is designed so the LLM's primary feedback signal is a **failing Playwright assertion**, not a compiler error or a runtime exception. Every state name and event name in the test exactly matches the machine definition — there is nothing to invent.
+
+### Tight loop (one command)
+
+```bash
+./scripts/check.sh          # cargo check + cargo test + gen_tests (all examples)
+./scripts/check.sh kanban   # same, gen_tests for one example only
+```
+
+Run this after every change. It is fast (incremental type-check, no browser).
+
+### Full loop
+
+```bash
+./scripts/demo.sh kanban    # start the server (separate terminal)
+cd examples/kanban && npx playwright test --reporter=line
+```
+
+### Adding a feature
+
+The minimal change for any new behavior:
+
+1. Add a transition: `.on("from_state", "event_name", "to_state", Some(reducer_fn))`
+2. Add the reducer: `fn reducer_fn(ctx: Value, payload: Value) -> Result<Value, MachineError>`
+3. Add the HTML: `<button fx-on="click->event_name">label</button>`
+4. Run `./scripts/check.sh` — tests for the new edge appear automatically
+
+That's it. No test file to edit. No type file to update. The state machine is the single source of truth; everything else is derived.
+
+### What good iteration looks like
+
+```
+LLM writes machine definition
+  → ./scripts/check.sh passes (type-safe, unit tests green)
+  → Playwright test for every edge exists (generated)
+  → Run playwright test
+  → One test fails: "kanban | viewing →[move_task]→ viewing"
+  → The failing assertion tells you exactly which state/event/transition is wrong
+  → Fix the reducer, re-run, green
+```
+
+The loop is tight because the failure is always in terms the LLM already knows — state names and event names from its own machine definition.
+
 ## Quick start
 
 ```bash
@@ -232,6 +277,16 @@ SSE is unidirectional, text-based, and handled natively by `EventSource` — no 
 
 **Why `closure.forget()` in the WASM client?**
 Event listener closures and SSE `EventSource` handles are page-lifetime singletons.  Storing them in a registry adds complexity; leaking them is the conventional wasm-bindgen pattern for static handles.
+
+## Comparative benchmarks
+
+`benchmarks/` contains React implementations of the counter and kanban apps — the same specs, written idiomatically.  `scripts/measure.sh` reports LOC and token counts.
+
+The raw numbers are close (React is slightly smaller on tokens).  The meaningful differences are in `benchmarks/README.md`:
+
+- **Test coverage**: React tests cover what the developer remembered. Foster tests cover every edge automatically.  For kanban's 10 transitions, that's ~800 tokens the LLM never writes.
+- **Feature delta**: Adding a transition in Foster touches exactly one `.on()` call, one reducer, one HTML attribute.  React changes fan out across types, reducer, component(s), and test file.
+- **Zero implicit bugs**: React's reconciler, hook deps, and stale closures are entire failure classes that simply don't exist in Foster.
 
 ## Deployment
 
