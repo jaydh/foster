@@ -79,7 +79,7 @@ The minimal change for any new behavior:
 2. Add the reducer: `fn reducer_fn(ctx: Value, payload: Value) -> Result<Value, MachineError>`
    — or use `.typed_on("from", "event", "to", reducer_fn)` with a typed struct
 3. Add the HTML: `<button fx-on="click->event_name">label</button>`
-4. Run `./scripts/check.sh` — tests for the new edge appear automatically, template is validated
+4. Run `./scripts/check.sh` — tests for the new edge appear automatically (including walk and toggle-pair tests if applicable), template is validated
 
 That's it. No test file to edit. No type file to update. The state machine is the single source of truth; everything else is derived.
 
@@ -271,12 +271,24 @@ await expect(root).toHaveAttribute('data-fx-state', 'idle');
 
 ### Test generation
 
-`Machine::transitions()` returns all `(from, event, to)` triples.  `foster-testgen` generates one test per edge plus one injection-only test per state:
+`foster-testgen` derives a complete Playwright suite from the machine graph — no manual test writing.  Four suites are generated automatically:
+
+| Suite | What it covers |
+|-------|----------------|
+| **Transition coverage** | One test per directed edge: inject source state → click event → assert target |
+| **Multi-step walk** | Greedy deterministic walk visiting every state ≥2× in sequence — catches SSE snapshot ordering and stale `data-fx-state` bugs that isolated tests miss |
+| **Rapid toggle pairs** | Every pair of states connected in both directions ping-ponged 4× — catches `fx-class`/animation sync bugs |
+| **Snapshot injection** | One test per state verifying `POST /test/state` works correctly |
+
+When you add a transition, regenerating the spec adds tests for the new edge, the walk automatically extends to cover it, and a toggle-pair test appears if the new edge creates a bidirectional pair.  Nothing to write manually.
 
 ```bash
 ./scripts/gen-tests.sh          # all examples
 ./scripts/gen-tests.sh kanban   # one example
+cargo run -p aura --bin gen_tests   # single example directly
 ```
+
+The `injectState` helper in generated specs waits for WASM bootstrap before firing `POST /test/state`, so the SSE listener is always live before state is injected.
 
 ## State graph visualization (for human debugging)
 
