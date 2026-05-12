@@ -6,6 +6,8 @@
 ./scripts/measure.sh
 ```
 
+The React implementations are embedded inline in `measure.sh` — not committed as separate files. The script writes them to a temp dir, measures, and cleans up.
+
 ## What is measured
 
 **Included:** application-specific logic only.
@@ -28,9 +30,9 @@ Token estimate: `file_size_bytes ÷ 4`. Consistent across runs; within ~15% of t
 |---|---|---|
 | Foster implementation | 69 | 860 |
 | Foster tests | 0 | **0** (generated) |
-| React implementation | 56 | 599 |
-| React tests | 61 | 626 |
-| **Net Foster vs React** | | **−365 tokens** |
+| React implementation | 56 | 515 |
+| React tests | 61 | 590 |
+| **Net Foster vs React** | | **−245 tokens** |
 
 ### Kanban
 
@@ -38,9 +40,9 @@ Token estimate: `file_size_bytes ÷ 4`. Consistent across runs; within ~15% of t
 |---|---|---|
 | Foster implementation | 201 | 2484 |
 | Foster tests | 0 | **0** (generated) |
-| React implementation | 169 | 1806 |
-| React tests | 71 | 796 |
-| **Net Foster vs React** | | **−118 tokens** |
+| React implementation | 165 | 1671 |
+| React tests | 70 | 725 |
+| **Net Foster vs React** | | **+88 tokens (impl) / −725 tokens (tests)** |
 
 ---
 
