@@ -233,6 +233,23 @@ SSE is unidirectional, text-based, and handled natively by `EventSource` — no 
 **Why `closure.forget()` in the WASM client?**
 Event listener closures and SSE `EventSource` handles are page-lifetime singletons.  Storing them in a registry adds complexity; leaking them is the conventional wasm-bindgen pattern for static handles.
 
+## Deployment
+
+Foster's app server is plain HTTP/1.1 — intentionally so.  **HTTP/2 termination belongs at the edge**, handled by a reverse proxy that the framework author chooses.  Foster requires HTTP/2 at that edge; running it behind HTTP/1.1 only will break SSE under load (six-connection-per-origin browser limit).
+
+**Recommended local setup (Caddy):**
+
+```bash
+# Install: brew install caddy
+caddy reverse-proxy --from https://localhost:3000 --to localhost:3000
+```
+
+Caddy automatically provisions a locally-trusted TLS cert via its built-in CA (no browser warnings, no manual cert steps) and negotiates h2 via ALPN.
+
+**Playwright:** add `ignoreHTTPSErrors: true` to `playwright.config.ts` when testing against the local TLS endpoint, or point tests directly at the HTTP backend and accept HTTP/1.1 for test runs.
+
+**Production:** put any HTTP/2-capable proxy in front — Caddy, nginx, Envoy, Cloudflare, etc.  The Foster app server itself has no opinion on TLS or the outer protocol.
+
 ## What's next
 
 ### Medium-term
