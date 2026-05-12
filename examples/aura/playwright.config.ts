@@ -10,7 +10,7 @@ export default defineConfig({
   },
   // Run against a locally started server.  Adjust command/port as needed.
   webServer: {
-    command : 'cargo run -p counter',
+    command : 'cargo run -p aura',
     url     : 'http://localhost:3003',
     reuseExistingServer: !process.env.CI,
   },

@@ -75,10 +75,11 @@ cd examples/kanban && npx playwright test --reporter=line
 
 The minimal change for any new behavior:
 
-1. Add a transition: `.on("from_state", "event_name", "to_state", Some(reducer_fn))`
+1. Add a transition: `.on("from_state", "event_name", "to_state", reducer_fn)` or `.pass(...)` for no-op
 2. Add the reducer: `fn reducer_fn(ctx: Value, payload: Value) -> Result<Value, MachineError>`
+   — or use `.typed_on("from", "event", "to", reducer_fn)` with a typed struct
 3. Add the HTML: `<button fx-on="click->event_name">label</button>`
-4. Run `./scripts/check.sh` — tests for the new edge appear automatically
+4. Run `./scripts/check.sh` — tests for the new edge appear automatically, template is validated
 
 That's it. No test file to edit. No type file to update. The state machine is the single source of truth; everything else is derived.
 
@@ -124,17 +125,55 @@ MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
         "required": ["count"],
         "properties": { "count": { "type": "integer", "minimum": 0 } }
     }))
-    .on("idle", "increment", "idle", Some(increment_fn))
-    .on("idle", "break_it",  "error", Some(passthrough))
-    .on("error", "recover",  "idle",  Some(passthrough))
+    .on("idle", "increment", "idle", |ctx, _| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 })))
+    .on("idle", "reset",     "idle", |_, _|   Ok(json!({ "count": 0 })))
+    .pass("idle",  "break_it", "error")   // passthrough — context unchanged
+    .pass("error", "recover",  "idle")
+    // Optional: co-locate HTML — served at GET /, validated at startup
+    .template(include_str!("../static/index.html"))
     .build()  // → Arc<Machine>
 ```
 
-- `Machine` is static and `Arc`-shared (Send + Sync via `fn` pointer reducers, no closures)
+### Transition methods
+
+| Method | When to use |
+|--------|-------------|
+| `.on(from, event, to, reducer)` | Reducer transforms `Value` context directly |
+| `.pass(from, event, to)` | Context passes through unchanged |
+| `.typed_on(from, event, to, reducer)` | Reducer works with a typed struct — no json! unwrapping |
+
+`.typed_on` example — field assignment replaces `json!` reconstruction:
+
+```rust
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct KanbanCtx { tasks: Vec<Task>, draft_title: String, editing_id: String, confirm_id: String }
+
+fn begin_edit(mut ctx: KanbanCtx, payload: Value) -> Result<KanbanCtx, MachineError> {
+    ctx.editing_id  = payload["id"].as_str().unwrap_or("").to_string();
+    ctx.draft_title = ctx.tasks.iter().find(|t| t.id == ctx.editing_id)
+                          .map(|t| t.title.clone()).unwrap_or_default();
+    Ok(ctx)
+}
+
+builder.typed_on("viewing", "start_edit", "editing", begin_edit)
+```
+
+- `Machine` is static and `Arc`-shared; reducers are `Arc<dyn Fn>` so closures, fn pointers, and typed wrappers all work
 - `MachineInstance` is mutable runtime state: current state + context `Value` + monotonic version
 - `Snapshot` is the unit of everything: wire format, time-travel, test injection, state diffing
 
 Key invariant: **state transitions are the only way state changes**.  The server owns instances; the client is a render layer.
+
+### Template co-location and validation
+
+`.template(html)` stores HTML in the machine. `foster_server::router()` then:
+1. Serves it at `GET /` automatically — no explicit index handler needed
+2. Validates every `fx-show` and `fx-on` attribute at startup — a typo panics the server immediately rather than silently doing nothing at runtime
+
+```rust
+// Panics at startup: "fx-on=\"click->incremnt\": event 'incremnt' not defined in machine 'counter'"
+.template(r#"<button fx-on="click->incremnt">+</button>"#)
+```
 
 ### Schema validation
 
@@ -266,8 +305,8 @@ HTMX lesson: behavior expressed as attributes is directly inspectable in devtool
 **Why MessagePack for the wire protocol?**
 Binary, compact, schema-preserving.  `rmp-serde` serializes the same `Snapshot` struct that the server uses internally — no translation layer.  JSON stays for `/test/state` because that endpoint must be curl-friendly.
 
-**Why `fn` pointers for reducers, not closures?**
-`fn` pointers are `Send + Sync`, making `Arc<Machine>` safe to share across Axum handlers without wrapping in `Arc<Mutex<...>>`.  Closures would require the machine definition to be inside a mutex.
+**Why `Arc<dyn Fn>` for reducers, not bare `fn` pointers?**
+`Arc<dyn Fn(...) + Send + Sync>` allows non-capturing closures, named fn pointers, and typed reducer wrappers (from `.typed_on`) to all use the same storage.  The `Send + Sync` bounds on the trait object preserve thread safety — `Arc<Machine>` remains safe to clone across Axum handlers without a mutex.
 
 **Why inline schema validation instead of a jsonschema crate?**
 `foster-core` is shared between native server code and the WASM client.  External JSON Schema crates pull in network and filesystem dependencies that don't compile to `wasm32-unknown-unknown`.  The inline validator covers the subset that matters for context shape enforcement with zero dependencies.
