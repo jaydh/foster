@@ -231,6 +231,27 @@ cargo run -p aura --bin gen_tests           # one example
 The generated `injectState` helper waits for WASM bootstrap before injecting,
 so the SSE listener is always wired before state is pushed.
 
+## Roadmap — what to build next
+
+When asked to add a feature, check here first so your design is consistent with planned work.
+
+### Pending items
+
+| Item | Design notes |
+|------|-------------|
+| **HA / multi-replica** | `StateStore` + `PubSub` traits are already defined in `crates/foster-server/src/store.rs`. Implement `RedisStore` and `RedisPubSub` using `redis-rs`. `AppState` should become generic over both traits. The `version` field on `Snapshot` is the optimistic lock token — use a Redis Lua CAS script or `WATCH`/`MULTI` to reject stale writes. |
+| **Time-travel debugger** | Ring buffer of snapshots in `MachineInstance` (cap ~50). Expose `GET /debug/history?session=<sid>&machine=<id>` returning `Vec<Snapshot>`. Add `POST /rewind?version=N` that calls `restore()`. Store trait will need a `history()` method for the Redis path. |
+| **State graph UI** | `GET /debug/graph` returns a self-contained HTML page. Use D3 force layout SVG. Nodes = states, edges = events. Highlight current state per session via SSE. Add only in debug builds / behind `FOSTER_DEV_UI=1`. |
+| **Dev overlay** | Floating panel injected via `<script>` tag in debug builds. Shows current state, version, last event, and a "jump to state" dropdown calling `POST /test/state`. Off in release. |
+| **Multiple machines per page** | Instance addressing syntax: `fx-machine="counter#1"`. The `#fragment` becomes the instance key appended to the session. WASM client needs to split on `#` when building the session key. |
+| **Generated TypeScript SDK** | Derive typed `sendEvent(event: CounterEvent, payload?: ...) → Promise<Snapshot>` and `setState(snap: Snapshot)` from the machine definition. Output alongside the Playwright spec in `gen_tests`. |
+| **Compiled machine validation** | Proc-macro that turns a `MachineBuilder` into a compile-time-checked type graph: Rust enum for states, exhaustive `match` on events. Catches unreachable states and missing transitions at compile time. |
+| **Differential rendering** | Server sends a JSON Patch (`RFC 6902`) diff of context instead of the full snapshot. Reduces wire payload for large context objects (e.g. kanban task lists). WASM client applies the patch with `json-patch`. |
+
+### Already scaffolded
+
+- `StateStore` / `PubSub` traits + `InMemoryStore` / `InMemoryPubSub` impls — `crates/foster-server/src/store.rs`
+
 ## Security invariants — do not break
 
 - **All state transitions go through `machine.send()`** — never mutate `MachineInstance` directly
