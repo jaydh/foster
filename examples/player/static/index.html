@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Foster · Player</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Berkeley Mono", "Fira Code", ui-monospace, monospace;
+      background: #0d0d0d; color: #c8c8c8;
+      min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 2rem;
+    }
+
+    [fx-show] { display: none; }
+
+    .player {
+      width: 100%; max-width: 480px;
+      background: #131313;
+      border: 1px solid #222;
+      border-radius: 4px;
+      padding: 2rem;
+    }
+
+    .badge { display: inline-block; padding: 1px 8px; border: 1px solid #2a2a2a;
+             font-size: 0.7rem; color: #555; border-radius: 2px; }
+    .state-row { margin-bottom: 1.5rem; font-size: 0.75rem; color: #444; }
+
+    /* idle */
+    .idle-art { width: 100%; aspect-ratio: 1; background: #1a1a1a; border: 1px solid #222;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 3rem; margin-bottom: 1.5rem; }
+    .load-btn { width: 100%; padding: 12px; background: #1e1e1e; border: 1px solid #333;
+                color: #c8c8c8; cursor: pointer; font-family: inherit; font-size: 0.9rem; }
+    .load-btn:hover { background: #252525; }
+
+    /* loading */
+    .spinner { text-align: center; padding: 3rem; color: #555; font-size: 0.85rem; }
+
+    /* playing / paused */
+    .track-info { margin-bottom: 1.5rem; }
+    .track-title  { font-size: 1.1rem; font-weight: 600; color: #fff; margin-bottom: 0.25rem; }
+    .track-artist { font-size: 0.8rem; color: #666; }
+
+    .progress-bar {
+      height: 3px; background: #1e1e1e; border-radius: 2px;
+      margin: 1rem 0 0.4rem;
+      position: relative;
+    }
+    .progress-fill {
+      position: absolute; left: 0; top: 0; height: 100%;
+      background: #fff; border-radius: 2px;
+      /* width set dynamically via inline style by server or kept static for PoC */
+    }
+    .time-row { display: flex; justify-content: space-between;
+                font-size: 0.7rem; color: #555; margin-bottom: 1.5rem; }
+
+    .controls { display: flex; gap: 0.5rem; align-items: center; justify-content: center; }
+    .btn { background: #1a1a1a; border: 1px solid #2a2a2a; color: #c8c8c8;
+           padding: 8px 16px; cursor: pointer; font-family: inherit; font-size: 0.85rem;
+           transition: background 0.1s; }
+    .btn:hover:not([disabled]) { background: #222; }
+    .btn[disabled] { opacity: 0.3; cursor: not-allowed; }
+    .btn-primary { border-color: #444; color: #fff; }
+    .btn-sm { padding: 6px 12px; font-size: 0.75rem; }
+
+    /* ended */
+    .ended-msg { text-align: center; padding: 1.5rem 0; color: #555; font-size: 0.85rem; }
+
+    /* error */
+    .error-box { border: 1px solid #5a2020; background: #110808; padding: 1.2rem; border-radius: 3px; }
+    .error-msg { color: #d07070; font-size: 0.85rem; margin-bottom: 1rem; }
+
+    details { margin-top: 1.5rem; width: 100%; max-width: 480px; }
+    summary { font-size: 0.7rem; color: #333; cursor: pointer; text-transform: uppercase; letter-spacing: 0.1em; }
+    pre { background: #0a0a0a; border: 1px solid #1a1a1a; padding: 0.75rem;
+          font-size: 0.7rem; color: #555; overflow: auto; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+
+<div class="player" fx-machine="player">
+  <div class="state-row">state: <span class="badge" fx-state-label>…</span></div>
+
+  <!-- ── idle ─────────────────────────────────────────────────────────────── -->
+  <div fx-show="idle">
+    <div class="idle-art">♫</div>
+    <button class="load-btn" fx-on="click->load">Load track</button>
+  </div>
+
+  <!-- ── loading ───────────────────────────────────────────────────────────── -->
+  <div fx-show="loading" class="spinner">
+    Loading track…
+  </div>
+
+  <!-- ── playing + paused (shared chrome) ──────────────────────────────────── -->
+  <div fx-show="playing,paused">
+    <div class="track-info">
+      <div class="track-title"  fx-text="title">—</div>
+      <div class="track-artist" fx-text="artist">—</div>
+    </div>
+
+    <div class="progress-bar">
+      <!-- Width driven by inline style is beyond the current attribute set;
+           the PoC shows raw seconds instead. A real impl would add fx-style. -->
+      <div class="progress-fill" style="width: 0%"></div>
+    </div>
+    <div class="time-row">
+      <span fx-text="position">0</span>s
+      <span fx-text="duration">0</span>s
+    </div>
+
+    <div class="controls">
+      <button class="btn btn-sm" fx-on="click->back_10">−10s</button>
+
+      <!-- Pause visible only while playing -->
+      <button class="btn btn-primary" fx-on="click->pause" fx-show="playing">⏸</button>
+      <!-- Play visible only while paused -->
+      <button class="btn btn-primary" fx-on="click->play"  fx-show="paused">▶</button>
+
+      <button class="btn btn-sm" fx-on="click->forward_10">+10s</button>
+      <!-- Simulate track ending (replaces a real audio "ended" event) -->
+      <button class="btn btn-sm" fx-on="click->end" fx-show="playing"
+              style="color:#666;border-color:#1e1e1e">end</button>
+    </div>
+  </div>
+
+  <!-- ── ended ─────────────────────────────────────────────────────────────── -->
+  <div fx-show="ended">
+    <div class="track-info">
+      <div class="track-title" fx-text="title">—</div>
+      <div class="track-artist" fx-text="artist">—</div>
+    </div>
+    <div class="ended-msg">Track finished</div>
+    <div class="controls">
+      <button class="btn btn-primary" fx-on="click->replay">↺ Replay</button>
+      <button class="btn"            fx-on="click->load">Next track</button>
+    </div>
+  </div>
+
+  <!-- ── error ─────────────────────────────────────────────────────────────── -->
+  <div fx-show="error" class="error-box">
+    <div class="error-msg" fx-text="error">Playback failed.</div>
+    <div class="controls">
+      <button class="btn" fx-on="click->retry">Retry</button>
+      <button class="btn" fx-on="click->dismiss">Dismiss</button>
+    </div>
+  </div>
+</div>
+
+<details>
+  <summary>snapshot</summary>
+  <pre id="debug-snapshot">{}</pre>
+</details>
+
+<script type="module">
+  import init from '/pkg/foster_client.js';
+  init();
+</script>
+</body>
+</html>

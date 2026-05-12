@@ -18,7 +18,8 @@ on:
 jobs:
   improve:
     name: Autonomous improvement iteration
-    runs-on: ubuntu-latest
+    runs-on: arc-runner-set-k8s-foster
+    container: harbor.home.local/library/foster-runner:latest
     timeout-minutes: 90
 
     permissions:
@@ -30,39 +31,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Setup Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Cache Rust build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            crates/foster-client/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Playwright dependencies
-        working-directory: examples/counter
-        run: |
-          npm install
-          npx playwright install --with-deps chromium
-
-      - name: Install Claude Code CLI
-        run: npm install -g @anthropic-ai/claude-code
 
       - name: Run improvement loop
         env:

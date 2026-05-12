@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Foster · Kanban</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "Berkeley Mono", "Fira Code", ui-monospace, monospace;
+      background: #0d0d0d; color: #c8c8c8;
+      padding: 2rem;
+    }
+
+    [fx-show] { display: none; }
+
+    h1 { font-size: 0.75rem; color: #444; text-transform: uppercase;
+         letter-spacing: 0.15em; margin-bottom: 2rem; }
+
+    .badge { display: inline-block; padding: 1px 8px; border: 1px solid #2a2a2a;
+             font-size: 0.7rem; color: #555; border-radius: 2px; }
+
+    /* ── board ── */
+    .board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
+             margin-bottom: 1.5rem; }
+    .col-header { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em;
+                  color: #555; padding-bottom: 0.75rem; border-bottom: 1px solid #1c1c1c;
+                  margin-bottom: 0.75rem; }
+
+    /* ── task card (rendered by fx-for) ── */
+    /*
+      The template element (data-template) has display:none so it isn't shown
+      before WASM loads.  The WASM client removes that style on each clone.
+    */
+    .task-card {
+      background: #131313;
+      border: 1px solid #222;
+      border-radius: 3px;
+      padding: 0.6rem 0.75rem;
+      margin-bottom: 0.5rem;
+      font-size: 0.82rem;
+    }
+    .task-title { color: #ddd; margin-bottom: 0.5rem; }
+    .card-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+    .btn { background: #1a1a1a; border: 1px solid #2a2a2a; color: #888;
+           padding: 3px 10px; cursor: pointer; font-family: inherit; font-size: 0.72rem; }
+    .btn:hover:not([disabled]) { background: #1e1e1e; color: #aaa; }
+    .btn[disabled] { opacity: 0.3; cursor: not-allowed; }
+    .btn-danger { border-color: #3a1a1a; color: #c06060; }
+    .btn-danger:hover:not([disabled]) { background: #180a0a; }
+    .btn-safe  { border-color: #1a3a1a; color: #60a060; }
+
+    /* ── toolbar ── */
+    .toolbar { margin-bottom: 1rem; display: flex; gap: 0.5rem; align-items: center; }
+    .btn-add { background: #181818; border: 1px solid #333; color: #aaa;
+               padding: 6px 16px; cursor: pointer; font-family: inherit; font-size: 0.85rem; }
+    .btn-add:hover { background: #1e1e1e; }
+
+    /* ── modal overlays for create / edit / delete ── */
+    .modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 10;
+    }
+    .modal-box {
+      background: #111; border: 1px solid #2a2a2a; padding: 1.5rem;
+      width: 100%; max-width: 380px; border-radius: 3px;
+    }
+    .modal-title { font-size: 0.8rem; text-transform: uppercase;
+                   letter-spacing: 0.1em; color: #666; margin-bottom: 1rem; }
+    .modal input[type=text] {
+      width: 100%; background: #0d0d0d; border: 1px solid #2a2a2a;
+      color: #d0d0d0; padding: 8px 10px; font-family: inherit; font-size: 0.85rem;
+      margin-bottom: 1rem;
+    }
+    .modal input[type=text]:focus { outline: none; border-color: #444; }
+    .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+
+    details { margin-top: 2rem; }
+    summary { font-size: 0.7rem; color: #333; cursor: pointer;
+              text-transform: uppercase; letter-spacing: 0.1em; }
+    pre { background: #0a0a0a; border: 1px solid #1a1a1a; padding: 0.75rem;
+          font-size: 0.7rem; color: #555; overflow: auto; margin-top: 0.5rem; max-height: 300px; }
+  </style>
+</head>
+<body>
+
+<!--
+  The entire application state lives in one [fx-machine] root.
+  data-fx-state and data-fx-version are stamped here after every transition.
+
+  New attributes used here:
+    fx-for="tasks"      — renders <div class="task-card"> once per item in context.tasks
+    fx-field="title"    — binds to item.title within each fx-for clone
+    fx-payload='{"column":"todo"}'
+                        — static JSON merged into the transition payload
+    fx-collect="draft_title"
+                        — reads input value into the transition payload
+    fx-value="draft_title"
+                        — populates input from context (pre-fills on edit)
+-->
+<div fx-machine="kanban">
+
+  <h1>Foster Kanban · state: <span class="badge" fx-state-label>…</span></h1>
+
+  <!-- ── toolbar (visible in viewing state only) ───────────────────────────── -->
+  <div class="toolbar" fx-show="viewing">
+    <button class="btn-add" fx-on="click->start_create">+ New task</button>
+  </div>
+
+  <!-- ── board columns ─────────────────────────────────────────────────────── -->
+  <div class="board" fx-show="viewing">
+
+    <!-- TODO column -->
+    <div>
+      <div class="col-header">Todo</div>
+      <!--
+        fx-for="tasks" renders one clone of its first child per item in context.tasks.
+        The WASM client saves this inner HTML as the template before the first render,
+        then clears and re-renders on every snapshot.
+        data-fx-item='{...}' is stamped on each clone; the delegating click listener
+        walks up to find it and merges it into the transition payload automatically.
+      -->
+      <div fx-for="tasks" fx-where='{"column":"todo"}'>
+        <!-- item template — hidden by default, clones are shown -->
+        <div class="task-card" data-template style="display:none">
+          <div class="task-title" fx-field="title">—</div>
+          <div class="card-actions">
+            <button class="btn" fx-on="click->start_edit">edit</button>
+            <button class="btn btn-danger" fx-on="click->start_delete">del</button>
+            <button class="btn btn-safe"
+                    fx-on="click->move_task"
+                    fx-payload='{"column":"in_progress"}'>→ IP</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- IN PROGRESS column -->
+    <div>
+      <div class="col-header">In Progress</div>
+      <div fx-for="tasks" fx-where='{"column":"in_progress"}'>
+        <div class="task-card" data-template style="display:none">
+          <div class="task-title" fx-field="title">—</div>
+          <div class="card-actions">
+            <button class="btn" fx-on="click->start_edit">edit</button>
+            <button class="btn btn-danger" fx-on="click->start_delete">del</button>
+            <button class="btn btn-safe"
+                    fx-on="click->move_task"
+                    fx-payload='{"column":"done"}'>→ Done</button>
+            <button class="btn"
+                    fx-on="click->move_task"
+                    fx-payload='{"column":"todo"}'>← Todo</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- DONE column -->
+    <div>
+      <div class="col-header">Done</div>
+      <div fx-for="tasks" fx-where='{"column":"done"}'>
+        <div class="task-card" data-template style="display:none">
+          <div class="task-title" fx-field="title">—</div>
+          <div class="card-actions">
+            <button class="btn btn-danger" fx-on="click->start_delete">del</button>
+            <button class="btn"
+                    fx-on="click->move_task"
+                    fx-payload='{"column":"in_progress"}'>← IP</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /board -->
+
+  <!-- ── create modal ──────────────────────────────────────────────────────── -->
+  <div class="modal" fx-show="creating">
+    <div class="modal-box">
+      <div class="modal-title">New task</div>
+      <!--
+        fx-collect="draft_title" — value is read when "save" button is clicked
+        and sent as payload.draft_title to the server.
+      -->
+      <input type="text" placeholder="Task title…"
+             fx-collect="draft_title"
+             autofocus>
+      <div class="modal-actions">
+        <button class="btn" fx-on="click->cancel">Cancel</button>
+        <button class="btn btn-safe" fx-on="click->save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── edit modal ────────────────────────────────────────────────────────── -->
+  <div class="modal" fx-show="editing">
+    <div class="modal-box">
+      <div class="modal-title">Edit task</div>
+      <!--
+        fx-value="draft_title" — pre-populates the input with context.draft_title
+        (which begin_edit set to the task's current title).
+        fx-collect="draft_title" — sends the updated value on save.
+      -->
+      <input type="text" placeholder="Task title…"
+             fx-value="draft_title"
+             fx-collect="draft_title">
+      <div class="modal-actions">
+        <button class="btn" fx-on="click->cancel">Cancel</button>
+        <button class="btn btn-safe" fx-on="click->save">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── delete confirmation ───────────────────────────────────────────────── -->
+  <div class="modal" fx-show="confirming_delete">
+    <div class="modal-box">
+      <div class="modal-title">Delete task?</div>
+      <p style="color:#888;font-size:0.82rem;margin-bottom:1rem">
+        This cannot be undone.
+      </p>
+      <div class="modal-actions">
+        <button class="btn" fx-on="click->cancel">Cancel</button>
+        <button class="btn btn-danger" fx-on="click->confirm">Delete</button>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /fx-machine -->
+
+<details>
+  <summary>snapshot</summary>
+  <pre id="debug-snapshot">{}</pre>
+</details>
+
+<script type="module">
+  import init from '/pkg/foster_client.js';
+  init();
+</script>
+</body>
+</html>

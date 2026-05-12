@@ -56,7 +56,9 @@ async fn main() {
 
     // CARGO_MANIFEST_DIR is the examples/counter directory at compile time,
     // so pkg/ resolves correctly regardless of where `cargo run` is invoked from.
-    let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/pkg");
+    // Shared WASM build lives at the workspace root: `pkg/`
+    // Build with: wasm-pack build crates/foster-client --target web --out-dir pkg
+    let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
 
     let app = foster_server::router(machines)
         .route("/", get(index))
