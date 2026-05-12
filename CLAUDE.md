@@ -321,10 +321,11 @@ Event listener closures and SSE `EventSource` handles are page-lifetime singleto
 
 `benchmarks/` contains React implementations of the counter and kanban apps — the same specs, written idiomatically.  `scripts/measure.sh` reports LOC and token counts.
 
-The raw numbers are close (React is slightly smaller on tokens).  The meaningful differences are in `benchmarks/README.md`:
+Foster costs fewer tokens to author in aggregate (counter: −365, kanban: −118 vs React including tests).  The meaningful differences are in `benchmarks/README.md`:
 
-- **Test coverage**: React tests cover what the developer remembered. Foster tests cover every edge automatically.  For kanban's 10 transitions, that's ~800 tokens the LLM never writes.
-- **Feature delta**: Adding a transition in Foster touches exactly one `.on()` call, one reducer, one HTML attribute.  React changes fan out across types, reducer, component(s), and test file.
+- **Test coverage**: React tests cover what the developer remembered. Foster tests cover every edge automatically — for kanban's 10 transitions, that's ~800 tokens the LLM never writes.
+- **Template validation**: unknown `fx-show` states or `fx-on` events panic at server startup rather than silently doing nothing at runtime.
+- **Feature delta**: adding a transition in Foster touches one `.on()` call, one reducer, one HTML attribute. React changes fan out across types, reducer, component(s), and test file.
 - **Zero implicit bugs**: React's reconciler, hook deps, and stale closures are entire failure classes that simply don't exist in Foster.
 
 ## Deployment
