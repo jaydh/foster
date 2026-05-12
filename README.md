@@ -1,11 +1,8 @@
 # Foster
 
 A Rust web UI framework where UI is a pure function of server-managed state.
-Designed so an LLM can write, test, and iterate on a full-stack app with no
-hidden state, no framework magic, and a Playwright suite generated automatically
-from the machine definition.
-
-See [`CLAUDE.md`](CLAUDE.md) for the full reference (architecture, API, DSL, deployment).
+The server owns all state. The browser is a render layer. A WASM client
+processes `fx-*` attributes and sends named events back over HTTP.
 
 ---
 
@@ -32,8 +29,7 @@ See [`CLAUDE.md`](CLAUDE.md) for the full reference (architecture, API, DSL, dep
 │  GET  /events      → SSE stream of snapshots            │
 │  POST /test/state  → inject snapshot (debug only)       │
 │                                                         │
-│  State lives here: HashMap<(session_id, machine_id),    │
-│                            MachineInstance>             │
+│  State: HashMap<(session_id, machine_id), MachineInstance>
 └────────────┬────────────────┬───────────────────────────┘
     HTTP/MsgPack           SSE push
              │                │
@@ -45,12 +41,11 @@ See [`CLAUDE.md`](CLAUDE.md) for the full reference (architecture, API, DSL, dep
 │  2. Subscribe SSE                                       │
 │  3. GET /state → apply_snapshot_if_newer()              │
 │  4. Walk DOM, wire fx-* attributes:                     │
-│       fx-show      → toggle display                     │
-│       fx-text      → set textContent                    │
-│       fx-class     → add/remove CSS class               │
-│       fx-on        → addEventListener → POST /trans.    │
-│       fx-for       → clone template per item            │
-│       fx-collect   → read input into payload            │
+│       fx-show   → toggle display                        │
+│       fx-text   → set textContent                       │
+│       fx-class  → add/remove CSS class                  │
+│       fx-on     → addEventListener → POST /transition   │
+│       fx-for    → clone template per item               │
 │  5. On SSE snapshot → apply_snapshot_if_newer()         │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -81,8 +76,6 @@ Browser                    foster-client (WASM)         foster-server
 ```
 
 Version ordering prevents out-of-order SSE messages from rolling state backwards.
-The WASM client subscribes to SSE *before* the initial fetch, so test-injected
-state is never missed.
 
 ### Test generation
 
@@ -109,11 +102,8 @@ foster_testgen::generate()
         POST /test/state → assert data-fx-state
   │
   ▼
-aura.spec.ts  (23 tests for 4 states, 12 edges)
+aura.spec.ts  (23 tests for 4 states, 12 edges — nothing written by hand)
 ```
-
-No test IDs needed. `[fx-on="click->EVENT"]` is the universal locator;
-`data-fx-state` is the universal assertion target. Both come from the framework.
 
 ---
 
@@ -142,3 +132,48 @@ cd examples/aura && npx playwright test
 | `player`  | 3001 | 6-state media player, `fx-show` per state |
 | `kanban`  | 3002 | Multi-column board, `fx-for` list rendering |
 | `aura`    | 3003 | CSS animation showcase, `fx-class` state highlighting |
+
+---
+
+## Design decisions
+
+**Why state machines over free-form atoms?**
+Named states with typed transitions give an exhaustive, derivable state space. The test generator knows every valid event from every state, so it can cover the full graph by construction. Free-form reducers lose this.
+
+**Why HTML-first over proc-macro RSX?**
+HTMX lesson: behavior expressed as attributes is directly inspectable in devtools. No build-step mental model. Non-Rust contributors can edit templates.
+
+**Why MessagePack?**
+Binary, compact, schema-preserving. `rmp-serde` serializes the same `Snapshot` struct the server uses internally — no translation layer. JSON stays for `/test/state` because that endpoint needs to be curl-friendly.
+
+**Why SSE over WebSockets?**
+SSE is unidirectional, text-based, and handled natively by `EventSource` — no protocol upgrade or reconnect logic. The push direction (server → client) is all Foster needs; transitions go over the existing REST endpoints.
+
+**Why inline schema validation?**
+`foster-core` compiles to both native and `wasm32-unknown-unknown`. External JSON Schema crates pull in filesystem/network deps that don't compile to WASM. The inline validator covers the subset needed for context shape enforcement with zero dependencies.
+
+---
+
+## Deployment
+
+Foster's app server is plain HTTP/1.1. **HTTP/2 termination belongs at the edge** — running behind HTTP/1.1 only will break SSE under load (six-connection-per-origin browser limit).
+
+```bash
+# Local: Caddy provisions a trusted TLS cert automatically
+brew install caddy
+caddy reverse-proxy --from https://localhost:3000 --to localhost:3000
+```
+
+Production: any HTTP/2-capable proxy works — Caddy, nginx, Envoy, Cloudflare.
+
+---
+
+## Roadmap
+
+- **Time-travel debugger** — ring buffer of snapshots; `GET /debug/history`, `POST /rewind?version=N`
+- **State graph UI** — `GET /debug/graph`, real-time SVG with active session highlighting
+- **Dev overlay** — floating panel in debug builds: current state, version, last event, jump-to-state
+- **Multiple machines per page** — `fx-machine="counter#1"` instance addressing
+- **Generated TypeScript SDK** — typed `sendEvent` / `setState` wrappers derived from the machine
+- **Compiled machine validation** — proc-macro turning the state graph into exhaustive Rust enums
+- **Differential rendering** — JSON Patch diffs instead of full snapshots for large context objects
