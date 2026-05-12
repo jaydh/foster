@@ -228,7 +228,7 @@ Binary, compact, schema-preserving.  `rmp-serde` serializes the same `Snapshot` 
 `foster-core` is shared between native server code and the WASM client.  External JSON Schema crates pull in network and filesystem dependencies that don't compile to `wasm32-unknown-unknown`.  The inline validator covers the subset that matters for context shape enforcement with zero dependencies.
 
 **Why SSE instead of WebSockets for push?**
-SSE is unidirectional, text-based, and handled natively by `EventSource` — no protocol upgrade, no frame parsing, no reconnect logic to write.  The push direction (server → client) is all Foster needs; transitions go over the existing REST endpoints.
+SSE is unidirectional, text-based, and handled natively by `EventSource` — no protocol upgrade, no frame parsing, no reconnect logic to write.  The push direction (server → client) is all Foster needs; transitions go over the existing REST endpoints.  Foster requires HTTP/2 at the edge (see Deployment below), so the historical per-domain connection limit on SSE does not apply.
 
 **Why `closure.forget()` in the WASM client?**
 Event listener closures and SSE `EventSource` handles are page-lifetime singletons.  Storing them in a registry adds complexity; leaking them is the conventional wasm-bindgen pattern for static handles.
