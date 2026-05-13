@@ -196,6 +196,7 @@ Inlined — no external dependencies, compiles to WASM.
 | POST | `/test/state?session=<sid>` | JSON in/out | Inject snapshot (debug only) |
 | GET | `/debug/history?machine=<id>&session=<sid>` | JSON | History ring buffer — up to 50 snapshots, oldest first (debug only) |
 | POST | `/debug/rewind?machine=<id>&session=<sid>&version=N` | JSON | Restore a historical snapshot and broadcast via SSE (debug only) |
+| GET | `/debug/graph?machine=<id>&session=<sid>` | HTML | Self-contained state graph visualiser — SVG nodes/edges + live SSE state highlight (debug only) |
 
 `session` defaults to `"default"` if omitted.
 
@@ -292,7 +293,7 @@ When asked to add a feature, check here first so your design is consistent with 
 |------|-------------|
 | **HA / multi-replica** | `StateStore` + `PubSub` traits are already defined in `crates/foster-server/src/store.rs`. Implement `RedisStore` and `RedisPubSub` using `redis-rs`. `AppState` should become generic over both traits. The `version` field on `Snapshot` is the optimistic lock token — use a Redis Lua CAS script or `WATCH`/`MULTI` to reject stale writes. |
 | **Time-travel debugger** | ~~Ring buffer of snapshots in `MachineInstance` (cap ~50). Expose `GET /debug/history?session=<sid>&machine=<id>` returning `Vec<Snapshot>`. Add `POST /rewind?version=N` that calls `restore()`. Store trait will need a `history()` method for the Redis path.~~ **Done** — `InMemoryStore` tracks a 50-entry ring buffer per `(session, machine)`. `StateStore` trait has `history()`. `GET /debug/history?session=<sid>&machine=<id>` returns `Vec<Snapshot>` JSON. `POST /debug/rewind?session=<sid>&machine=<id>&version=N` restores a historical snapshot and broadcasts via SSE. Both routes gated by `test_mode`. |
-| **State graph UI** | `GET /debug/graph` returns a self-contained HTML page. Use D3 force layout SVG. Nodes = states, edges = events. Highlight current state per session via SSE. Add only in debug builds / behind `FOSTER_DEV_UI=1`. |
+| **State graph UI** | ~~`GET /debug/graph` returns a self-contained HTML page. Use D3 force layout SVG. Nodes = states, edges = events. Highlight current state per session via SSE. Add only in debug builds / behind `FOSTER_DEV_UI=1`.~~ **Done** — `GET /debug/graph?machine=<id>&session=<sid>` returns a self-contained HTML page. Circular SVG layout with arrowhead edges (curves for bidirectional pairs, arcs for self-loops). Initial state shown with a dashed outer ring. SSE connection highlights the current state in green. Gated by `test_mode`. |
 | **Dev overlay** | Floating panel injected via `<script>` tag in debug builds. Shows current state, version, last event, and a "jump to state" dropdown calling `POST /test/state`. Off in release. |
 | **Multiple machines per page** | Instance addressing syntax: `fx-machine="counter#1"`. The `#fragment` becomes the instance key appended to the session. WASM client needs to split on `#` when building the session key. |
 | **Generated TypeScript SDK** | Derive typed `sendEvent(event: CounterEvent, payload?: ...) → Promise<Snapshot>` and `setState(snap: Snapshot)` from the machine definition. Output alongside the Playwright spec in `gen_tests`. |
@@ -303,6 +304,7 @@ When asked to add a feature, check here first so your design is consistent with 
 
 - `StateStore` / `PubSub` traits + `InMemoryStore` / `InMemoryPubSub` impls — `crates/foster-server/src/store.rs`
 - Time-travel debugger: `GET /debug/history` + `POST /debug/rewind`, 50-entry ring buffer in `InMemoryStore`, `history()` on `StateStore` trait — `crates/foster-server/src/`
+- State graph UI: `GET /debug/graph` — self-contained SVG visualiser with live SSE state highlighting — `crates/foster-server/src/lib.rs`
 
 ## Security invariants — do not break
 
