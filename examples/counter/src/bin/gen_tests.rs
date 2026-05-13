@@ -18,9 +18,14 @@ fn main() {
     let spec_path = format!("{out_dir}/counter.spec.ts");
     let cfg_path  = concat!(env!("CARGO_MANIFEST_DIR"), "/playwright.config.ts");
 
+    let sdk_path = format!("{out_dir}/counter.sdk.ts");
+
     fs::create_dir_all(out_dir).unwrap();
     fs::write(&spec_path, foster_testgen::generate(&machine, base_url)).unwrap();
     println!("wrote  {spec_path}");
+
+    fs::write(&sdk_path, foster_testgen::generate_sdk(&machine, base_url)).unwrap();
+    println!("wrote  {sdk_path}");
 
     if !Path::new(cfg_path).exists() {
         fs::write(cfg_path, foster_testgen::generate_playwright_config(base_url, "counter")).unwrap();

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "devDependencies": {
+    "@msgpack/msgpack": "^3.0.0",
     "@playwright/test": "^1.52.0"
   }
 }
