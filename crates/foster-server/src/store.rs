@@ -267,4 +267,49 @@ mod tests {
         let err = store.store("s", "counter", &snap(1)).await.unwrap_err();
         assert!(matches!(err, StoreError::VersionConflict { .. }));
     }
+
+    // ── concurrency ───────────────────────────────────────────────────────────
+    // This test would have failed against the old separate load()+store() path:
+    // both tasks read version 1, both try to write version 2, the second gets
+    // a 409.  apply() holds a single lock across the entire read-modify-write
+    // so both tasks succeed — the second sees the state written by the first.
+
+    #[tokio::test]
+    async fn concurrent_apply_both_succeed_and_versions_are_sequential() {
+        let store = Arc::new(InMemoryStore::default());
+        // Seed a starting snapshot so both tasks have something to read.
+        store.store("s", "counter", &snap(1)).await.unwrap();
+
+        let s1 = Arc::clone(&store);
+        let s2 = Arc::clone(&store);
+
+        let t1 = tokio::spawn(async move {
+            s1.apply("s", "counter", |current| {
+                let v = current.map(|s| s.version).unwrap_or(0);
+                Ok(snap(v + 1))
+            }).await
+        });
+        let t2 = tokio::spawn(async move {
+            s2.apply("s", "counter", |current| {
+                let v = current.map(|s| s.version).unwrap_or(0);
+                Ok(snap(v + 1))
+            }).await
+        });
+
+        let r1 = t1.await.unwrap();
+        let r2 = t2.await.unwrap();
+
+        // Neither task should fail — apply() serialises them.
+        assert!(r1.is_ok(), "first apply failed: {r1:?}");
+        assert!(r2.is_ok(), "second apply failed: {r2:?}");
+
+        // One task wrote v2, the other wrote v3.  Final state must be v3.
+        let final_snap = store.load("s", "counter").await.unwrap();
+        assert_eq!(final_snap.version, 3);
+        // History must contain exactly the two intermediate writes.
+        let history = store.history("s", "counter").await;
+        assert_eq!(history.len(), 3); // seed + two applies
+        assert_eq!(history[0].version, 1);
+        assert_eq!(history[2].version, 3);
+    }
 }
