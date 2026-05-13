@@ -4,16 +4,9 @@ body {
   font-family: "Berkeley Mono", "Fira Code", monospace;
   background: #0d0d0d;
   color: #d0d0d0;
-  min-height: 100vh;
-  display: flex;
-  justify-content: center;
-  padding: 0 1.5rem 4rem;
-}
-
-[fx-machine="checkout"] {
-  width: 100%;
   max-width: 520px;
-  padding-top: 3rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 4rem;
 }
 
 /* ── header ─────────────────────────────────────────────── */

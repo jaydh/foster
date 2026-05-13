@@ -478,23 +478,8 @@ fn update_debug(document: &Document, snap: &Snapshot) {
 }
 
 // ── dev overlay (debug builds only) ──────────────────────────────────────────
-
-#[cfg(debug_assertions)]
-const OVERLAY_CSS: &str = "
-.fx-dbg{position:fixed;bottom:14px;right:14px;z-index:2147483647;font-family:monospace;font-size:12px;background:#1a1a1a;border:1px solid #333;border-radius:8px;min-width:210px;box-shadow:0 4px 24px rgba(0,0,0,.6);color:#ccc}
-.fx-dbg.min .fx-dbg-body{display:none}
-.fx-dbg-head{display:flex;align-items:center;padding:7px 10px;gap:6px;background:#242424;border-radius:7px 7px 0 0}
-.fx-dbg-body{display:flex;flex-direction:column;padding:8px 10px;gap:5px}
-.fx-dbg-row{display:flex;justify-content:space-between;align-items:center}
-.fx-dbg-key{color:#666}
-.fx-dbg-st{display:inline-block;padding:1px 8px;border-radius:10px;background:#1a3a1a;color:#4caf50}
-.fx-dbg-jump{display:flex;gap:4px;margin-top:2px}
-.fx-dbg-jump select{flex:1;background:#111;color:#ccc;border:1px solid #333;border-radius:4px;padding:2px 4px;font:11px monospace}
-.fx-dbg-jump button{background:#2a4a2a;color:#4caf50;border:1px solid #2d6a2d;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px}
-.fx-dbg-links{display:flex;gap:8px;margin-top:4px}
-.fx-dbg-links a{color:#4a9eff;text-decoration:none;font-size:11px}
-.fx-dbg-ctrl{background:none;border:none;color:#666;cursor:pointer;padding:0 2px;font-size:13px}
-";
+// CSS is served by foster-server (in the HTML before WASM runs) so there's no
+// render-cycle flash. The WASM creates the panel DOM and wires all event handlers.
 
 #[cfg(debug_assertions)]
 fn read_machine_states(machine_id: &str) -> Vec<String> {
@@ -520,15 +505,6 @@ fn read_machine_states(machine_id: &str) -> Vec<String> {
 
 #[cfg(debug_assertions)]
 fn mount_overlay(document: &Document, machine_id: &str, session_id: &str) {
-    if document.get_element_by_id("fx-dbg-css").is_none() {
-        let style = document.create_element("style").unwrap();
-        style.set_id("fx-dbg-css");
-        style.set_text_content(Some(OVERLAY_CSS));
-        if let Some(head) = document.query_selector("head").ok().flatten() {
-            head.append_child(&style).unwrap();
-        }
-    }
-
     let panel_id = format!("fx-dbg-{machine_id}");
     if document.get_element_by_id(&panel_id).is_some() {
         return;

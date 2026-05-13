@@ -3,7 +3,7 @@
 // states  : ended, error, idle, loading, paused, playing
 // edges   : 14
 //
-// Regenerate: cargo run -p counter --bin gen_tests
+// Regenerate: cargo run -p player --bin gen_tests
 // Edit freely — regenerating will not overwrite this file; diff and merge.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,10 @@ async function injectState(
   version = 0
 ): Promise<void> {
   const root = page.locator(ROOT);
+  // Wait for WASM to finish its initial bootstrap (data-fx-state is stamped
+  // after the first snapshot is applied, and the SSE listener is wired up
+  // before that fetch — so by this point the SSE channel is live).
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
   const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
   await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
@@ -43,7 +47,6 @@ test('player | ended →[load]→ loading', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'ended', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->load"]').first().click();
 
@@ -54,7 +57,6 @@ test('player | ended →[replay]→ playing', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'ended', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->replay"]').first().click();
 
@@ -65,7 +67,6 @@ test('player | error →[dismiss]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'error', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->dismiss"]').first().click();
 
@@ -76,7 +77,6 @@ test('player | error →[retry]→ loading', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'error', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->retry"]').first().click();
 
@@ -87,7 +87,6 @@ test('player | idle →[load]→ loading', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'idle', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->load"]').first().click();
 
@@ -98,7 +97,6 @@ test('player | loading →[fail]→ error', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'loading', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->fail"]').first().click();
 
@@ -109,7 +107,6 @@ test('player | loading →[ready]→ playing', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'loading', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->ready"]').first().click();
 
@@ -120,7 +117,6 @@ test('player | paused →[back_10]→ paused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'paused', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->back_10"]').first().click();
 
@@ -131,7 +127,6 @@ test('player | paused →[forward_10]→ paused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'paused', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->forward_10"]').first().click();
 
@@ -142,7 +137,6 @@ test('player | paused →[play]→ playing', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'paused', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->play"]').first().click();
 
@@ -153,7 +147,6 @@ test('player | playing →[back_10]→ playing', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'playing', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->back_10"]').first().click();
 
@@ -164,7 +157,6 @@ test('player | playing →[end]→ ended', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'playing', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->end"]').first().click();
 
@@ -175,7 +167,6 @@ test('player | playing →[forward_10]→ playing', async ({ page, request }) =>
   await page.goto(BASE_URL);
   await injectState(request, page, 'playing', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->forward_10"]').first().click();
 
@@ -186,11 +177,61 @@ test('player | playing →[pause]→ paused', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'playing', {"artist":"","duration":0,"error":"","position":0,"title":""});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->pause"]').first().click();
 
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'paused');
+});
+
+// ── multi-step walk ─────────────────────────────────────────────────────────
+// A single deterministic walk visiting every state ≥2× catches ordering bugs
+// (SSE snapshot rollback, stale fx-class) that single-edge tests miss.
+
+test('player | walk visits every state ≥2× in sequence', async ({ page }) => {
+  await page.goto(BASE_URL);
+  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+  const sequence = ['load', 'fail', 'dismiss', 'load', 'ready', 'end', 'replay', 'pause', 'back_10', 'back_10', 'play', 'end', 'load', 'fail'];
+  const expected = ['loading', 'error', 'idle', 'loading', 'playing', 'ended', 'playing', 'paused', 'paused', 'paused', 'playing', 'ended', 'loading', 'error'];
+  for (let i = 0; i < sequence.length; i++) {
+    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', expected[i], { timeout: 3000 });
+  }
+});
+
+// ── rapid toggle pairs ──────────────────────────────────────────────────────
+// Bidirectional pairs ping-ponged 4× — catches animation/fx-class sync bugs.
+
+test('player | rapid toggle ended↔playing stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'ended', {"artist":"","duration":0,"error":"","position":0,"title":""});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->replay"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'playing', { timeout: 3000 });
+    await page.locator('[fx-on="click->end"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'ended', { timeout: 3000 });
+  }
+});
+
+test('player | rapid toggle error↔loading stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'error', {"artist":"","duration":0,"error":"","position":0,"title":""});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->retry"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'loading', { timeout: 3000 });
+    await page.locator('[fx-on="click->fail"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'error', { timeout: 3000 });
+  }
+});
+
+test('player | rapid toggle paused↔playing stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'paused', {"artist":"","duration":0,"error":"","position":0,"title":""});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->play"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'playing', { timeout: 3000 });
+    await page.locator('[fx-on="click->pause"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'paused', { timeout: 3000 });
+  }
 });
 
 // ── snapshot injection (no interaction) ──────────────────────────────────────

@@ -3,7 +3,7 @@
 // states  : confirming_delete, creating, editing, viewing
 // edges   : 10
 //
-// Regenerate: cargo run -p counter --bin gen_tests
+// Regenerate: cargo run -p kanban --bin gen_tests
 // Edit freely — regenerating will not overwrite this file; diff and merge.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,10 @@ async function injectState(
   version = 0
 ): Promise<void> {
   const root = page.locator(ROOT);
+  // Wait for WASM to finish its initial bootstrap (data-fx-state is stamped
+  // after the first snapshot is applied, and the SSE listener is wired up
+  // before that fetch — so by this point the SSE channel is live).
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
   const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
   await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
@@ -41,9 +45,8 @@ async function injectState(
 
 test('kanban | confirming_delete →[cancel]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->cancel"]').first().click();
 
@@ -52,9 +55,8 @@ test('kanban | confirming_delete →[cancel]→ viewing', async ({ page, request
 
 test('kanban | confirming_delete →[confirm]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->confirm"]').first().click();
 
@@ -63,9 +65,8 @@ test('kanban | confirming_delete →[confirm]→ viewing', async ({ page, reques
 
 test('kanban | creating →[cancel]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->cancel"]').first().click();
 
@@ -74,9 +75,8 @@ test('kanban | creating →[cancel]→ viewing', async ({ page, request }) => {
 
 test('kanban | creating →[save]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->save"]').first().click();
 
@@ -85,9 +85,8 @@ test('kanban | creating →[save]→ viewing', async ({ page, request }) => {
 
 test('kanban | editing →[cancel]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->cancel"]').first().click();
 
@@ -96,9 +95,8 @@ test('kanban | editing →[cancel]→ viewing', async ({ page, request }) => {
 
 test('kanban | editing →[save]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->save"]').first().click();
 
@@ -107,9 +105,8 @@ test('kanban | editing →[save]→ viewing', async ({ page, request }) => {
 
 test('kanban | viewing →[move_task]→ viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->move_task"]').first().click();
 
@@ -118,9 +115,8 @@ test('kanban | viewing →[move_task]→ viewing', async ({ page, request }) => 
 
 test('kanban | viewing →[start_create]→ creating', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->start_create"]').first().click();
 
@@ -129,9 +125,8 @@ test('kanban | viewing →[start_create]→ creating', async ({ page, request })
 
 test('kanban | viewing →[start_delete]→ confirming_delete', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->start_delete"]').first().click();
 
@@ -140,13 +135,63 @@ test('kanban | viewing →[start_delete]→ confirming_delete', async ({ page, r
 
 test('kanban | viewing →[start_edit]→ editing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->start_edit"]').first().click();
 
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'editing');
+});
+
+// ── multi-step walk ─────────────────────────────────────────────────────────
+// A single deterministic walk visiting every state ≥2× catches ordering bugs
+// (SSE snapshot rollback, stale fx-class) that single-edge tests miss.
+
+test('kanban | walk visits every state ≥2× in sequence', async ({ page }) => {
+  await page.goto(BASE_URL);
+  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+  const sequence = ['start_create', 'cancel', 'start_delete', 'cancel', 'start_edit', 'cancel', 'start_create', 'cancel', 'start_delete', 'cancel', 'start_edit'];
+  const expected = ['creating', 'viewing', 'confirming_delete', 'viewing', 'editing', 'viewing', 'creating', 'viewing', 'confirming_delete', 'viewing', 'editing'];
+  for (let i = 0; i < sequence.length; i++) {
+    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', expected[i], { timeout: 3000 });
+  }
+});
+
+// ── rapid toggle pairs ──────────────────────────────────────────────────────
+// Bidirectional pairs ping-ponged 4× — catches animation/fx-class sync bugs.
+
+test('kanban | rapid toggle confirming_delete↔viewing stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->cancel"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'viewing', { timeout: 3000 });
+    await page.locator('[fx-on="click->start_delete"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'confirming_delete', { timeout: 3000 });
+  }
+});
+
+test('kanban | rapid toggle creating↔viewing stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->cancel"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'viewing', { timeout: 3000 });
+    await page.locator('[fx-on="click->start_create"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'creating', { timeout: 3000 });
+  }
+});
+
+test('kanban | rapid toggle editing↔viewing stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->cancel"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'viewing', { timeout: 3000 });
+    await page.locator('[fx-on="click->start_edit"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'editing', { timeout: 3000 });
+  }
 });
 
 // ── snapshot injection (no interaction) ──────────────────────────────────────
@@ -155,25 +200,25 @@ test('kanban | viewing →[start_edit]→ editing', async ({ page, request }) =>
 
 test('kanban | inject state: confirming_delete', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'confirming_delete', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'confirming_delete');
 });
 
 test('kanban | inject state: creating', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'creating', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'creating');
 });
 
 test('kanban | inject state: editing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'editing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'editing');
 });
 
 test('kanban | inject state: viewing', async ({ page, request }) => {
   await page.goto(BASE_URL);
-  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[{"column":"done","id":"1","title":"Design state model"},{"column":"in_progress","id":"2","title":"Build WASM client"},{"column":"todo","id":"3","title":"Write tests"}]});
+  await injectState(request, page, 'viewing', {"confirm_id":"","draft_title":"","editing_id":"","tasks":[]});
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'viewing');
 });
 

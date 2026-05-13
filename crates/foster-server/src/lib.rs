@@ -63,8 +63,9 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
     let test_mode = cfg!(debug_assertions)
         || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);
 
-    // Inject machine metadata so the WASM overlay can populate the jump-to-state dropdown.
-    // The overlay UI itself is Rust/WASM (foster-client, compiled with debug_assertions).
+    // Inject overlay CSS + machine metadata in debug builds.
+    // CSS is served here (not by WASM) so it's in the document before WASM runs,
+    // avoiding a render cycle where the panel briefly appears as an unstyled block.
     let overlay_script = if test_mode {
         serde_json::to_string(
             &machines.iter()
@@ -72,7 +73,10 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
                 .collect::<HashMap<_, _>>()
         )
         .ok()
-        .map(|meta| format!("<script>window.__FOSTER_MACHINES={meta};</script>"))
+        .map(|meta| format!(
+            "<style id=\"fx-dbg-css\">{OVERLAY_CSS}</style>\
+             <script>window.__FOSTER_MACHINES={meta};</script>"
+        ))
     } else { None };
 
     let app = AppState {
@@ -383,6 +387,23 @@ const SESSION = {session_json};
 </html>"##
     )
 }
+
+// ── overlay CSS (served by the server so it's in the HTML before WASM runs) ───
+const OVERLAY_CSS: &str = "\
+.fx-dbg{position:fixed;bottom:14px;right:14px;z-index:2147483647;font-family:monospace;font-size:12px;background:#1a1a1a;border:1px solid #333;border-radius:8px;min-width:210px;box-shadow:0 4px 24px rgba(0,0,0,.6);color:#ccc}\
+.fx-dbg.min .fx-dbg-body{display:none}\
+.fx-dbg-head{display:flex;align-items:center;padding:7px 10px;gap:6px;background:#242424;border-radius:7px 7px 0 0}\
+.fx-dbg-body{display:flex;flex-direction:column;padding:8px 10px;gap:5px}\
+.fx-dbg-row{display:flex;justify-content:space-between;align-items:center}\
+.fx-dbg-key{color:#666}\
+.fx-dbg-st{display:inline-block;padding:1px 8px;border-radius:10px;background:#1a3a1a;color:#4caf50}\
+.fx-dbg-jump{display:flex;gap:4px;margin-top:2px}\
+.fx-dbg-jump select{flex:1;background:#111;color:#ccc;border:1px solid #333;border-radius:4px;padding:2px 4px;font:11px monospace}\
+.fx-dbg-jump button{background:#2a4a2a;color:#4caf50;border:1px solid #2d6a2d;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px}\
+.fx-dbg-links{display:flex;gap:8px;margin-top:4px}\
+.fx-dbg-links a{color:#4a9eff;text-decoration:none;font-size:11px}\
+.fx-dbg-ctrl{background:none;border:none;color:#666;cursor:pointer;padding:0 2px;font-size:13px}\
+";
 
 // r##"..."## is required: fill="#555" contains "# which would terminate r#"..."#.
 const GRAPH_SVG_DEFS: &str = r##"<defs>
