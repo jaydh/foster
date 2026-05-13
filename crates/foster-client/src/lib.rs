@@ -36,6 +36,9 @@ async fn bootstrap() {
         attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
         attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
 
+        #[cfg(debug_assertions)]
+        mount_overlay(&document, &machine_id, &session_id);
+
         match fetch_snapshot(&machine_id, &session_id).await {
             Ok(snap) => {
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
@@ -468,7 +471,218 @@ fn val_to_string(v: &Value) -> String {
 }
 
 fn update_debug(document: &Document, snap: &Snapshot) {
-    if let Some(el) = document.get_element_by_id("debug-snapshot") {
-        el.set_text_content(Some(&serde_json::to_string_pretty(snap).unwrap_or_default()));
+    #[cfg(debug_assertions)]
+    update_overlay(document, snap);
+    #[cfg(not(debug_assertions))]
+    let _ = (document, snap);
+}
+
+// ── dev overlay (debug builds only) ──────────────────────────────────────────
+
+#[cfg(debug_assertions)]
+const OVERLAY_CSS: &str = "
+.fx-dbg{position:fixed;bottom:14px;right:14px;z-index:2147483647;font-family:monospace;font-size:12px;background:#1a1a1a;border:1px solid #333;border-radius:8px;min-width:210px;box-shadow:0 4px 24px rgba(0,0,0,.6);color:#ccc}
+.fx-dbg.min .fx-dbg-body{display:none}
+.fx-dbg-head{display:flex;align-items:center;padding:7px 10px;gap:6px;background:#242424;border-radius:7px 7px 0 0}
+.fx-dbg-body{display:flex;flex-direction:column;padding:8px 10px;gap:5px}
+.fx-dbg-row{display:flex;justify-content:space-between;align-items:center}
+.fx-dbg-key{color:#666}
+.fx-dbg-st{display:inline-block;padding:1px 8px;border-radius:10px;background:#1a3a1a;color:#4caf50}
+.fx-dbg-jump{display:flex;gap:4px;margin-top:2px}
+.fx-dbg-jump select{flex:1;background:#111;color:#ccc;border:1px solid #333;border-radius:4px;padding:2px 4px;font:11px monospace}
+.fx-dbg-jump button{background:#2a4a2a;color:#4caf50;border:1px solid #2d6a2d;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px}
+.fx-dbg-links{display:flex;gap:8px;margin-top:4px}
+.fx-dbg-links a{color:#4a9eff;text-decoration:none;font-size:11px}
+.fx-dbg-ctrl{background:none;border:none;color:#666;cursor:pointer;padding:0 2px;font-size:13px}
+";
+
+#[cfg(debug_assertions)]
+fn read_machine_states(machine_id: &str) -> Vec<String> {
+    let global = js_sys::global();
+    let Ok(machines) = js_sys::Reflect::get(&global, &JsValue::from_str("__FOSTER_MACHINES"))
+    else {
+        return vec![];
+    };
+    if machines.is_undefined() || machines.is_null() {
+        return vec![];
     }
+    let Ok(states) = js_sys::Reflect::get(&machines, &JsValue::from_str(machine_id)) else {
+        return vec![];
+    };
+    if !js_sys::Array::is_array(&states) {
+        return vec![];
+    }
+    js_sys::Array::from(&states)
+        .iter()
+        .filter_map(|v| v.as_string())
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+fn mount_overlay(document: &Document, machine_id: &str, session_id: &str) {
+    if document.get_element_by_id("fx-dbg-css").is_none() {
+        let style = document.create_element("style").unwrap();
+        style.set_id("fx-dbg-css");
+        style.set_text_content(Some(OVERLAY_CSS));
+        if let Some(head) = document.query_selector("head").ok().flatten() {
+            head.append_child(&style).unwrap();
+        }
+    }
+
+    let panel_id = format!("fx-dbg-{machine_id}");
+    if document.get_element_by_id(&panel_id).is_some() {
+        return;
+    }
+
+    let states = read_machine_states(machine_id);
+    let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
+    let options_html: String = states.iter()
+        .map(|s| format!("<option>{s}</option>"))
+        .collect();
+
+    let enc_machine = percent_encode(machine_id);
+    let enc_session = percent_encode(session_id);
+
+    let panel = document.create_element("div").unwrap();
+    panel.set_id(&panel_id);
+    panel.set_attribute("class", "fx-dbg").unwrap();
+    panel.set_inner_html(&format!(
+        "<div class=\"fx-dbg-head\">\
+          <span style=\"color:#4a9eff;font-weight:bold\">Foster</span>\
+          <span style=\"flex:1;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis\" title=\"{session_id}\"> {short_sid}\u{2026}</span>\
+          <button class=\"fx-dbg-ctrl fx-dbg-mn\">\u{2014}</button>\
+          <button class=\"fx-dbg-ctrl fx-dbg-cl\">\u{d7}</button>\
+        </div>\
+        <div class=\"fx-dbg-body\">\
+          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">machine</span><span>{machine_id}</span></div>\
+          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">state</span><span class=\"fx-dbg-st\">\u{2014}</span></div>\
+          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">version</span><span class=\"fx-dbg-ver\">\u{2014}</span></div>\
+          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">event</span><span class=\"fx-dbg-ev\" style=\"color:#aaa\">\u{2014}</span></div>\
+          <div class=\"fx-dbg-jump\">\
+            <select class=\"fx-dbg-sel\">{options_html}</select>\
+            <button class=\"fx-dbg-go\">\u{2192}</button>\
+          </div>\
+          <div class=\"fx-dbg-links\">\
+            <a href=\"/debug/graph?machine={enc_machine}&session={enc_session}\" target=\"_blank\">graph \u{2197}</a>\
+            <a href=\"/debug/history?machine={enc_machine}&session={enc_session}\" target=\"_blank\">history \u{2197}</a>\
+          </div>\
+        </div>"
+    ));
+
+    let minimized = web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .and_then(|s| s.get_item("fx-dbg-min").ok().flatten())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if minimized {
+        panel.class_list().add_1("min").unwrap();
+        if let Some(btn) = panel.query_selector(".fx-dbg-mn").ok().flatten() {
+            btn.set_text_content(Some("\u{25a1}"));
+        }
+    }
+
+    // Minimize
+    let panel_mn = panel.clone();
+    let mn_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        let minimized = panel_mn.class_list().toggle("min").unwrap_or(false);
+        if let Some(btn) = panel_mn.query_selector(".fx-dbg-mn").ok().flatten() {
+            btn.set_text_content(Some(if minimized { "\u{25a1}" } else { "\u{2014}" }));
+        }
+        if let Some(s) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+            let _ = s.set_item("fx-dbg-min", if minimized { "1" } else { "0" });
+        }
+    });
+    if let Some(btn) = panel.query_selector(".fx-dbg-mn").ok().flatten() {
+        btn.add_event_listener_with_callback("click", mn_cb.as_ref().unchecked_ref()).unwrap();
+    }
+    mn_cb.forget();
+
+    // Close
+    let panel_cl = panel.clone();
+    let cl_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        panel_cl.remove();
+    });
+    if let Some(btn) = panel.query_selector(".fx-dbg-cl").ok().flatten() {
+        btn.add_event_listener_with_callback("click", cl_cb.as_ref().unchecked_ref()).unwrap();
+    }
+    cl_cb.forget();
+
+    // Jump to state
+    let panel_go = panel.clone();
+    let mid_go = machine_id.to_string();
+    let sid_go = session_id.to_string();
+    let go_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
+        let target_state = panel_go
+            .query_selector(".fx-dbg-sel").ok().flatten()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlSelectElement>().ok())
+            .map(|s| s.value())
+            .unwrap_or_default();
+        if target_state.is_empty() { return; }
+
+        let last_ctx: Value = panel_go
+            .get_attribute("data-fx-last-ctx")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(Value::Object(Default::default()));
+
+        let body = serde_json::json!({
+            "machine_id": mid_go,
+            "state": target_state,
+            "context": last_ctx,
+            "version": 0,
+        });
+        let url = format!("/test/state?session={}", sid_go);
+        let body_str = body.to_string();
+        spawn_local(async move {
+            let opts = RequestInit::new();
+            opts.set_method("POST");
+            opts.set_body(&JsValue::from_str(&body_str));
+            opts.set_mode(RequestMode::SameOrigin);
+            let Ok(req) = Request::new_with_str_and_init(&url, &opts) else { return };
+            let _ = req.headers().set("content-type", "application/json");
+            let window = web_sys::window().unwrap();
+            let _ = JsFuture::from(window.fetch_with_request(&req)).await;
+        });
+    });
+    if let Some(btn) = panel.query_selector(".fx-dbg-go").ok().flatten() {
+        btn.add_event_listener_with_callback("click", go_cb.as_ref().unchecked_ref()).unwrap();
+    }
+    go_cb.forget();
+
+    if let Some(body) = document.query_selector("body").ok().flatten() {
+        body.append_child(&panel).unwrap();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn update_overlay(document: &Document, snap: &Snapshot) {
+    let panel_id = format!("fx-dbg-{}", snap.machine_id);
+    let Some(panel) = document.get_element_by_id(&panel_id) else { return };
+
+    if let Some(el) = panel.query_selector(".fx-dbg-st").ok().flatten() {
+        el.set_text_content(Some(&snap.state));
+    }
+    if let Some(el) = panel.query_selector(".fx-dbg-ver").ok().flatten() {
+        el.set_text_content(Some(&format!("v{}", snap.version)));
+    }
+    if let Some(el) = panel.query_selector(".fx-dbg-ev").ok().flatten() {
+        el.set_text_content(Some(snap.last_event.as_deref().unwrap_or("\u{2014}")));
+    }
+    let _ = panel.set_attribute("data-fx-last-ctx", &snap.context.to_string());
+}
+
+#[cfg(debug_assertions)]
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                use std::fmt::Write;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
