@@ -28,6 +28,10 @@ async function injectState(
   version = 0
 ): Promise<void> {
   const root = page.locator(ROOT);
+  // Wait for WASM to finish its initial bootstrap (data-fx-state is stamped
+  // after the first snapshot is applied, and the SSE listener is wired up
+  // before that fetch — so by this point the SSE channel is live).
+  await expect(root).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
   const sid  = (await root.getAttribute('data-fx-session')) ?? 'default';
   await request.post(`${BASE_URL}/test/state?session=${sid}`, {
     data: { machine_id: MACHINE_ID, state, context, version },
@@ -43,7 +47,6 @@ test('counter | error →[recover]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'error', {"count":0});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->recover"]').first().click();
 
@@ -54,7 +57,6 @@ test('counter | idle →[break_it]→ error', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'idle', {"count":0});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->break_it"]').first().click();
 
@@ -65,7 +67,6 @@ test('counter | idle →[decrement]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'idle', {"count":0});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->decrement"]').first().click();
 
@@ -76,7 +77,6 @@ test('counter | idle →[increment]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'idle', {"count":0});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->increment"]').first().click();
 
@@ -87,11 +87,39 @@ test('counter | idle →[reset]→ idle', async ({ page, request }) => {
   await page.goto(BASE_URL);
   await injectState(request, page, 'idle', {"count":0});
 
-  // Trigger the transition.
   // The `[fx-on]` attribute doubles as a universal locator — no test IDs needed.
   await page.locator('[fx-on="click->reset"]').first().click();
 
   await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'idle');
+});
+
+// ── multi-step walk ─────────────────────────────────────────────────────────
+// A single deterministic walk visiting every state ≥2× catches ordering bugs
+// (SSE snapshot rollback, stale fx-class) that single-edge tests miss.
+
+test('counter | walk visits every state ≥2× in sequence', async ({ page }) => {
+  await page.goto(BASE_URL);
+  await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', /.+/, { timeout: 5000 });
+  const sequence = ['break_it', 'recover', 'break_it'];
+  const expected = ['error', 'idle', 'error'];
+  for (let i = 0; i < sequence.length; i++) {
+    await page.locator(`[fx-on="click->${sequence[i]}"]`).first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', expected[i], { timeout: 3000 });
+  }
+});
+
+// ── rapid toggle pairs ──────────────────────────────────────────────────────
+// Bidirectional pairs ping-ponged 4× — catches animation/fx-class sync bugs.
+
+test('counter | rapid toggle error↔idle stays in sync', async ({ page, request }) => {
+  await page.goto(BASE_URL);
+  await injectState(request, page, 'error', {"count":0});
+  for (let i = 0; i < 4; i++) {
+    await page.locator('[fx-on="click->recover"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'idle', { timeout: 3000 });
+    await page.locator('[fx-on="click->break_it"]').first().click();
+    await expect(page.locator(ROOT)).toHaveAttribute('data-fx-state', 'error', { timeout: 3000 });
+  }
 });
 
 // ── snapshot injection (no interaction) ──────────────────────────────────────
