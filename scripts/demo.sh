@@ -1,35 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start one or all Foster demo servers.
+# Build WASM (dev) and start one or all Foster demo servers.
 # Usage:
-#   ./scripts/demo.sh            — start all four demos
-#   ./scripts/demo.sh counter    — start only the counter demo
-#   ./scripts/demo.sh player     — start only the player demo
-#   ./scripts/demo.sh kanban     — start only the kanban demo
-#   ./scripts/demo.sh aura       — start only the aura demo
-#
-# Each server runs in the background; Ctrl-C kills them all.
+#   ./scripts/demo.sh            — start all demos
+#   ./scripts/demo.sh kanban     — start only kanban
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 if [[ $# -eq 0 ]]; then
-    DEMOS=(counter player kanban aura)
+    DEMOS=(counter player kanban aura checkout)
 else
     DEMOS=("$@")
 fi
 
 port_for() {
     case "$1" in
-        counter) echo 3000 ;;
-        player)  echo 3001 ;;
-        kanban)  echo 3002 ;;
-        aura)    echo 3003 ;;
-        *) echo "Unknown demo: $1 (choose: counter, player, kanban, aura)" >&2; exit 1 ;;
+        counter)  echo 3000 ;;
+        player)   echo 3001 ;;
+        kanban)   echo 3002 ;;
+        aura)     echo 3003 ;;
+        checkout) echo 3004 ;;
+        *) echo "Unknown demo: $1 (choose: counter, player, kanban, aura, checkout)" >&2; exit 1 ;;
     esac
 }
 
+# ── build WASM ────────────────────────────────────────────────────────────────
+echo "▸ building foster-client (wasm-pack --dev)…"
+cd crates/foster-client
+wasm-pack build --dev --target web --out-dir pkg 2>&1 | grep -v "^\[WARN\]" || true
+rm -rf ../../pkg
+mv pkg ../../pkg
+cd ../..
+
+# ── start servers ─────────────────────────────────────────────────────────────
 PIDS=()
 
 cleanup() {

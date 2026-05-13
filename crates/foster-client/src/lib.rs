@@ -1,9 +1,44 @@
 use foster_core::Snapshot;
+use serde::Deserialize;
 use serde_json::Value;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{Document, Element, EventSource, HtmlElement, MessageEvent, Request, RequestInit, RequestMode, Response};
+
+// ── context cache ─────────────────────────────────────────────────────────────
+//
+// Tracks the last context Value received over SSE per machine, keyed by machine_id.
+// Used to apply JSON Patch diffs from "patch" SSE events against the correct base.
+// Only SSE events (snapshot/patch) update this cache — direct transition responses
+// do not, keeping the cache aligned with the server's SSE diff chain.
+
+thread_local! {
+    static CONTEXT_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+fn store_context(machine_id: &str, ctx: Value) {
+    CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(machine_id.to_string(), ctx); });
+}
+
+fn load_context(machine_id: &str) -> Value {
+    CONTEXT_CACHE.with(|c| {
+        c.borrow().get(machine_id).cloned().unwrap_or_else(|| Value::Object(Default::default()))
+    })
+}
+
+/// Deserialized form of the server's `ContextPatch` SSE event.
+#[derive(Deserialize)]
+struct ContextPatch {
+    machine_id: String,
+    state: String,
+    version: u64,
+    #[serde(default)]
+    last_event: Option<String>,
+    patch: json_patch::Patch,
+}
 
 // ── entry point ──────────────────────────────────────────────────────────────
 
@@ -41,6 +76,8 @@ async fn bootstrap() {
 
         match fetch_snapshot(&machine_id, &session_id).await {
             Ok(snap) => {
+                // Seed the context cache so the first SSE "patch" event has a valid base.
+                store_context(&snap.machine_id, snap.context.clone());
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
                 apply_snapshot_if_newer(&document, &root, &snap);
@@ -116,7 +153,7 @@ fn apply_fx_show(root: &Element, state: &str) {
         let attr = el.get_attribute("fx-show").unwrap_or_default();
         let visible = attr.split(',').any(|s| s.trim() == state);
         el.style()
-            .set_property("display", if visible { "" } else { "none" })
+            .set_property("display", if visible { "block" } else { "none" })
             .unwrap();
     }
 }
@@ -341,20 +378,45 @@ fn attach_sse_listener(document: Document, root: Element, machine_id: String, se
     let url = format!("/events?machine={machine_id}&session={session_id}");
     let Ok(es) = EventSource::new(&url) else { return };
 
-    let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-        let data = match e.data().as_string() {
-            Some(s) => s,
-            None => return,
-        };
-        let snap: Snapshot = match serde_json::from_str(&data) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        apply_snapshot_if_newer(&document, &root, &snap);
-    });
+    // "snapshot" — full state; first event on each SSE connection (or reconnect).
+    // Always update the context cache so subsequent patches have a valid base,
+    // even if the DOM version check skips the render.
+    {
+        let document = document.clone();
+        let root = root.clone();
+        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            let data = match e.data().as_string() { Some(s) => s, None => return };
+            let snap: Snapshot = match serde_json::from_str(&data) { Ok(s) => s, Err(_) => return };
+            store_context(&snap.machine_id, snap.context.clone());
+            apply_snapshot_if_newer(&document, &root, &snap);
+        });
+        es.add_event_listener_with_callback("snapshot", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
 
-    es.set_onmessage(Some(cb.as_ref().unchecked_ref()));
-    cb.forget();
+    // "patch" — RFC 6902 JSON Patch of the context field only.
+    // Always apply the patch to the cache (keeps the diff chain intact even when
+    // the DOM is already at a newer version from a direct transition response).
+    {
+        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
+            let data = match e.data().as_string() { Some(s) => s, None => return };
+            let pe: ContextPatch = match serde_json::from_str(&data) { Ok(p) => p, Err(_) => return };
+            let mut ctx = load_context(&pe.machine_id);
+            if json_patch::patch(&mut ctx, &pe.patch.0).is_err() { return; }
+            store_context(&pe.machine_id, ctx.clone());
+            let snap = Snapshot {
+                machine_id: pe.machine_id,
+                state: pe.state,
+                version: pe.version,
+                last_event: pe.last_event,
+                context: ctx,
+            };
+            apply_snapshot_if_newer(&document, &root, &snap);
+        });
+        es.add_event_listener_with_callback("patch", cb.as_ref().unchecked_ref()).unwrap();
+        cb.forget();
+    }
+
     // Prevent the EventSource from being dropped (closing the connection).
     std::mem::forget(es);
 }

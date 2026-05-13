@@ -214,17 +214,51 @@ async fn post_transition(
     }
 }
 
+/// Patch event sent over SSE after the first snapshot — only the diff is sent.
+#[derive(serde::Serialize)]
+struct ContextPatch {
+    machine_id: String,
+    state: String,
+    version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_event: Option<String>,
+    patch: json_patch::Patch,
+}
+
 /// Server-Sent Events stream — one channel per (session_id, machine_id).
-/// After any state change, the new snapshot is pushed here so the WASM client
-/// can update without a page reload.
+///
+/// The first event on each connection is a named `snapshot` (full state).
+/// Subsequent events are named `patch` (RFC 6902 JSON Patch of just the context),
+/// which reduces wire payload for large context objects (e.g. kanban task lists).
 async fn get_events(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState>,
 ) -> impl IntoResponse {
     let stream = app.pubsub.subscribe(q.session_id(), &q.machine);
-    let sse_stream = stream.map(|snap| {
-        Event::default().json_data(snap)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    let mut prev: Option<Snapshot> = None;
+    let sse_stream = stream.map(move |snap| {
+        let event = match prev.take() {
+            None => Event::default()
+                .event("snapshot")
+                .json_data(&snap)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            Some(p) => {
+                let patch = json_patch::diff(&p.context, &snap.context);
+                let msg = ContextPatch {
+                    machine_id: snap.machine_id.clone(),
+                    state: snap.state.clone(),
+                    version: snap.version,
+                    last_event: snap.last_event.clone(),
+                    patch,
+                };
+                Event::default()
+                    .event("patch")
+                    .json_data(&msg)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        };
+        prev = Some(snap);
+        event
     });
     Sse::new(sse_stream).keep_alive(KeepAlive::default())
 }
@@ -559,9 +593,11 @@ const GRAPH_RENDER_JS: &str = r#"
   const dot = document.getElementById('conn-dot');
   const url = `/events?machine=${encodeURIComponent(MACHINE)}&session=${encodeURIComponent(SESSION)}`;
   const es = new EventSource(url);
-  es.onopen    = () => dot.classList.add('live');
-  es.onerror   = () => dot.classList.remove('live');
-  es.onmessage = ev => { try { setCurrentState(JSON.parse(ev.data).state); } catch (_) {} };
+  es.onopen  = () => dot.classList.add('live');
+  es.onerror = () => dot.classList.remove('live');
+  const onState = ev => { try { setCurrentState(JSON.parse(ev.data).state); } catch (_) {} };
+  es.addEventListener('snapshot', onState);
+  es.addEventListener('patch',    onState);
 }());
 "#;
 
