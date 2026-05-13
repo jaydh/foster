@@ -48,6 +48,19 @@ pub trait StateStore: Send + Sync + 'static {
         session: &str,
         machine: &str,
     ) -> impl Future<Output = Vec<Snapshot>> + Send;
+
+    /// Atomically load the current snapshot, pass it to `f`, and store the result.
+    ///
+    /// `f` receives `None` on first access (no prior state for this session).
+    /// The load and store are a single atomic unit — no other writer can interleave.
+    /// For `InMemoryStore` this is a single Mutex acquisition; for a Redis impl it
+    /// would be a Lua CAS script.
+    fn apply(
+        &self,
+        session: &str,
+        machine: &str,
+        f: impl FnOnce(Option<Snapshot>) -> Result<Snapshot, String> + Send,
+    ) -> impl Future<Output = Result<Snapshot, String>> + Send;
 }
 
 // ── PubSub ────────────────────────────────────────────────────────────────────
@@ -120,6 +133,29 @@ impl StateStore for InMemoryStore {
             .get(&(session.to_string(), machine.to_string()))
             .map(|buf| buf.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    async fn apply(
+        &self,
+        session: &str,
+        machine: &str,
+        f: impl FnOnce(Option<Snapshot>) -> Result<Snapshot, String> + Send,
+    ) -> Result<Snapshot, String> {
+        let key = (session.to_string(), machine.to_string());
+        let next = {
+            let mut map = self.inner.lock().unwrap();
+            let current = map.get(&key).cloned();
+            let next = f(current)?;
+            map.insert(key.clone(), next.clone());
+            next
+        };
+        let mut h = self.hist.lock().unwrap();
+        let buf = h.entry(key).or_default();
+        buf.push_back(next.clone());
+        if buf.len() > HISTORY_CAP {
+            buf.pop_front();
+        }
+        Ok(next)
     }
 }
 

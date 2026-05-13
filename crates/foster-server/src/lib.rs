@@ -173,29 +173,25 @@ async fn post_transition(
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", req.machine));
     };
 
-    let current = app.store.load(&session_id, &req.machine).await;
-    let mut inst = match current {
-        Some(snap) => {
-            let mut i = MachineInstance::new(machine);
-            if let Err(e) = i.restore(snap) {
-                return msgpack_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let result = app.store.apply(&session_id, &req.machine, move |current| {
+        let mut inst = match current {
+            Some(snap) => {
+                let mut i = MachineInstance::new(machine);
+                i.restore(snap).map_err(|e| e.to_string())?;
+                i
             }
-            i
+            None => MachineInstance::new(machine),
+        };
+        inst.send(&req.event, req.payload).map_err(|e| e.to_string())
+    }).await;
+
+    match result {
+        Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
+        Ok(snap) => {
+            app.pubsub.publish(&session_id, &req.machine, snap.clone()).await;
+            msgpack(&snap)
         }
-        None => MachineInstance::new(machine),
-    };
-
-    let snap = match inst.send(&req.event, req.payload) {
-        Err(e) => return msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
-        Ok(s) => s,
-    };
-
-    if let Err(e) = app.store.store(&session_id, &req.machine, &snap).await {
-        return msgpack_err(StatusCode::CONFLICT, e.to_string());
     }
-
-    app.pubsub.publish(&session_id, &req.machine, snap.clone()).await;
-    msgpack(&snap)
 }
 
 /// Server-Sent Events stream — one channel per (session_id, machine_id).
