@@ -57,11 +57,24 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
         }
     }
 
-    // Collect template HTML before machines are moved into AppState.
+    // Collect template HTML and machine metadata before machines are moved into AppState.
     let index_html = machines.values().find_map(|m| m.template.clone());
 
     let test_mode = cfg!(debug_assertions)
         || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);
+
+    // Build overlay metadata (state names per machine) before machines is moved.
+    let overlay_script = if test_mode {
+        if let Ok(meta) = serde_json::to_string(
+            &machines.iter()
+                .map(|(id, m)| (id.clone(), m.state_names()))
+                .collect::<HashMap<_, _>>()
+        ) {
+            Some(format!(
+                "<script>window.__FOSTER_MACHINES={meta};{OVERLAY_JS}</script>"
+            ))
+        } else { None }
+    } else { None };
 
     let app = AppState {
         machines: Arc::new(machines),
@@ -81,10 +94,13 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app);
 
-    // If a machine provides a template, register GET / so examples need no explicit index handler.
-    // Explicit routes take priority over any ServeDir the caller nests afterward.
+    // Serve template at GET /, injecting the dev overlay in debug builds.
     if let Some(html) = index_html {
-        router = router.route("/", get(move || async move { Html(html) }));
+        let served = match overlay_script {
+            Some(script) => html.replace("</body>", &format!("{script}</body>")),
+            None => html,
+        };
+        router = router.route("/", get(move || async move { Html(served) }));
     }
 
     router
@@ -279,6 +295,7 @@ async fn post_debug_rewind(
         state: target.state,
         context: target.context,
         version: current_version + 1,
+        last_event: None,
     };
 
     app.store
@@ -367,6 +384,109 @@ const SESSION = {session_json};
 </html>"##
     )
 }
+
+// ── dev overlay ───────────────────────────────────────────────────────────────
+// Injected as a <script> tag into the served template HTML in debug builds.
+// Waits for the WASM client to stamp data-fx-session, then subscribes to SSE
+// for live state/version/last-event updates and wires up the jump-to-state UI.
+const OVERLAY_JS: &str = r#"
+(function(){
+  var STY = '#_fo{position:fixed;bottom:14px;right:14px;z-index:2147483647;font-family:monospace;font-size:12px;background:#1a1a1a;border:1px solid #333;border-radius:8px;min-width:210px;box-shadow:0 4px 24px rgba(0,0,0,.6);color:#ccc;}'
+    + '#_fo._min #_fob{display:none}'
+    + '#_foh{display:flex;align-items:center;padding:7px 10px;gap:6px;background:#242424;border-radius:7px 7px 0 0}'
+    + '#_fob{display:flex;flex-direction:column;padding:8px 10px;gap:5px}'
+    + '._fr{display:flex;justify-content:space-between;align-items:center}'
+    + '._fk{color:#666}'
+    + '#_fst{display:inline-block;padding:1px 8px;border-radius:10px;background:#1a3a1a;color:#4caf50}'
+    + '#_fj{display:flex;gap:4px;margin-top:2px}'
+    + '#_fj select{flex:1;background:#111;color:#ccc;border:1px solid #333;border-radius:4px;padding:2px 4px;font:11px monospace}'
+    + '#_fj button{background:#2a4a2a;color:#4caf50;border:1px solid #2d6a2d;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px}'
+    + '#_fl{display:flex;gap:8px;margin-top:4px}'
+    + '#_fl a{color:#4a9eff;text-decoration:none;font-size:11px}'
+    + '._btn{background:none;border:none;color:#666;cursor:pointer;padding:0 2px;font-size:13px}';
+
+  function init(root){
+    var machine = root.getAttribute('fx-machine');
+    var session = root.getAttribute('data-fx-session');
+    var states  = (window.__FOSTER_MACHINES||{})[machine]||[];
+    var enc     = encodeURIComponent;
+
+    var st = document.createElement('style'); st.textContent = STY;
+    document.head.appendChild(st);
+
+    var minimized = sessionStorage.getItem('_fo_min')==='1';
+    var p = document.createElement('div'); p.id='_fo';
+    if(minimized) p.classList.add('_min');
+    p.innerHTML =
+      '<div id="_foh">'
+        +'<span style="color:#4a9eff;font-weight:bold">Foster</span>'
+        +'<span style="flex:1;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+session+'"> '+session.slice(0,8)+'…</span>'
+        +'<button class="_btn" id="_fmn">'+(minimized?'□':'—')+'</button>'
+        +'<button class="_btn" id="_fcl">×</button>'
+      +'</div>'
+      +'<div id="_fob">'
+        +'<div class="_fr"><span class="_fk">machine</span><span>'+machine+'</span></div>'
+        +'<div class="_fr"><span class="_fk">state</span><span id="_fst">—</span></div>'
+        +'<div class="_fr"><span class="_fk">version</span><span id="_fver">—</span></div>'
+        +'<div class="_fr"><span class="_fk">event</span><span id="_fev" style="color:#aaa">—</span></div>'
+        +'<div id="_fj">'
+          +'<select id="_fsel">'+states.map(function(s){return'<option>'+s+'</option>';}).join('')+'</select>'
+          +'<button id="_fgo">→</button>'
+        +'</div>'
+        +'<div id="_fl">'
+          +'<a id="_fga" href="/debug/graph?machine='+enc(machine)+'&session='+enc(session)+'" target="_blank">graph ↗</a>'
+          +'<a id="_fha" href="/debug/history?machine='+enc(machine)+'&session='+enc(session)+'" target="_blank">history ↗</a>'
+        +'</div>'
+      +'</div>';
+    document.body.appendChild(p);
+
+    var elSt  = document.getElementById('_fst');
+    var elVer = document.getElementById('_fver');
+    var elEv  = document.getElementById('_fev');
+    var elSel = document.getElementById('_fsel');
+    var elMn  = document.getElementById('_fmn');
+    var lastCtx = {};
+
+    // seed from DOM (WASM stamps data-fx-state before SSE arrives)
+    var ds = root.getAttribute('data-fx-state'), dv = root.getAttribute('data-fx-version');
+    if(ds){ elSt.textContent=ds; }
+    if(dv){ elVer.textContent='v'+dv; }
+
+    function onSnap(snap){
+      elSt.textContent  = snap.state;
+      elVer.textContent = 'v'+snap.version;
+      elEv.textContent  = snap.last_event||'—';
+      lastCtx = snap.context||{};
+    }
+
+    var es = new EventSource('/events?machine='+enc(machine)+'&session='+enc(session));
+    es.onmessage = function(e){ try{ onSnap(JSON.parse(e.data)); }catch(_){} };
+
+    document.getElementById('_fmn').addEventListener('click',function(){
+      var m = p.classList.toggle('_min');
+      elMn.textContent = m?'□':'—';
+      sessionStorage.setItem('_fo_min', m?'1':'0');
+    });
+    document.getElementById('_fcl').addEventListener('click',function(){ p.remove(); es.close(); });
+    document.getElementById('_fgo').addEventListener('click',function(){
+      var st = elSel.value; if(!st) return;
+      fetch('/test/state?session='+enc(session),{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({machine_id:machine,state:st,context:lastCtx,version:0})
+      });
+    });
+  }
+
+  var root = document.querySelector('[fx-machine]');
+  if(!root) return;
+  if(root.getAttribute('data-fx-session')){ init(root); return; }
+  var mo = new MutationObserver(function(){
+    if(root.getAttribute('data-fx-session')){ mo.disconnect(); init(root); }
+  });
+  mo.observe(root,{attributes:true,attributeFilter:['data-fx-session']});
+}());
+"#;
 
 // r##"..."## is required: fill="#555" contains "# which would terminate r#"..."#.
 const GRAPH_SVG_DEFS: &str = r##"<defs>

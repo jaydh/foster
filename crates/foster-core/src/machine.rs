@@ -267,13 +267,14 @@ pub struct MachineInstance {
     pub current_state: String,
     pub context: Value,
     pub version: u64,
+    last_event: Option<String>,
 }
 
 impl MachineInstance {
     pub fn new(machine: Arc<Machine>) -> Self {
         let current_state = machine.initial_state.clone();
         let context = machine.initial_context.clone();
-        Self { machine, current_state, context, version: 0 }
+        Self { machine, current_state, context, version: 0, last_event: None }
     }
 
     /// Send an event, advance state, return the resulting snapshot.
@@ -299,6 +300,7 @@ impl MachineInstance {
         self.current_state = def.target.clone();
         self.context = next_context;
         self.version += 1;
+        self.last_event = Some(event.to_string());
 
         Ok(self.snapshot())
     }
@@ -309,6 +311,7 @@ impl MachineInstance {
             state: self.current_state.clone(),
             context: self.context.clone(),
             version: self.version,
+            last_event: self.last_event.clone(),
         }
     }
 
@@ -323,6 +326,7 @@ impl MachineInstance {
         self.current_state = snap.state;
         self.context = snap.context;
         self.version = self.version.max(snap.version) + 1;
+        self.last_event = None;
         Ok(())
     }
 
@@ -502,6 +506,7 @@ mod tests {
             state: "error".into(),
             context: json!({ "count": 99 }),
             version: 42,
+            last_event: None,
         };
         m.restore(injected).unwrap();
 
@@ -518,6 +523,7 @@ mod tests {
             state: "nonexistent".into(),
             context: json!({}),
             version: 0,
+            last_event: None,
         };
         assert!(m.restore(bad).is_err());
     }
@@ -553,6 +559,7 @@ mod tests {
             state: "ready".into(),
             context: json!({ "count": -1 }),
             version: 0,
+            last_event: None,
         };
         assert!(inst.restore(bad_snap).is_err());
     }
@@ -576,6 +583,7 @@ mod tests {
             state: "ready".into(),
             context: json!({ "count": 5 }),
             version: 10,
+            last_event: None,
         };
         assert!(inst.restore(good_snap).is_ok());
         assert_eq!(inst.version, 11);

@@ -13,4 +13,8 @@ pub struct Snapshot {
     /// Monotonically increasing version counter — used by the client
     /// to detect stale snapshots and by tests to await specific transitions.
     pub version: u64,
+    /// The event name that produced this snapshot, if any.
+    /// `None` for the initial snapshot and for snapshots produced by `restore()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
 }

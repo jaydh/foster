@@ -212,6 +212,7 @@ mod tests {
             state: "idle".into(),
             context: json!({ "count": version }),
             version,
+            last_event: None,
         }
     }
 
