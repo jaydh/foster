@@ -1,9 +1,11 @@
 use foster_core::Snapshot;
 use futures_util::stream::{self, BoxStream, StreamExt};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+const HISTORY_CAP: usize = 50;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -38,6 +40,14 @@ pub trait StateStore: Send + Sync + 'static {
         machine: &str,
         snap: &Snapshot,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
+
+    /// Return all snapshots recorded for this `(session, machine)` pair, oldest first.
+    /// Capped at [`HISTORY_CAP`] entries; earlier snapshots are evicted.
+    fn history(
+        &self,
+        session: &str,
+        machine: &str,
+    ) -> impl Future<Output = Vec<Snapshot>> + Send;
 }
 
 // ── PubSub ────────────────────────────────────────────────────────────────────
@@ -68,6 +78,7 @@ use std::future::Future;
 #[derive(Clone, Default)]
 pub struct InMemoryStore {
     inner: Arc<Mutex<HashMap<(String, String), Snapshot>>>,
+    hist: Arc<Mutex<HashMap<(String, String), VecDeque<Snapshot>>>>,
 }
 
 impl StateStore for InMemoryStore {
@@ -81,17 +92,34 @@ impl StateStore for InMemoryStore {
 
     async fn store(&self, session: &str, machine: &str, snap: &Snapshot) -> Result<(), StoreError> {
         let key = (session.to_string(), machine.to_string());
-        let mut map = self.inner.lock().unwrap();
-        if let Some(existing) = map.get(&key) {
-            if existing.version != snap.version.saturating_sub(1) {
-                return Err(StoreError::VersionConflict {
-                    expected: snap.version.saturating_sub(1),
-                    actual: existing.version,
-                });
+        {
+            let mut map = self.inner.lock().unwrap();
+            if let Some(existing) = map.get(&key) {
+                if existing.version != snap.version.saturating_sub(1) {
+                    return Err(StoreError::VersionConflict {
+                        expected: snap.version.saturating_sub(1),
+                        actual: existing.version,
+                    });
+                }
             }
+            map.insert(key.clone(), snap.clone());
         }
-        map.insert(key, snap.clone());
+        let mut h = self.hist.lock().unwrap();
+        let buf = h.entry(key).or_default();
+        buf.push_back(snap.clone());
+        if buf.len() > HISTORY_CAP {
+            buf.pop_front();
+        }
         Ok(())
+    }
+
+    async fn history(&self, session: &str, machine: &str) -> Vec<Snapshot> {
+        self.hist
+            .lock()
+            .unwrap()
+            .get(&(session.to_string(), machine.to_string()))
+            .map(|buf| buf.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -134,5 +162,73 @@ impl PubSub for InMemoryPubSub {
             }
         })
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snap(version: u64) -> Snapshot {
+        Snapshot {
+            machine_id: "counter".into(),
+            state: "idle".into(),
+            context: json!({ "count": version }),
+            version,
+        }
+    }
+
+    #[tokio::test]
+    async fn history_empty_before_any_store() {
+        let store = InMemoryStore::default();
+        assert!(store.history("s", "counter").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_records_each_stored_snapshot() {
+        let store = InMemoryStore::default();
+        store.store("s", "counter", &snap(1)).await.unwrap();
+        store.store("s", "counter", &snap(2)).await.unwrap();
+        store.store("s", "counter", &snap(3)).await.unwrap();
+
+        let h = store.history("s", "counter").await;
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].version, 1);
+        assert_eq!(h[2].version, 3);
+    }
+
+    #[tokio::test]
+    async fn history_capped_at_history_cap() {
+        let store = InMemoryStore::default();
+        for i in 1..=(HISTORY_CAP as u64 + 10) {
+            store.store("s", "counter", &snap(i)).await.unwrap();
+        }
+        let h = store.history("s", "counter").await;
+        assert_eq!(h.len(), HISTORY_CAP);
+        // Oldest evicted; first entry should be entry 11
+        assert_eq!(h[0].version, 11);
+    }
+
+    #[tokio::test]
+    async fn history_is_isolated_by_session_and_machine() {
+        let store = InMemoryStore::default();
+        store.store("alice", "counter", &snap(1)).await.unwrap();
+        store.store("bob", "counter", &snap(1)).await.unwrap();
+        store.store("alice", "timer", &snap(1)).await.unwrap();
+
+        assert_eq!(store.history("alice", "counter").await.len(), 1);
+        assert_eq!(store.history("bob", "counter").await.len(), 1);
+        assert_eq!(store.history("alice", "timer").await.len(), 1);
+        assert!(store.history("bob", "timer").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn version_conflict_rejected() {
+        let store = InMemoryStore::default();
+        store.store("s", "counter", &snap(1)).await.unwrap();
+        // snap(1) is already stored as version 1; storing version 1 again conflicts
+        let err = store.store("s", "counter", &snap(1)).await.unwrap_err();
+        assert!(matches!(err, StoreError::VersionConflict { .. }));
     }
 }

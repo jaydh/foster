@@ -75,6 +75,8 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
         .route("/transition", post(post_transition))
         .route("/events", get(get_events))
         .route("/test/state", post(post_test_state))
+        .route("/debug/history", get(get_debug_history))
+        .route("/debug/rewind", post(post_debug_rewind))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app);
 
@@ -209,6 +211,86 @@ async fn get_events(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
     Sse::new(sse_stream).keep_alive(KeepAlive::default())
+}
+
+/// Debug: return the snapshot history ring buffer for a `(session, machine)` pair.
+///
+/// Returns oldest-first, capped at 50 entries.  Gated by `test_mode`.
+async fn get_debug_history(
+    Query(q): Query<MachineQuery>,
+    State(app): State<AppState>,
+) -> Response {
+    if !app.test_mode {
+        return (StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable").into_response();
+    }
+    let history = app.store.history(q.session_id(), &q.machine).await;
+    Json(history).into_response()
+}
+
+#[derive(Deserialize)]
+struct RewindQuery {
+    machine: String,
+    version: u64,
+    #[serde(default)]
+    session: String,
+}
+
+impl RewindQuery {
+    fn session_id(&self) -> &str {
+        if self.session.is_empty() { "default" } else { &self.session }
+    }
+}
+
+/// Rewind a machine instance to a previously recorded snapshot version.
+///
+/// Looks up `version` in the history ring buffer, validates state and schema via
+/// `restore()`, then writes a new snapshot (at `current_version + 1`) and
+/// publishes it over SSE so connected clients update immediately.
+///
+/// Gated by `test_mode`.
+async fn post_debug_rewind(
+    Query(q): Query<RewindQuery>,
+    State(app): State<AppState>,
+) -> Result<Json<Snapshot>, (StatusCode, String)> {
+    if !app.test_mode {
+        return Err((StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
+    }
+
+    let session_id = q.session_id().to_string();
+
+    let Some(machine) = app.machines.get(&q.machine).cloned() else {
+        return Err((StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine)));
+    };
+
+    let history = app.store.history(&session_id, &q.machine).await;
+    let target = history
+        .iter()
+        .find(|s| s.version == q.version)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("version {} not in history for machine '{}'", q.version, q.machine)))?
+        .clone();
+
+    // Validate state and schema via restore() on a throwaway instance.
+    let mut validator = MachineInstance::new(Arc::clone(&machine));
+    validator
+        .restore(Snapshot { version: 0, ..target.clone() })
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Build the rewound snapshot at current_version+1 so the CAS check passes.
+    let current_version = app.store.load(&session_id, &q.machine).await.map(|s| s.version).unwrap_or(0);
+    let rewound = Snapshot {
+        machine_id: q.machine.clone(),
+        state: target.state,
+        context: target.context,
+        version: current_version + 1,
+    };
+
+    app.store
+        .store(&session_id, &q.machine, &rewound)
+        .await
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    app.pubsub.publish(&session_id, &q.machine, rewound.clone()).await;
+
+    Ok(Json(rewound))
 }
 
 /// Inject an arbitrary snapshot — bypasses all transition logic.
