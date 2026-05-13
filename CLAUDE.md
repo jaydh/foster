@@ -17,16 +17,17 @@ foster/
 │   ├── counter/           # Simple idle ↔ error counter (port 3000)
 │   ├── player/            # 6-state media player (port 3001)
 │   ├── kanban/            # Multi-column task board with fx-for (port 3002)
-│   └── aura/              # CSS animation showcase with fx-class (port 3003)
+│   ├── aura/              # CSS animation showcase with fx-class (port 3003)
+│   └── checkout/          # 7-state checkout flow, showcases graph + history (port 3004)
 └── scripts/
-    ├── build-wasm.sh      # Build foster-client and move pkg/ to workspace root
-    ├── demo.sh            # Start one or all demo servers (Ctrl-C stops all)
+    ├── build-wasm.sh      # Build foster-client (release); pass --dev for dev overlay
+    ├── demo.sh            # Build WASM (dev) + start all demo servers (Ctrl-C stops all)
     └── gen-tests.sh       # Regenerate Playwright specs for all examples
 ```
 
 `Cargo.toml` includes native crates only. `crates/foster-client` targets
-`wasm32-unknown-unknown` and must be built separately with `wasm-pack` via
-`./scripts/build-wasm.sh`.
+`wasm32-unknown-unknown` and must be built separately with `wasm-pack`.
+`./scripts/demo.sh` handles this automatically — it builds dev WASM then starts servers.
 
 ## Iteration loop
 
@@ -43,7 +44,7 @@ and event names in the test exactly match the machine definition.
 ### Full loop (browser)
 
 ```bash
-./scripts/demo.sh kanban    # start server (separate terminal)
+./scripts/demo.sh kanban    # builds dev WASM + starts server (separate terminal)
 cd examples/kanban && npx playwright test --reporter=line
 ```
 
@@ -298,15 +299,18 @@ When asked to add a feature, check here first so your design is consistent with 
 | **Multiple machines per page** | Instance addressing syntax: `fx-machine="counter#1"`. The `#fragment` becomes the instance key appended to the session. WASM client needs to split on `#` when building the session key. |
 | **Generated TypeScript SDK** | Derive typed `sendEvent(event: CounterEvent, payload?: ...) → Promise<Snapshot>` and `setState(snap: Snapshot)` from the machine definition. Output alongside the Playwright spec in `gen_tests`. |
 | **Compiled machine validation** | Proc-macro that turns a `MachineBuilder` into a compile-time-checked type graph: Rust enum for states, exhaustive `match` on events. Catches unreachable states and missing transitions at compile time. |
-| **Differential rendering** | Server sends a JSON Patch (`RFC 6902`) diff of context instead of the full snapshot. Reduces wire payload for large context objects (e.g. kanban task lists). WASM client applies the patch with `json-patch`. |
+| **Differential rendering** | ~~Server sends a JSON Patch (`RFC 6902`) diff of context instead of the full snapshot. Reduces wire payload for large context objects (e.g. kanban task lists). WASM client applies the patch with `json-patch`.~~ **Done** — SSE emits a named `snapshot` event (full state) on first connection, then named `patch` events (RFC 6902 JSON Patch) for all subsequent updates. WASM client maintains a per-machine context cache and applies patches with `json-patch`. Graph UI updated to listen on both event names. |
 
 ### Already implemented
 
 - `StateStore` / `PubSub` traits + `InMemoryStore` / `InMemoryPubSub` impls — `crates/foster-server/src/store.rs`
 - Time-travel debugger: `GET /debug/history` + `POST /debug/rewind`, 50-entry ring buffer in `InMemoryStore`, `history()` on `StateStore` trait — `crates/foster-server/src/`
 - State graph UI: `GET /debug/graph` — self-contained SVG visualiser with live SSE state highlighting — `crates/foster-server/src/lib.rs`
-- Dev overlay: Rust/WASM panel in `crates/foster-client/src/lib.rs` — compiled with `debug_assertions`; server injects only `window.__FOSTER_MACHINES` metadata (no JS logic)
+- Dev overlay: Rust/WASM panel in `crates/foster-client/src/lib.rs` — compiled with `debug_assertions`; server injects only `window.__FOSTER_MACHINES` metadata (no JS logic); CSS injected server-side so no flash on load
 - `Snapshot.last_event: Option<String>` — set by `MachineInstance::send()`, `None` for `restore()` and initial state — `crates/foster-core/src/`
+- Differential rendering: SSE emits named `snapshot` (full, on connect) + `patch` (RFC 6902 JSON Patch) events — `crates/foster-server/src/lib.rs`; WASM client applies patches via `json-patch` crate — `crates/foster-client/src/lib.rs`
+- Checkout example: 7-state checkout flow (`cart → shipping → payment → review → processing → confirmed/failed`), port 3004 — `examples/checkout/`
+- `demo.sh` is self-sufficient: builds dev WASM then starts all servers; `<link rel="icon" href="data:,">` in HTML shell eliminates favicon 404s
 
 ## Security invariants — do not break
 
