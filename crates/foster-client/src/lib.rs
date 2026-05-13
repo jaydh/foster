@@ -10,22 +10,25 @@ use web_sys::{Document, Element, EventSource, HtmlElement, MessageEvent, Request
 
 // ── context cache ─────────────────────────────────────────────────────────────
 //
-// Tracks the last context Value received over SSE per machine, keyed by machine_id.
-// Used to apply JSON Patch diffs from "patch" SSE events against the correct base.
-// Only SSE events (snapshot/patch) update this cache — direct transition responses
-// do not, keeping the cache aligned with the server's SSE diff chain.
+// Tracks the last context Value received over SSE per machine instance, keyed
+// by `"{machine_id}:{effective_session}"`.  This makes the key unique across
+// both different machine types and multiple instances of the same type on the
+// same page (achieved via the `fx-machine="counter#1"` fragment syntax).
+// Used to apply JSON Patch diffs from "patch" SSE events against the correct
+// base.  Only SSE events (snapshot/patch) update this cache — direct transition
+// responses do not, keeping the cache aligned with the server's SSE diff chain.
 
 thread_local! {
     static CONTEXT_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
-fn store_context(machine_id: &str, ctx: Value) {
-    CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(machine_id.to_string(), ctx); });
+fn store_context(cache_key: &str, ctx: Value) {
+    CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(cache_key.to_string(), ctx); });
 }
 
-fn load_context(machine_id: &str) -> Value {
+fn load_context(cache_key: &str) -> Value {
     CONTEXT_CACHE.with(|c| {
-        c.borrow().get(machine_id).cloned().unwrap_or_else(|| Value::Object(Default::default()))
+        c.borrow().get(cache_key).cloned().unwrap_or_else(|| Value::Object(Default::default()))
     })
 }
 
@@ -57,10 +60,23 @@ async fn bootstrap() {
     let roots = document.query_selector_all("[fx-machine]").unwrap();
     for i in 0..roots.length() {
         let root: Element = roots.item(i).unwrap().dyn_into().unwrap();
-        let machine_id = root.get_attribute("fx-machine").unwrap();
+        let raw_attr = root.get_attribute("fx-machine").unwrap();
 
-        // Stamp the session ID so Playwright can discover it.
-        let _ = root.set_attribute("data-fx-session", &session_id);
+        // Split `"counter#1"` → machine_id="counter", fragment="1".
+        // The fragment is appended to the session ID so each instance on
+        // the page talks to a distinct server-side (session, machine) pair.
+        let (machine_id, fragment) = split_instance(&raw_attr);
+        let effective_session = if fragment.is_empty() {
+            session_id.clone()
+        } else {
+            format!("{session_id}.{fragment}")
+        };
+
+        // Cache key unique per (machine type, instance) on this page.
+        let cache_key = format!("{machine_id}:{effective_session}");
+
+        // Stamp the effective session so Playwright can discover it.
+        let _ = root.set_attribute("data-fx-session", &effective_session);
 
         save_for_templates(&root);
 
@@ -68,23 +84,42 @@ async fn bootstrap() {
         // the initial snapshot.  This closes the race window where a Playwright
         // test-inject fires its SSE broadcast before the client is listening,
         // causing the inject to be silently lost.
-        attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
-        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone());
+        attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
+        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone());
 
         #[cfg(debug_assertions)]
-        mount_overlay(&document, &machine_id, &session_id);
+        mount_overlay(&document, &root, &machine_id, &effective_session);
 
-        match fetch_snapshot(&machine_id, &session_id).await {
+        match fetch_snapshot(&machine_id, &effective_session).await {
             Ok(snap) => {
                 // Seed the context cache so the first SSE "patch" event has a valid base.
-                store_context(&snap.machine_id, snap.context.clone());
+                store_context(&cache_key, snap.context.clone());
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
                 apply_snapshot_if_newer(&document, &root, &snap);
-                update_debug(&document, &snap);
+                update_debug(&document, &root, &snap);
             }
             Err(e) => web_sys::console::error_1(&e),
         }
+    }
+}
+
+// ── instance addressing ───────────────────────────────────────────────────────
+//
+// `fx-machine="counter#1"` → machine_id="counter", fragment="1"
+// `fx-machine="counter"`   → machine_id="counter", fragment=""
+//
+// The fragment is appended to the page's base session ID (with a `.` separator)
+// to form the effective session sent to the server.  This lets two `counter`
+// roots on the same page address independent server-side instances:
+//
+//   fx-machine="counter#a" → POST /transition?session=<base>.a  machine=counter
+//   fx-machine="counter#b" → POST /transition?session=<base>.b  machine=counter
+
+fn split_instance(raw: &str) -> (String, String) {
+    match raw.find('#') {
+        Some(i) => (raw[..i].to_string(), raw[i + 1..].to_string()),
+        None => (raw.to_string(), String::new()),
     }
 }
 
@@ -140,7 +175,7 @@ fn apply_snapshot_if_newer(document: &Document, root: &Element, snap: &Snapshot)
         .unwrap_or(0);
     if snap.version >= current {
         apply_snapshot(document, root, snap);
-        update_debug(document, snap);
+        update_debug(document, root, snap);
     }
 }
 
@@ -357,7 +392,7 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
             match send_transition(&mid, &machine_event, payload, &sid).await {
                 Ok(snap) => {
                     apply_snapshot(&doc_clone, &root_clone, &snap);
-                    update_debug(&doc_clone, &snap);
+                    update_debug(&doc_clone, &root_clone, &snap);
                 }
                 Err(e) => web_sys::console::error_1(&e),
             }
@@ -374,7 +409,7 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
 // When the server broadcasts a new snapshot (e.g., after POST /test/state from Playwright),
 // the client applies it immediately — no page.reload() needed.
 
-fn attach_sse_listener(document: Document, root: Element, machine_id: String, session_id: String) {
+fn attach_sse_listener(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
     let url = format!("/events?machine={machine_id}&session={session_id}");
     let Ok(es) = EventSource::new(&url) else { return };
 
@@ -384,10 +419,11 @@ fn attach_sse_listener(document: Document, root: Element, machine_id: String, se
     {
         let document = document.clone();
         let root = root.clone();
+        let cache_key = cache_key.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             let data = match e.data().as_string() { Some(s) => s, None => return };
             let snap: Snapshot = match serde_json::from_str(&data) { Ok(s) => s, Err(_) => return };
-            store_context(&snap.machine_id, snap.context.clone());
+            store_context(&cache_key, snap.context.clone());
             apply_snapshot_if_newer(&document, &root, &snap);
         });
         es.add_event_listener_with_callback("snapshot", cb.as_ref().unchecked_ref()).unwrap();
@@ -398,12 +434,13 @@ fn attach_sse_listener(document: Document, root: Element, machine_id: String, se
     // Always apply the patch to the cache (keeps the diff chain intact even when
     // the DOM is already at a newer version from a direct transition response).
     {
+        let cache_key = cache_key.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             let data = match e.data().as_string() { Some(s) => s, None => return };
             let pe: ContextPatch = match serde_json::from_str(&data) { Ok(p) => p, Err(_) => return };
-            let mut ctx = load_context(&pe.machine_id);
+            let mut ctx = load_context(&cache_key);
             if json_patch::patch(&mut ctx, &pe.patch.0).is_err() { return; }
-            store_context(&pe.machine_id, ctx.clone());
+            store_context(&cache_key, ctx.clone());
             let snap = Snapshot {
                 machine_id: pe.machine_id,
                 state: pe.state,
@@ -532,11 +569,11 @@ fn val_to_string(v: &Value) -> String {
     }
 }
 
-fn update_debug(document: &Document, snap: &Snapshot) {
+fn update_debug(document: &Document, root: &Element, snap: &Snapshot) {
     #[cfg(debug_assertions)]
-    update_overlay(document, snap);
+    update_overlay(document, root, snap);
     #[cfg(not(debug_assertions))]
-    let _ = (document, snap);
+    let _ = (document, root, snap);
 }
 
 // ── dev overlay (debug builds only) ──────────────────────────────────────────
@@ -565,12 +602,25 @@ fn read_machine_states(machine_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Mount the debug overlay panel for one `[fx-machine]` root.
+///
+/// The panel ID incorporates both the machine name and the effective session so
+/// that two instances of the same machine on the same page (`fx-machine="counter#1"`
+/// and `fx-machine="counter#2"`) each get their own independent panel.
+/// The panel ID is also stamped as `data-fx-panel` on the root so that
+/// `update_overlay` can find the right panel when a snapshot arrives.
 #[cfg(debug_assertions)]
-fn mount_overlay(document: &Document, machine_id: &str, session_id: &str) {
-    let panel_id = format!("fx-dbg-{machine_id}");
+fn mount_overlay(document: &Document, root: &Element, machine_id: &str, session_id: &str) {
+    // Replace '.' (fragment separator) with '-' for a CSS-safe element ID.
+    let safe_session = session_id.replace('.', "-");
+    let panel_id = format!("fx-dbg-{machine_id}-{safe_session}");
+
     if document.get_element_by_id(&panel_id).is_some() {
         return;
     }
+
+    // Stamp so update_overlay can route snapshot updates to the right panel.
+    let _ = root.set_attribute("data-fx-panel", &panel_id);
 
     let states = read_machine_states(machine_id);
     let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
@@ -692,8 +742,8 @@ fn mount_overlay(document: &Document, machine_id: &str, session_id: &str) {
 }
 
 #[cfg(debug_assertions)]
-fn update_overlay(document: &Document, snap: &Snapshot) {
-    let panel_id = format!("fx-dbg-{}", snap.machine_id);
+fn update_overlay(document: &Document, root: &Element, snap: &Snapshot) {
+    let panel_id = root.get_attribute("data-fx-panel").unwrap_or_default();
     let Some(panel) = document.get_element_by_id(&panel_id) else { return };
 
     if let Some(el) = panel.query_selector(".fx-dbg-st").ok().flatten() {
@@ -723,4 +773,48 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::split_instance;
+
+    #[test]
+    fn split_no_fragment() {
+        let (machine, fragment) = split_instance("counter");
+        assert_eq!(machine, "counter");
+        assert_eq!(fragment, "");
+    }
+
+    #[test]
+    fn split_with_fragment() {
+        let (machine, fragment) = split_instance("counter#1");
+        assert_eq!(machine, "counter");
+        assert_eq!(fragment, "1");
+    }
+
+    #[test]
+    fn split_with_alphanumeric_fragment() {
+        let (machine, fragment) = split_instance("player#main");
+        assert_eq!(machine, "player");
+        assert_eq!(fragment, "main");
+    }
+
+    #[test]
+    fn split_only_first_hash() {
+        // Fragment containing '#' — only the first hash is the separator.
+        let (machine, fragment) = split_instance("counter#a#b");
+        assert_eq!(machine, "counter");
+        assert_eq!(fragment, "a#b");
+    }
+
+    #[test]
+    fn split_empty_fragment() {
+        // Trailing '#' with no fragment text.
+        let (machine, fragment) = split_instance("counter#");
+        assert_eq!(machine, "counter");
+        assert_eq!(fragment, "");
+    }
 }
