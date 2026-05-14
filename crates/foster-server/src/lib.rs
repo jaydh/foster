@@ -20,16 +20,20 @@ use std::sync::Arc;
 // ── state ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState {
+struct AppState<S: StateStore + Clone, P: PubSub + Clone> {
     machines: Arc<HashMap<String, Arc<Machine>>>,
-    store: InMemoryStore,
-    pubsub: InMemoryPubSub,
+    store: S,
+    pubsub: P,
     test_mode: bool,
 }
 
 // ── router ────────────────────────────────────────────────────────────────────
 
-/// Build the Foster API router pre-loaded with machine definitions.
+/// Build the Foster API router with in-memory store and pubsub (default, single-process).
+///
+/// For multi-replica deployments, use [`router_with`] and supply Redis-backed
+/// [`StateStore`] and [`PubSub`] implementations so all replicas share state and
+/// broadcast transitions across processes.
 ///
 /// Session isolation
 /// ─────────────────
@@ -45,6 +49,29 @@ struct AppState {
 ///   GET  /events?machine=<id>&session=<sid> → SSE stream of JSON Snapshots
 ///   POST /test/state?session=<sid>           → JSON Snapshot in/out  (debug only)
 pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
+    router_with(machines, InMemoryStore::default(), InMemoryPubSub::default())
+}
+
+/// Build the Foster API router with explicit store and pubsub backends.
+///
+/// Enables dependency injection of custom [`StateStore`] and [`PubSub`] backends.
+/// The canonical use case is a Redis-backed implementation for HA / multi-replica
+/// deployments where every server replica must share state and broadcast transitions.
+///
+/// The `version` field on [`Snapshot`] is the optimistic lock token: a Redis Lua
+/// CAS script or `WATCH`/`MULTI` transaction is the typical way to implement atomic
+/// [`StateStore::apply`] in a distributed setting.
+///
+/// For single-process deployments, prefer [`router`] which uses in-memory defaults.
+pub fn router_with<S, P>(
+    machines: HashMap<String, Arc<Machine>>,
+    store: S,
+    pubsub: P,
+) -> Router
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     // Validate all templates at startup — unknown fx-show states or fx-on events panic immediately
     // rather than silently misbehaving at runtime.
     for (id, machine) in &machines {
@@ -81,19 +108,19 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
 
     let app = AppState {
         machines: Arc::new(machines),
-        store: InMemoryStore::default(),
-        pubsub: InMemoryPubSub::default(),
+        store,
+        pubsub,
         test_mode,
     };
 
     let mut router = Router::new()
-        .route("/state", get(get_state))
-        .route("/transition", post(post_transition))
-        .route("/events", get(get_events))
-        .route("/test/state", post(post_test_state))
-        .route("/debug/history", get(get_debug_history))
-        .route("/debug/rewind", post(post_debug_rewind))
-        .route("/debug/graph", get(get_debug_graph))
+        .route("/state", get(get_state::<S, P>))
+        .route("/transition", post(post_transition::<S, P>))
+        .route("/events", get(get_events::<S, P>))
+        .route("/test/state", post(post_test_state::<S, P>))
+        .route("/debug/history", get(get_debug_history::<S, P>))
+        .route("/debug/rewind", post(post_debug_rewind::<S, P>))
+        .route("/debug/graph", get(get_debug_graph::<S, P>))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app);
 
@@ -152,7 +179,7 @@ impl SessionQuery {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Serialize, Deserialize)]
 struct TransitionRequest {
     machine: String,
     event: String,
@@ -165,10 +192,14 @@ struct TransitionRequest {
 
 // ── handlers ──────────────────────────────────────────────────────────────────
 
-async fn get_state(
+async fn get_state<S, P>(
     Query(q): Query<MachineQuery>,
-    State(app): State<AppState>,
-) -> Response {
+    State(app): State<AppState<S, P>>,
+) -> Response
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     let Some(machine) = app.machines.get(&q.machine).cloned() else {
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine));
     };
@@ -179,10 +210,14 @@ async fn get_state(
     msgpack(&snap)
 }
 
-async fn post_transition(
-    State(app): State<AppState>,
+async fn post_transition<S, P>(
+    State(app): State<AppState<S, P>>,
     body: Bytes,
-) -> Response {
+) -> Response
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     let req: TransitionRequest = match rmp_serde::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
@@ -230,10 +265,14 @@ struct ContextPatch {
 /// The first event on each connection is a named `snapshot` (full state).
 /// Subsequent events are named `patch` (RFC 6902 JSON Patch of just the context),
 /// which reduces wire payload for large context objects (e.g. kanban task lists).
-async fn get_events(
+async fn get_events<S, P>(
     Query(q): Query<MachineQuery>,
-    State(app): State<AppState>,
-) -> impl IntoResponse {
+    State(app): State<AppState<S, P>>,
+) -> impl IntoResponse
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     let stream = app.pubsub.subscribe(q.session_id(), &q.machine);
     let mut prev: Option<Snapshot> = None;
     let sse_stream = stream.map(move |snap| {
@@ -266,10 +305,14 @@ async fn get_events(
 /// Debug: return the snapshot history ring buffer for a `(session, machine)` pair.
 ///
 /// Returns oldest-first, capped at 50 entries.  Gated by `test_mode`.
-async fn get_debug_history(
+async fn get_debug_history<S, P>(
     Query(q): Query<MachineQuery>,
-    State(app): State<AppState>,
-) -> Response {
+    State(app): State<AppState<S, P>>,
+) -> Response
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     if !app.test_mode {
         return (StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable").into_response();
     }
@@ -298,10 +341,14 @@ impl RewindQuery {
 /// publishes it over SSE so connected clients update immediately.
 ///
 /// Gated by `test_mode`.
-async fn post_debug_rewind(
+async fn post_debug_rewind<S, P>(
     Query(q): Query<RewindQuery>,
-    State(app): State<AppState>,
-) -> Result<Json<Snapshot>, (StatusCode, String)> {
+    State(app): State<AppState<S, P>>,
+) -> Result<Json<Snapshot>, (StatusCode, String)>
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     if !app.test_mode {
         return Err((StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
     }
@@ -351,10 +398,14 @@ async fn post_debug_rewind(
 /// state in green without a page reload.
 ///
 /// Gated by `test_mode` (debug builds or `FOSTER_TEST_MODE=1`).
-async fn get_debug_graph(
+async fn get_debug_graph<S, P>(
     Query(q): Query<MachineQuery>,
-    State(app): State<AppState>,
-) -> Response {
+    State(app): State<AppState<S, P>>,
+) -> Response
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     if !app.test_mode {
         return (
             StatusCode::FORBIDDEN,
@@ -610,11 +661,15 @@ const GRAPH_RENDER_JS: &str = r#"
 ///   curl -X POST 'http://localhost:3000/test/state?session=my-test' \
 ///        -H 'Content-Type: application/json' \
 ///        -d '{"machine_id":"counter","state":"error","context":{"count":99},"version":0}'
-async fn post_test_state(
+async fn post_test_state<S, P>(
     Query(q): Query<SessionQuery>,
-    State(app): State<AppState>,
+    State(app): State<AppState<S, P>>,
     Json(snap): Json<Snapshot>,
-) -> Result<Json<Snapshot>, (StatusCode, String)> {
+) -> Result<Json<Snapshot>, (StatusCode, String)>
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     if !app.test_mode {
         return Err((StatusCode::FORBIDDEN, "test endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
     }
@@ -713,5 +768,243 @@ mod tests {
         let html = build_graph_html(&m, "s");
         assert!(html.contains("\"only\""));
         assert!(html.contains("\"noop\""));
+    }
+
+    // ── HTTP integration tests ────────────────────────────────────────────────
+
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_machines() -> HashMap<String, Arc<Machine>> {
+        HashMap::from([("counter".to_string(), two_state_machine())])
+    }
+
+    #[tokio::test]
+    async fn http_get_state_returns_initial_snapshot() {
+        let app = router(test_machines());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/state?machine=counter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(snap.machine_id, "counter");
+        assert_eq!(snap.state, "idle");
+        assert_eq!(snap.version, 0);
+        assert_eq!(snap.context["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn http_get_state_404_for_unknown_machine() {
+        let app = router(test_machines());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/state?machine=unknown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_post_transition_increments_counter() {
+        let app = router(test_machines());
+        let req_body = TransitionRequest {
+            machine: "counter".to_string(),
+            event: "increment".to_string(),
+            payload: Value::Null,
+            session: "t1".to_string(),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transition")
+                    .body(Body::from(rmp_serde::to_vec_named(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(snap.state, "idle");
+        assert_eq!(snap.context["count"], 1);
+        assert_eq!(snap.version, 1);
+        assert_eq!(snap.last_event.as_deref(), Some("increment"));
+    }
+
+    #[tokio::test]
+    async fn http_post_transition_state_change() {
+        let app = router(test_machines());
+        let req_body = TransitionRequest {
+            machine: "counter".to_string(),
+            event: "break_it".to_string(),
+            payload: Value::Null,
+            session: "t2".to_string(),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transition")
+                    .body(Body::from(rmp_serde::to_vec_named(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(snap.state, "error");
+    }
+
+    #[tokio::test]
+    async fn http_post_transition_404_for_unknown_machine() {
+        let app = router(test_machines());
+        let req_body = TransitionRequest {
+            machine: "nope".to_string(),
+            event: "x".to_string(),
+            payload: Value::Null,
+            session: "t3".to_string(),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transition")
+                    .body(Body::from(rmp_serde::to_vec_named(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_post_transition_400_for_invalid_event() {
+        let app = router(test_machines());
+        let req_body = TransitionRequest {
+            machine: "counter".to_string(),
+            event: "no_such_event".to_string(),
+            payload: Value::Null,
+            session: "t4".to_string(),
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transition")
+                    .body(Body::from(rmp_serde::to_vec_named(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn http_post_test_state_injects_snapshot() {
+        let app = router(test_machines());
+        let snap = Snapshot {
+            machine_id: "counter".to_string(),
+            state: "error".to_string(),
+            context: json!({ "count": 99 }),
+            version: 0,
+            last_event: None,
+        };
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/test/state?session=inject-test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&snap).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let returned: Snapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(returned.state, "error");
+        assert_eq!(returned.context["count"], 99);
+    }
+
+    #[tokio::test]
+    async fn http_debug_history_records_transitions() {
+        let store = InMemoryStore::default();
+        let pubsub = InMemoryPubSub::default();
+        let app = router_with(test_machines(), store, pubsub);
+
+        // Fire a transition
+        let req_body = TransitionRequest {
+            machine: "counter".to_string(),
+            event: "increment".to_string(),
+            payload: Value::Null,
+            session: "hist-s".to_string(),
+        };
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/transition")
+                    .body(Body::from(rmp_serde::to_vec_named(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Check history
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/history?machine=counter&session=hist-s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let history: Vec<Snapshot> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].state, "idle");
+        assert_eq!(history[0].context["count"], 1);
+    }
+
+    #[tokio::test]
+    async fn router_with_accepts_custom_backends() {
+        let app = router_with(
+            test_machines(),
+            InMemoryStore::default(),
+            InMemoryPubSub::default(),
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/state?machine=counter")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(snap.machine_id, "counter");
+        assert_eq!(snap.state, "idle");
     }
 }
