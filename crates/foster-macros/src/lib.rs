@@ -2,6 +2,281 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use proc_macro2::{Delimiter, TokenTree};
 
+/// Validate a state machine graph at compile time and generate typed `State`/`Event` enums.
+///
+/// # Syntax
+/// ```rust,ignore
+/// machine_graph! {
+///     id: "counter",
+///     initial: "idle",
+///     states: ["idle", "error"],
+///     transitions: [
+///         ("idle", "increment", "idle"),
+///         ("idle", "break_it",  "error"),
+///         ("error", "recover",  "idle"),
+///     ]
+/// }
+/// ```
+///
+/// Emits compile errors for:
+/// - `initial` state not in `states`
+/// - Transition source or target state not in `states`
+/// - States unreachable from `initial` via any transition path
+///
+/// On success, generates (for `id = "counter"`):
+/// - `enum CounterState { Idle, Error }` with `fn as_str(self) -> &'static str`
+/// - `enum CounterEvent { Increment, BreakIt, Recover }` with `fn as_str(self) -> &'static str`
+///
+/// Events are collected from the transitions list in encounter order, deduplicated.
+#[proc_macro]
+pub fn machine_graph(input: TokenStream) -> TokenStream {
+    match mg_parse_and_generate(input) {
+        Ok(ts) => ts,
+        Err(msg) => {
+            let lit = proc_macro2::Literal::string(&msg);
+            quote::quote!(compile_error!(#lit);).into()
+        }
+    }
+}
+
+fn mg_parse_and_generate(input: TokenStream) -> Result<TokenStream, String> {
+    let tokens: Vec<TokenTree> = proc_macro2::TokenStream::from(input).into_iter().collect();
+
+    let mut id: Option<String> = None;
+    let mut initial: Option<String> = None;
+    let mut states: Vec<String> = Vec::new();
+    let mut transitions: Vec<(String, String, String)> = Vec::new();
+
+    let mut i = 0;
+    while i < tokens.len() {
+        if let TokenTree::Punct(p) = &tokens[i] {
+            if p.as_char() == ',' {
+                i += 1;
+                continue;
+            }
+        }
+        if i + 2 >= tokens.len() {
+            break;
+        }
+        let key = match &tokens[i] {
+            TokenTree::Ident(ident) => ident.to_string(),
+            _ => { i += 1; continue; }
+        };
+        match &tokens[i + 1] {
+            TokenTree::Punct(p) if p.as_char() == ':' => {}
+            _ => return Err(format!("machine_graph!: expected ':' after key '{}'", key)),
+        }
+        let value = &tokens[i + 2];
+        match key.as_str() {
+            "id"      => { id      = Some(mg_extract_str(value)?); i += 3; }
+            "initial" => { initial = Some(mg_extract_str(value)?); i += 3; }
+            "states"  => { states  = mg_parse_str_array(value)?;   i += 3; }
+            "transitions" => { transitions = mg_parse_transitions(value)?; i += 3; }
+            _ => return Err(format!(
+                "machine_graph!: unknown key '{}' — expected id, initial, states, or transitions",
+                key
+            )),
+        }
+    }
+
+    let id      = id.ok_or("machine_graph!: missing required field 'id'")?;
+    let initial = initial.ok_or("machine_graph!: missing required field 'initial'")?;
+
+    if states.is_empty() {
+        return Err("machine_graph!: 'states' list must not be empty".into());
+    }
+
+    let states_set: std::collections::HashSet<&str> =
+        states.iter().map(|s| s.as_str()).collect();
+
+    if !states_set.contains(initial.as_str()) {
+        return Err(format!(
+            "machine_graph!: initial state '{}' is not in states list {:?}",
+            initial, states
+        ));
+    }
+
+    for (from, event, to) in &transitions {
+        if !states_set.contains(from.as_str()) {
+            return Err(format!(
+                "machine_graph!: transition source '{}' (event '{}') is not a declared state. \
+                 Declared: {:?}",
+                from, event, states
+            ));
+        }
+        if !states_set.contains(to.as_str()) {
+            return Err(format!(
+                "machine_graph!: transition target '{}' (from '{}', event '{}') is not a declared state. \
+                 Declared: {:?}",
+                to, from, event, states
+            ));
+        }
+    }
+
+    // BFS reachability from initial
+    let mut reachable: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    queue.push_back(initial.as_str());
+    while let Some(s) = queue.pop_front() {
+        if !reachable.insert(s) { continue; }
+        for (from, _, to) in &transitions {
+            if from.as_str() == s {
+                queue.push_back(to.as_str());
+            }
+        }
+    }
+    let unreachable: Vec<&str> = states.iter()
+        .filter(|s| !reachable.contains(s.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if !unreachable.is_empty() {
+        return Err(format!(
+            "machine_graph!: unreachable states [{}] — every state must be reachable from '{}'",
+            unreachable.join(", "), initial
+        ));
+    }
+
+    mg_generate_types(&id, &states, &transitions)
+}
+
+fn mg_generate_types(
+    id: &str,
+    states: &[String],
+    transitions: &[(String, String, String)],
+) -> Result<TokenStream, String> {
+    use proc_macro2::{Ident, Span};
+    use quote::quote;
+
+    let span = Span::call_site();
+    let prefix = mg_to_pascal_case(id);
+
+    let state_enum = Ident::new(&format!("{}State", prefix), span);
+    let event_enum = Ident::new(&format!("{}Event", prefix), span);
+
+    let state_variants: Vec<Ident> = states.iter()
+        .map(|s| Ident::new(&mg_to_pascal_case(s), span))
+        .collect();
+    let state_str_arms: Vec<_> = states.iter().zip(&state_variants).map(|(s, v)| {
+        let lit = proc_macro2::Literal::string(s);
+        quote! { Self::#v => #lit, }
+    }).collect();
+
+    // Events: unique, in encounter order
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut events: Vec<String> = Vec::new();
+    for (_, ev, _) in transitions {
+        if seen.insert(ev.clone()) { events.push(ev.clone()); }
+    }
+    let event_variants: Vec<Ident> = events.iter()
+        .map(|e| Ident::new(&mg_to_pascal_case(e), span))
+        .collect();
+    let event_str_arms: Vec<_> = events.iter().zip(&event_variants).map(|(e, v)| {
+        let lit = proc_macro2::Literal::string(e);
+        quote! { Self::#v => #lit, }
+    }).collect();
+
+    let out = quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum #state_enum {
+            #(#state_variants,)*
+        }
+        impl #state_enum {
+            /// Returns the machine state name as used in the wire protocol and HTML attributes.
+            pub fn as_str(self) -> &'static str {
+                match self { #(#state_str_arms)* }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum #event_enum {
+            #(#event_variants,)*
+        }
+        impl #event_enum {
+            /// Returns the event name as used in the wire protocol and `fx-on` attributes.
+            pub fn as_str(self) -> &'static str {
+                match self { #(#event_str_arms)* }
+            }
+        }
+    };
+
+    Ok(out.into())
+}
+
+/// Convert a snake_case or kebab-case string to PascalCase for use as a Rust type name.
+fn mg_to_pascal_case(s: &str) -> String {
+    s.split(|c: char| c == '_' || c == '-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+            }
+        })
+        .collect()
+}
+
+fn mg_extract_str(token: &TokenTree) -> Result<String, String> {
+    match token {
+        TokenTree::Literal(lit) => {
+            let s = lit.to_string();
+            if s.starts_with('"') || s.starts_with('r') {
+                Ok(extract_str_content(&s))
+            } else {
+                Err(format!("machine_graph!: expected string literal, got: {}", s))
+            }
+        }
+        _ => Err("machine_graph!: expected a string literal".into()),
+    }
+}
+
+fn mg_parse_str_array(token: &TokenTree) -> Result<Vec<String>, String> {
+    let group = match token {
+        TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket => g,
+        _ => return Err("machine_graph!: 'states' must be a [...] array of string literals".into()),
+    };
+    let tokens: Vec<TokenTree> = group.stream().into_iter().collect();
+    let mut result = Vec::new();
+    for t in &tokens {
+        match t {
+            TokenTree::Literal(_) => result.push(mg_extract_str(t)?),
+            TokenTree::Punct(p) if p.as_char() == ',' => {}
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+fn mg_parse_transitions(token: &TokenTree) -> Result<Vec<(String, String, String)>, String> {
+    let group = match token {
+        TokenTree::Group(g) if g.delimiter() == Delimiter::Bracket => g,
+        _ => return Err("machine_graph!: 'transitions' must be a [...] array of 3-tuples".into()),
+    };
+    let tokens: Vec<TokenTree> = group.stream().into_iter().collect();
+    let mut result = Vec::new();
+    for t in &tokens {
+        if let TokenTree::Group(g) = t {
+            if g.delimiter() == Delimiter::Parenthesis {
+                let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+                let strs: Vec<String> = inner.iter()
+                    .filter_map(|tok| {
+                        if let TokenTree::Literal(_) = tok { mg_extract_str(tok).ok() } else { None }
+                    })
+                    .collect();
+                if strs.len() != 3 {
+                    return Err(format!(
+                        "machine_graph!: each transition must be (\"from\", \"event\", \"to\"), \
+                         got {} element(s)",
+                        strs.len()
+                    ));
+                }
+                result.push((strs[0].clone(), strs[1].clone(), strs[2].clone()));
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Compact HTML template DSL with `fx-*` shorthand attributes.
 ///
 /// # Syntax
