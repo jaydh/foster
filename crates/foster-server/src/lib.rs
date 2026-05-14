@@ -20,7 +20,11 @@ use std::sync::Arc;
 // ── state ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct AppState<S: StateStore + Clone, P: PubSub + Clone> {
+struct AppState<S = InMemoryStore, P = InMemoryPubSub>
+where
+    S: StateStore + Clone,
+    P: PubSub + Clone,
+{
     machines: Arc<HashMap<String, Arc<Machine>>>,
     store: S,
     pubsub: P,
@@ -34,20 +38,6 @@ struct AppState<S: StateStore + Clone, P: PubSub + Clone> {
 /// For multi-replica deployments, use [`router_with`] and supply Redis-backed
 /// [`StateStore`] and [`PubSub`] implementations so all replicas share state and
 /// broadcast transitions across processes.
-///
-/// Session isolation
-/// ─────────────────
-/// Every request carries a `session` query param (or `"default"` if absent).
-/// Instances are keyed by `(session_id, machine_id)` and created lazily on first
-/// access.  The WASM client stamps `data-fx-session` on `[fx-machine]` roots so
-/// Playwright can discover the session and inject state without a page reload.
-///
-/// Wire protocol
-/// ─────────────
-///   GET  /state?machine=<id>&session=<sid>  → MessagePack Snapshot
-///   POST /transition                         → MessagePack TransitionRequest → MessagePack Snapshot
-///   GET  /events?machine=<id>&session=<sid> → SSE stream of JSON Snapshots
-///   POST /test/state?session=<sid>           → JSON Snapshot in/out  (debug only)
 pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
     router_with(machines, InMemoryStore::default(), InMemoryPubSub::default())
 }
@@ -63,14 +53,28 @@ pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
 /// [`StateStore::apply`] in a distributed setting.
 ///
 /// For single-process deployments, prefer [`router`] which uses in-memory defaults.
+///
+/// Session isolation
+/// ─────────────────
+/// Every request carries a `session` query param (or `"default"` if absent).
+/// Instances are keyed by `(session_id, machine_id)` and created lazily on first
+/// access.  The WASM client stamps `data-fx-session` on `[fx-machine]` roots so
+/// Playwright can discover the session and inject state without a page reload.
+///
+/// Wire protocol
+/// ─────────────
+///   GET  /state?machine=<id>&session=<sid>  → MessagePack Snapshot
+///   POST /transition                         → MessagePack TransitionRequest → MessagePack Snapshot
+///   GET  /events?machine=<id>&session=<sid> → SSE stream of JSON Snapshots
+///   POST /test/state?session=<sid>           → JSON Snapshot in/out  (debug only)
 pub fn router_with<S, P>(
     machines: HashMap<String, Arc<Machine>>,
     store: S,
     pubsub: P,
 ) -> Router
 where
-    S: StateStore + Clone,
-    P: PubSub + Clone,
+    S: StateStore + Clone + 'static,
+    P: PubSub + Clone + 'static,
 {
     // Validate all templates at startup — unknown fx-show states or fx-on events panic immediately
     // rather than silently misbehaving at runtime.
@@ -1289,5 +1293,34 @@ mod tests {
         let snap: Snapshot = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(snap.machine_id, "counter");
         assert_eq!(snap.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn ha_shared_store_state_visible_across_replicas() {
+        let store = InMemoryStore::default();
+        let snap_a = Snapshot {
+            machine_id: "counter".into(),
+            state: "idle".into(),
+            context: json!({ "count": 42 }),
+            version: 1,
+            last_event: Some("increment".into()),
+        };
+        store.store("session1", "counter", &snap_a).await.unwrap();
+        let loaded = store.clone().load("session1", "counter").await.unwrap();
+        assert_eq!(loaded.state, "idle");
+        assert_eq!(loaded.context["count"], 42);
+        assert_eq!(loaded.version, 1);
+    }
+
+    #[tokio::test]
+    async fn ha_shared_store_history_visible_across_replicas() {
+        let store = InMemoryStore::default();
+        let store_b = store.clone();
+        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "a".into(), context: json!({}), version: 1, last_event: None }).await.unwrap();
+        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "b".into(), context: json!({}), version: 2, last_event: None }).await.unwrap();
+        let history = store_b.history("s", "m").await;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].state, "a");
+        assert_eq!(history[1].state, "b");
     }
 }
