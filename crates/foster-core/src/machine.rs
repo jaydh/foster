@@ -444,6 +444,19 @@ fn type_name(v: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use crate::machine_graph;
+
+    // Generate typed enums used by machine_graph tests below.
+    machine_graph! {
+        id: "test_counter",
+        initial: "idle",
+        states: ["idle", "error"],
+        transitions: [
+            ("idle",  "increment", "idle"),
+            ("idle",  "break_it",  "error"),
+            ("error", "recover",   "idle"),
+        ]
+    }
 
     fn counter_machine() -> Arc<Machine> {
         MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
@@ -645,5 +658,90 @@ mod tests {
             .build();
 
         assert!(machine.validate_template().is_ok());
+    }
+
+    // ── machine_graph! macro tests ──────────────────────────────────────────
+
+    #[test]
+    fn machine_graph_state_as_str() {
+        assert_eq!(TestCounterState::Idle.as_str(),  "idle");
+        assert_eq!(TestCounterState::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn machine_graph_event_as_str() {
+        assert_eq!(TestCounterEvent::Increment.as_str(), "increment");
+        assert_eq!(TestCounterEvent::BreakIt.as_str(),   "break_it");
+        assert_eq!(TestCounterEvent::Recover.as_str(),   "recover");
+    }
+
+    #[test]
+    fn machine_graph_enum_copy_and_eq() {
+        let s = TestCounterState::Idle;
+        let s2 = s; // Copy
+        assert_eq!(s, s2);
+        assert_ne!(TestCounterState::Idle, TestCounterState::Error);
+    }
+
+    // ── valid_events and last_event tests ────────────────────────────────────
+
+    #[test]
+    fn valid_events_from_initial_state() {
+        let m = MachineInstance::new(counter_machine());
+        let mut events = m.valid_events();
+        events.sort();
+        assert!(events.contains(&"increment"));
+        assert!(events.contains(&"decrement"));
+        assert!(events.contains(&"break_it"));
+        assert!(!events.contains(&"recover")); // only valid from error state
+    }
+
+    #[test]
+    fn valid_events_change_after_transition() {
+        let mut m = MachineInstance::new(counter_machine());
+        m.send("break_it", json!(null)).unwrap();
+        let events = m.valid_events();
+        assert!(events.contains(&"recover"));
+        assert!(!events.contains(&"increment"));
+    }
+
+    #[test]
+    fn last_event_is_none_on_initial_snapshot() {
+        let m = MachineInstance::new(counter_machine());
+        assert!(m.snapshot().last_event.is_none());
+    }
+
+    #[test]
+    fn last_event_is_set_after_send() {
+        let mut m = MachineInstance::new(counter_machine());
+        let snap = m.send("increment", json!(null)).unwrap();
+        assert_eq!(snap.last_event.as_deref(), Some("increment"));
+    }
+
+    #[test]
+    fn last_event_is_none_after_restore() {
+        let mut m = MachineInstance::new(counter_machine());
+        m.send("increment", json!(null)).unwrap();
+        let snap = Snapshot {
+            machine_id: "counter".into(),
+            state: "idle".into(),
+            context: json!({ "count": 5 }),
+            version: 10,
+            last_event: None,
+        };
+        m.restore(snap).unwrap();
+        assert!(m.snapshot().last_event.is_none());
+    }
+
+    #[test]
+    fn version_increments_monotonically() {
+        let mut m = MachineInstance::new(counter_machine());
+        assert_eq!(m.snapshot().version, 0);
+        m.send("increment", json!(null)).unwrap();
+        assert_eq!(m.snapshot().version, 1);
+        m.send("increment", json!(null)).unwrap();
+        assert_eq!(m.snapshot().version, 2);
+        m.send("break_it", json!(null)).unwrap();
+        assert_eq!(m.snapshot().version, 3);
     }
 }

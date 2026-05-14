@@ -2,6 +2,7 @@ pub mod machine;
 pub mod snapshot;
 
 pub use foster_macros::html;
+pub use foster_macros::machine_graph;
 pub use machine::{Machine, MachineBuilder, MachineError, MachineInstance, TransitionDef};
 pub use snapshot::Snapshot;
 

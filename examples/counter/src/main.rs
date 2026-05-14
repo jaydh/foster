@@ -1,17 +1,38 @@
-use foster_core::{html, page, MachineBuilder};
+use foster_core::{html, machine_graph, page, MachineBuilder};
 use serde_json::json;
 use std::collections::HashMap;
 use tower_http::services::ServeDir;
 
+// Declares CounterState and CounterEvent enums; validates graph at compile time.
+machine_graph! {
+    id: "counter",
+    initial: "idle",
+    states: ["idle", "error"],
+    transitions: [
+        ("idle",  "increment", "idle"),
+        ("idle",  "decrement", "idle"),
+        ("idle",  "reset",     "idle"),
+        ("idle",  "break_it",  "error"),
+        ("error", "recover",   "idle"),
+    ]
+}
+
 #[tokio::main]
 async fn main() {
-    let machine = MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
-        .state("error")
-        .on("idle", "increment", "idle", |ctx, _| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 })))
-        .on("idle", "decrement", "idle", |ctx, _| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) - 1 })))
-        .on("idle", "reset",     "idle", |_, _|   Ok(json!({ "count": 0 })))
-        .pass("idle",  "break_it", "error")
-        .pass("error", "recover",  "idle")
+    let machine = MachineBuilder::new(
+            "counter",
+            CounterState::Idle.as_str(),
+            json!({ "count": 0 }),
+        )
+        .state(CounterState::Error.as_str())
+        .on(CounterState::Idle.as_str(), CounterEvent::Increment.as_str(), CounterState::Idle.as_str(),
+            |ctx, _| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 })))
+        .on(CounterState::Idle.as_str(), CounterEvent::Decrement.as_str(), CounterState::Idle.as_str(),
+            |ctx, _| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) - 1 })))
+        .on(CounterState::Idle.as_str(), CounterEvent::Reset.as_str(), CounterState::Idle.as_str(),
+            |_, _| Ok(json!({ "count": 0 })))
+        .pass(CounterState::Idle.as_str(),  CounterEvent::BreakIt.as_str(),  CounterState::Error.as_str())
+        .pass(CounterState::Error.as_str(), CounterEvent::Recover.as_str(), CounterState::Idle.as_str())
         .template(page("Foster • Counter", include_str!("../static/style.css"), html! {
             h1 { "Foster UI · Counter" }
             div[machine="counter"] {
