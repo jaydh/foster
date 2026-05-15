@@ -7,6 +7,14 @@ use tower_http::services::ServeDir;
 // ── data model ────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+struct PageData {
+    id:     String,
+    title:  String,
+    emoji:  String,
+    blocks: Vec<Block>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct Block {
     id:         String,
     block_type:  String,    // h1 h2 h3 p bullet numbered quote code callout todo
@@ -18,6 +26,23 @@ struct Block {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct NotionCtx {
+    // ── pages ───────────────────────────────────────────────────────────────
+    page_store:      Vec<PageData>,
+    current_page_id: String,
+    // Per-page active indicator: present ("1") when page is current, absent when not.
+    // fx-bind-attr uses ctx:p1_active etc. and removes the attribute when key is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p1_active: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p2_active: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p3_active: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p4_active: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p5_active: Option<String>,
+
+    // ── current page content ─────────────────────────────────────────────────
     doc_title:   String,
     blocks:      Vec<Block>,
 
@@ -155,6 +180,7 @@ fn commit_edit(mut ctx: NotionCtx, payload: Value) -> Result<NotionCtx, MachineE
     recompute_stats(&mut ctx);
     ctx.new_block_id  = String::new();
     ctx.draft_content = String::new();
+    flush_page(&mut ctx);
     Ok(ctx)
 }
 
@@ -214,6 +240,43 @@ fn toggle_todo(mut ctx: NotionCtx, payload: Value) -> Result<NotionCtx, MachineE
     Ok(ctx)
 }
 
+fn set_page_active(ctx: &mut NotionCtx, id: &str) {
+    ctx.p1_active = if id == "p1" { Some("1".into()) } else { None };
+    ctx.p2_active = if id == "p2" { Some("1".into()) } else { None };
+    ctx.p3_active = if id == "p3" { Some("1".into()) } else { None };
+    ctx.p4_active = if id == "p4" { Some("1".into()) } else { None };
+    ctx.p5_active = if id == "p5" { Some("1".into()) } else { None };
+}
+
+fn flush_page(ctx: &mut NotionCtx) {
+    if let Some(p) = ctx.page_store.iter_mut().find(|p| p.id == ctx.current_page_id) {
+        p.blocks = ctx.blocks.clone();
+        p.title  = ctx.doc_title.clone();
+    }
+}
+
+fn select_page(mut ctx: NotionCtx, payload: Value) -> Result<NotionCtx, MachineError> {
+    let new_id = payload["id"].as_str().unwrap_or("").to_string();
+    if new_id.is_empty() || new_id == ctx.current_page_id { return Ok(ctx); }
+
+    flush_page(&mut ctx);
+
+    if let Some(p) = ctx.page_store.iter().find(|p| p.id == new_id).cloned() {
+        ctx.current_page_id = new_id.clone();
+        ctx.doc_title       = p.title.clone();
+        ctx.draft_title     = p.title;
+        ctx.blocks          = p.blocks;
+        ctx.active_id       = String::new();
+        ctx.active_type     = String::new();
+        ctx.active_content  = String::new();
+        ctx.draft_content   = String::new();
+        ctx.new_block_id    = String::new();
+        set_page_active(&mut ctx, &new_id);
+        recompute_stats(&mut ctx);
+    }
+    Ok(ctx)
+}
+
 fn update_title(mut ctx: NotionCtx, payload: Value) -> Result<NotionCtx, MachineError> {
     let title = payload["draft_title"].as_str().unwrap_or("").trim().to_string();
     if !title.is_empty() {
@@ -224,10 +287,17 @@ fn update_title(mut ctx: NotionCtx, payload: Value) -> Result<NotionCtx, Machine
     Ok(ctx)
 }
 
-// ── seed document ─────────────────────────────────────────────────────────────
+// ── seed documents ────────────────────────────────────────────────────────────
+
+fn seed_page(id: &str, title: &str, emoji: &str, raw: Vec<Block>) -> PageData {
+    let mut blocks = raw;
+    renumber(&mut blocks);
+    PageData { id: id.into(), title: title.into(), emoji: emoji.into(), blocks }
+}
 
 fn seed_ctx() -> NotionCtx {
-    let mut blocks = vec![
+    // ── page 1: Foster Framework (main doc) ───────────────────────────────────
+    let blocks_p1 = vec![
         make_block("b-1",  "h1",       "Foster Framework",                                                        false),
         make_block("b-2",  "p",        "An open-source state machine framework for reactive web UIs in Rust + WASM.", false),
         make_block("b-3",  "h2",       "Key Features",                                                            false),
@@ -250,12 +320,79 @@ fn seed_ctx() -> NotionCtx {
         make_block("b-20", "todo",     "Add a new transition to an existing example",                             false),
         make_block("b-21", "todo",     "Build a custom machine from scratch",                                     false),
     ];
-    renumber(&mut blocks);
 
+    // ── page 2: Meeting Notes ──────────────────────────────────────────────────
+    let blocks_p2 = vec![
+        make_block("m-1", "h1",     "Meeting Notes",                           false),
+        make_block("m-2", "h2",     "2026-05-15 — Sprint Planning",            false),
+        make_block("m-3", "bullet", "Reviewed open PRs — #5 conflicts fixed",  false),
+        make_block("m-4", "bullet", "Foster demo deploy target: end of sprint", false),
+        make_block("m-5", "todo",   "Write retro notes",                        false),
+        make_block("m-6", "todo",   "Share recording with team",                false),
+        make_block("m-7", "h2",     "Action items",                             false),
+        make_block("m-8", "todo",   "Jay: merge PR #5",                         false),
+        make_block("m-9", "todo",   "Jay: ship timeline feature",               false),
+    ];
+
+    // ── page 3: Q3 Roadmap ────────────────────────────────────────────────────
+    let blocks_p3 = vec![
+        make_block("q-1",  "h1",      "Q3 Roadmap",                                    false),
+        make_block("q-2",  "callout", "Goal: production-ready Foster 1.0",              false),
+        make_block("q-3",  "h2",      "July",                                           false),
+        make_block("q-4",  "bullet",  "Redis HA backend (in progress)",                 false),
+        make_block("q-5",  "bullet",  "Timeline + history replay UI",                   false),
+        make_block("q-6",  "bullet",  "Performance benchmarks vs HTMX",                false),
+        make_block("q-7",  "h2",      "August",                                         false),
+        make_block("q-8",  "bullet",  "Generated TypeScript SDK GA",                    false),
+        make_block("q-9",  "bullet",  "Compiled machine validation proc-macro",         false),
+        make_block("q-10", "h2",      "September",                                      false),
+        make_block("q-11", "bullet",  "Differential rendering rollout to all examples", false),
+        make_block("q-12", "bullet",  "Documentation site launch",                      false),
+    ];
+
+    // ── page 4: Sprint Board ──────────────────────────────────────────────────
+    let blocks_p4 = vec![
+        make_block("s-1", "h1",     "Sprint Board",                               false),
+        make_block("s-2", "h2",     "In Progress",                                false),
+        make_block("s-3", "bullet", "Fix sidebar navigation in notion example",   false),
+        make_block("s-4", "bullet", "Resolve conflicts in PR #5",                 false),
+        make_block("s-5", "h2",     "To Do",                                      false),
+        make_block("s-6", "todo",   "Add E2E tests for timeline page",             false),
+        make_block("s-7", "todo",   "Update README with new examples",             false),
+        make_block("s-8", "h2",     "Done",                                       false),
+        make_block("s-9",  "todo",  "Dev overlay: move CSS to server",             true),
+        make_block("s-10", "todo",  "SSE differential rendering (JSON Patch)",     true),
+    ];
+
+    // ── page 5: Release Notes ─────────────────────────────────────────────────
+    let blocks_p5 = vec![
+        make_block("r-1", "h1",     "Release Notes",                              false),
+        make_block("r-2", "h2",     "v0.4.0 — 2026-05-14",                       false),
+        make_block("r-3", "bullet", "Differential SSE rendering via JSON Patch",  false),
+        make_block("r-4", "bullet", "History timeline UI at /debug/timeline",      false),
+        make_block("r-5", "bullet", "PR conflict resolution tooling",              false),
+        make_block("r-6", "h2",     "v0.3.0 — 2026-05-01",                       false),
+        make_block("r-7", "bullet", "Dev overlay fully in Rust/WASM",             false),
+        make_block("r-8", "bullet", "Checkout example (7 states)",                false),
+        make_block("r-9", "bullet", "favicon 404 fix via data: URI",              false),
+    ];
+
+    let page_store = vec![
+        seed_page("p1", "Foster Framework", "📄", blocks_p1),
+        seed_page("p2", "Meeting Notes",    "📝", blocks_p2),
+        seed_page("p3", "Q3 Roadmap",       "📊", blocks_p3),
+        seed_page("p4", "Sprint Board",     "✅", blocks_p4),
+        seed_page("p5", "Release Notes",    "🔖", blocks_p5),
+    ];
+
+    let initial_blocks = page_store[0].blocks.clone();
     let mut ctx = NotionCtx {
-        doc_title:   "Foster Framework".to_string(),
-        draft_title: "Foster Framework".to_string(),
-        blocks,
+        page_store,
+        current_page_id: "p1".to_string(),
+        p1_active:        Some("1".to_string()),
+        doc_title:        "Foster Framework".to_string(),
+        draft_title:      "Foster Framework".to_string(),
+        blocks:           initial_blocks,
         ..Default::default()
     };
     recompute_stats(&mut ctx);
@@ -278,6 +415,7 @@ async fn main() {
         .typed_on("reading", "move_down",    "reading", move_down)
         .typed_on("reading", "toggle_todo",  "reading", toggle_todo)
         .typed_on("reading", "update_title", "reading", update_title)
+        .typed_on("reading", "select_page",  "reading", select_page)
         .typed_on("editing", "commit_edit",  "reading", commit_edit)
         .typed_on("editing", "discard_edit", "reading", discard_edit)
         .typed_on("editing", "change_type",  "editing", change_type)
@@ -297,23 +435,33 @@ async fn main() {
                     div[class="sidebar-divider"]
                     div[class="sidebar-section"] {
                         div[class="sidebar-section-label"] { "Pages" }
-                        a[class="page-item page-item-active"] {
+                        a[class="page-item", on="click->select_page",
+                          payload=r#"{"id":"p1"}"#,
+                          fx_bind_attr="data-active=ctx:p1_active"] {
                             span[class="page-icon"] { "📄" }
                             span { "Foster Framework" }
                         }
-                        a[class="page-item"] {
+                        a[class="page-item", on="click->select_page",
+                          payload=r#"{"id":"p2"}"#,
+                          fx_bind_attr="data-active=ctx:p2_active"] {
                             span[class="page-icon"] { "📝" }
                             span { "Meeting Notes" }
                         }
-                        a[class="page-item"] {
+                        a[class="page-item", on="click->select_page",
+                          payload=r#"{"id":"p3"}"#,
+                          fx_bind_attr="data-active=ctx:p3_active"] {
                             span[class="page-icon"] { "📊" }
                             span { "Q3 Roadmap" }
                         }
-                        a[class="page-item"] {
+                        a[class="page-item", on="click->select_page",
+                          payload=r#"{"id":"p4"}"#,
+                          fx_bind_attr="data-active=ctx:p4_active"] {
                             span[class="page-icon"] { "✅" }
                             span { "Sprint Board" }
                         }
-                        a[class="page-item"] {
+                        a[class="page-item", on="click->select_page",
+                          payload=r#"{"id":"p5"}"#,
+                          fx_bind_attr="data-active=ctx:p5_active"] {
                             span[class="page-icon"] { "🔖" }
                             span { "Release Notes" }
                         }

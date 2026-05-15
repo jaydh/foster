@@ -201,6 +201,269 @@ impl PubSub for InMemoryPubSub {
     }
 }
 
+// ── Redis backend (optional feature) ─────────────────────────────────────────
+//
+// Enable with `--features redis-backend`.  Requires a running Redis instance
+// at runtime; all compile-time and default-feature tests continue to use
+// InMemoryStore so no Redis is needed in CI.
+//
+// Usage:
+//   let store  = RedisStore::new("redis://127.0.0.1/")?;
+//   let pubsub = RedisPubSub::new("redis://127.0.0.1/")?;
+//   let router = foster_server::router_with(machines, store, pubsub);
+//
+// Concurrency model
+// ─────────────────
+// `apply()` loads the current snapshot, runs the Rust closure, then uses a
+// Lua CAS script to store the result only if the version hasn't advanced.
+// If a concurrent replica writes first, `apply()` returns `Err("version
+// conflict")` and the HTTP handler returns 400 — the WASM client can retry.
+// This is standard optimistic concurrency control for distributed systems.
+
+#[cfg(feature = "redis-backend")]
+mod redis_impl {
+    use super::*;
+    use redis::AsyncCommands;
+    use tokio::sync::broadcast;
+
+    fn state_key(session: &str, machine: &str) -> String {
+        format!("foster:state:{}:{}", session, machine)
+    }
+
+    fn history_key(session: &str, machine: &str) -> String {
+        format!("foster:history:{}:{}", session, machine)
+    }
+
+    fn pubsub_channel(session: &str, machine: &str) -> String {
+        format!("foster:events:{}:{}", session, machine)
+    }
+
+    /// Redis-backed state store for HA/multi-replica deployments.
+    ///
+    /// Keys: `foster:state:{session}:{machine}` (JSON snapshot),
+    ///       `foster:history:{session}:{machine}` (Redis list, capped at 50).
+    #[derive(Clone)]
+    pub struct RedisStore {
+        client: redis::Client,
+    }
+
+    impl RedisStore {
+        pub fn new(url: &str) -> Result<Self, redis::RedisError> {
+            Ok(Self { client: redis::Client::open(url)? })
+        }
+    }
+
+    impl StateStore for RedisStore {
+        async fn load(&self, session: &str, machine: &str) -> Option<Snapshot> {
+            let key = state_key(session, machine);
+            let mut conn = self.client.get_multiplexed_async_connection().await.ok()?;
+            let val: Option<String> = conn.get(&key).await.ok()?;
+            val.and_then(|s| serde_json::from_str(&s).ok())
+        }
+
+        async fn store(
+            &self,
+            session: &str,
+            machine: &str,
+            snap: &Snapshot,
+        ) -> Result<(), StoreError> {
+            let skey = state_key(session, machine);
+            let hkey = history_key(session, machine);
+            let mut conn = self.client.get_multiplexed_async_connection().await
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+
+            let snap_json = serde_json::to_string(snap)
+                .map_err(|e| StoreError::Backend(e.to_string()))?;
+            let expected = snap.version.saturating_sub(1);
+
+            // Lua CAS: atomically check the stored version matches `expected`,
+            // then update state + append to history list (capped at HISTORY_CAP).
+            let result: Result<redis::Value, redis::RedisError> = redis::Script::new(r#"
+                local cur = redis.call('GET', KEYS[1])
+                if cur ~= false then
+                    local s = cjson.decode(cur)
+                    if s['version'] ~= tonumber(ARGV[1]) then
+                        return redis.error_reply('version_conflict:' .. tostring(s['version']))
+                    end
+                elseif tonumber(ARGV[1]) ~= 0 then
+                    return redis.error_reply('version_conflict:missing')
+                end
+                redis.call('SET', KEYS[1], ARGV[2])
+                redis.call('RPUSH', KEYS[2], ARGV[2])
+                redis.call('LTRIM', KEYS[2], -50, -1)
+                return 1
+            "#)
+            .key(&skey)
+            .key(&hkey)
+            .arg(expected)
+            .arg(&snap_json)
+            .invoke_async(&mut conn)
+            .await;
+
+            result.map(|_| ()).map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("version_conflict") {
+                    StoreError::VersionConflict { expected, actual: snap.version }
+                } else {
+                    StoreError::Backend(msg)
+                }
+            })
+        }
+
+        async fn history(&self, session: &str, machine: &str) -> Vec<Snapshot> {
+            let hkey = history_key(session, machine);
+            let mut conn = match self.client.get_multiplexed_async_connection().await {
+                Ok(c) => c,
+                Err(_) => return vec![],
+            };
+            let items: Vec<String> = conn.lrange(&hkey, 0, -1).await.unwrap_or_default();
+            items.iter().filter_map(|s| serde_json::from_str(s).ok()).collect()
+        }
+
+        async fn apply(
+            &self,
+            session: &str,
+            machine: &str,
+            f: impl FnOnce(Option<Snapshot>) -> Result<Snapshot, String> + Send,
+        ) -> Result<Snapshot, String> {
+            let skey = state_key(session, machine);
+            let hkey = history_key(session, machine);
+            let mut conn = self.client.get_multiplexed_async_connection().await
+                .map_err(|e| e.to_string())?;
+
+            // Load current state (outside the Lua script — Rust closure runs here).
+            let cur: Option<String> = conn.get(&skey).await.map_err(|e| e.to_string())?;
+            let current_snap: Option<Snapshot> = cur.as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            let expected_version = current_snap.as_ref().map(|s| s.version).unwrap_or(0);
+
+            // Run the transition in Rust — this is where machine logic executes.
+            let next = f(current_snap)?;
+            let next_json = serde_json::to_string(&next).map_err(|e| e.to_string())?;
+
+            // Lua CAS: only commit if no concurrent write advanced the version.
+            let result: Result<redis::Value, redis::RedisError> = redis::Script::new(r#"
+                local cur = redis.call('GET', KEYS[1])
+                local expected = tonumber(ARGV[1])
+                if cur ~= false then
+                    local s = cjson.decode(cur)
+                    if s['version'] ~= expected then
+                        return redis.error_reply('version_conflict')
+                    end
+                elseif expected ~= 0 then
+                    return redis.error_reply('version_conflict')
+                end
+                redis.call('SET', KEYS[1], ARGV[2])
+                redis.call('RPUSH', KEYS[2], ARGV[2])
+                redis.call('LTRIM', KEYS[2], -50, -1)
+                return 1
+            "#)
+            .key(&skey)
+            .key(&hkey)
+            .arg(expected_version)
+            .arg(&next_json)
+            .invoke_async(&mut conn)
+            .await;
+
+            result.map(|_| next).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Redis pub/sub backend for HA/multi-replica SSE fan-out.
+    ///
+    /// Each `(session, machine)` pair gets one Redis subscriber task (spawned
+    /// lazily on first `subscribe()` call) that forwards messages into a local
+    /// broadcast channel.  `publish()` writes directly to the Redis channel so
+    /// every replica's subscriber task picks it up, enabling cross-replica SSE.
+    #[derive(Clone)]
+    pub struct RedisPubSub {
+        client: redis::Client,
+        inner: Arc<Mutex<HashMap<(String, String), broadcast::Sender<Snapshot>>>>,
+    }
+
+    impl RedisPubSub {
+        pub fn new(url: &str) -> Result<Self, redis::RedisError> {
+            Ok(Self {
+                client: redis::Client::open(url)?,
+                inner: Arc::default(),
+            })
+        }
+    }
+
+    impl PubSub for RedisPubSub {
+        async fn publish(&self, session: &str, machine: &str, snap: Snapshot) {
+            let channel = pubsub_channel(session, machine);
+            let payload = match serde_json::to_string(&snap) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            if let Ok(mut conn) = self.client.get_multiplexed_async_connection().await {
+                let _: Result<(), _> = conn.publish(channel, payload).await;
+            }
+        }
+
+        fn subscribe(&self, session: &str, machine: &str) -> BoxStream<'static, Snapshot> {
+            let key = (session.to_string(), machine.to_string());
+            let channel = pubsub_channel(session, machine);
+
+            // Get or create the local broadcast channel for this (session, machine).
+            let (spawn_listener, tx) = {
+                let mut map = self.inner.lock().unwrap();
+                if let Some(tx) = map.get(&key) {
+                    (false, tx.clone())
+                } else {
+                    let (tx, _) = broadcast::channel(64);
+                    map.insert(key, tx.clone());
+                    (true, tx)
+                }
+            };
+
+            // On first subscription for this channel, spawn a Redis listener task
+            // that forwards incoming messages to the broadcast channel.
+            if spawn_listener {
+                let client = self.client.clone();
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    let mut ps = match client.get_async_pubsub().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if ps.subscribe(&channel).await.is_err() {
+                        return;
+                    }
+                    let mut msg_stream = ps.on_message();
+                    while let Some(msg) = msg_stream.next().await {
+                        let payload: String = match msg.get_payload() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        if let Ok(snap) = serde_json::from_str::<Snapshot>(&payload) {
+                            if tx2.send(snap).is_err() {
+                                break; // no more local receivers — task can exit
+                            }
+                        }
+                    }
+                });
+            }
+
+            let rx = tx.subscribe();
+            stream::unfold(rx, |mut rx| async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(snap) => return Some((snap, rx)),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            })
+            .boxed()
+        }
+    }
+}
+
+#[cfg(feature = "redis-backend")]
+pub use redis_impl::{RedisPubSub, RedisStore};
+
 #[cfg(test)]
 mod tests {
     use super::*;
