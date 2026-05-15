@@ -121,6 +121,7 @@ where
         .route("/debug/history", get(get_debug_history::<S, P>))
         .route("/debug/rewind", post(post_debug_rewind::<S, P>))
         .route("/debug/graph", get(get_debug_graph::<S, P>))
+        .route("/debug/timeline", get(get_debug_timeline::<S, P>))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app);
 
@@ -472,6 +473,288 @@ const SESSION = {session_json};
 </html>"##
     )
 }
+
+/// History timeline — self-contained HTML page showing every recorded snapshot
+/// as a scrubable timeline.  Clicking a step rewinds the machine to that version.
+/// An auto-play button replays the sequence at configurable speed.
+///
+/// Gated by `test_mode`.
+async fn get_debug_timeline<S: StateStore + Clone, P: PubSub + Clone>(
+    Query(q): Query<MachineQuery>,
+    State(app): State<AppState<S, P>>,
+) -> Response {
+    if !app.test_mode {
+        return (
+            StatusCode::FORBIDDEN,
+            "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable",
+        )
+            .into_response();
+    }
+    let Some(machine) = app.machines.get(&q.machine).cloned() else {
+        return (StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine))
+            .into_response();
+    };
+    Html(build_timeline_html(&machine, q.session_id())).into_response()
+}
+
+fn build_timeline_html(machine: &Machine, session: &str) -> String {
+    let machine_id   = &machine.id;
+    let machine_json = serde_json::json!(machine_id).to_string();
+    let session_json = serde_json::json!(session).to_string();
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Timeline — {machine_id}</title>
+<style>{TIMELINE_CSS}</style>
+</head>
+<body>
+<div class="tl-header">
+  <span class="tl-title">Timeline — <code>{machine_id}</code></span>
+  <span class="tl-meta">session: <code>{session}</code></span>
+  <span class="conn-dot" id="dot"></span>
+</div>
+<div class="tl-toolbar">
+  <button id="btn-prev"  title="Previous step">◀</button>
+  <button id="btn-play"  title="Play / Pause">▶ play</button>
+  <button id="btn-next"  title="Next step">▶</button>
+  <button id="btn-live"  title="Jump to latest">⏭ live</button>
+  <label class="speed-label">speed
+    <select id="speed">
+      <option value="1200">0.5×</option>
+      <option value="800" selected>1×</option>
+      <option value="400">2×</option>
+      <option value="200">4×</option>
+    </select>
+  </label>
+  <span class="tl-count" id="count"></span>
+</div>
+<div class="tl-rail-wrap">
+  <div class="tl-rail" id="rail"></div>
+</div>
+<div class="tl-ctx-wrap">
+  <div class="tl-ctx-label">context</div>
+  <pre class="tl-ctx" id="ctx">—</pre>
+</div>
+<script>
+const MACHINE = {machine_json};
+const SESSION = {session_json};
+</script>
+<script>{TIMELINE_JS}</script>
+</body>
+</html>"##
+    )
+}
+
+const TIMELINE_CSS: &str = r#"
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; background: #111; color: #ccc; display: flex;
+       flex-direction: column; height: 100vh; overflow: hidden; }
+code { background: #222; padding: 1px 5px; border-radius: 3px; font-size: 0.85em; }
+.tl-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+             background: #1a1a1a; border-bottom: 1px solid #2a2a2a; flex-shrink: 0; }
+.tl-title  { font-size: 0.95rem; color: #aaa; }
+.tl-meta   { font-size: 0.8rem; color: #555; }
+.conn-dot  { width: 8px; height: 8px; border-radius: 50%; background: #555; margin-left: auto; }
+.conn-dot.live { background: #4caf50; }
+.tl-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 16px;
+              background: #161616; border-bottom: 1px solid #222; flex-shrink: 0; }
+.tl-toolbar button { font-family: monospace; background: #222; border: 1px solid #333;
+                     color: #aaa; padding: 3px 10px; cursor: pointer; border-radius: 3px;
+                     font-size: 0.82rem; }
+.tl-toolbar button:hover { background: #2a2a2a; color: #ddd; }
+.tl-toolbar button.playing { background: #1a3a1a; border-color: #2d6a2d; color: #4caf50; }
+#btn-live { margin-left: 4px; }
+.speed-label { font-size: 0.78rem; color: #555; margin-left: 8px; }
+.speed-label select { font-family: monospace; background: #1a1a1a; border: 1px solid #2a2a2a;
+                      color: #888; border-radius: 3px; padding: 2px 4px; font-size: 0.78rem; }
+.tl-count  { font-size: 0.78rem; color: #555; margin-left: auto; }
+.tl-rail-wrap { flex: 1 1 auto; overflow-x: auto; overflow-y: hidden; padding: 24px 16px 16px;
+                min-height: 0; }
+.tl-rail { display: flex; align-items: center; min-width: max-content; gap: 0; height: 100%; }
+.tl-snap { display: flex; flex-direction: column; align-items: center; gap: 6px;
+           padding: 10px 14px; border: 1px solid #2a2a2a; border-radius: 6px;
+           background: #1a1a1a; cursor: pointer; min-width: 100px; max-width: 140px;
+           transition: border-color 0.12s, background 0.12s; }
+.tl-snap:hover { border-color: #444; background: #1e1e1e; }
+.tl-snap.active { border-color: #4caf50; background: #0d2010; }
+.tl-snap-ver   { font-size: 0.68rem; color: #555; }
+.tl-snap-state { font-size: 0.85rem; color: #ddd; font-weight: 600; text-align: center;
+                 word-break: break-all; }
+.tl-snap.active .tl-snap-state { color: #4caf50; }
+.tl-snap-ev    { font-size: 0.7rem; color: #666; text-align: center; word-break: break-all; }
+.tl-connector  { width: 32px; flex-shrink: 0; height: 2px; background: #2a2a2a;
+                 position: relative; }
+.tl-connector::after { content: '▶'; position: absolute; right: -6px; top: -7px;
+                       font-size: 10px; color: #333; }
+.tl-ctx-wrap { flex-shrink: 0; padding: 0 16px 16px; max-height: 35vh; overflow: auto; }
+.tl-ctx-label { font-size: 0.7rem; color: #555; text-transform: uppercase;
+                letter-spacing: 0.1em; margin-bottom: 6px; }
+.tl-ctx { font-family: monospace; font-size: 0.8rem; color: #888; white-space: pre-wrap;
+          word-break: break-all; line-height: 1.5; }
+"#;
+
+const TIMELINE_JS: &str = r#"
+(function () {
+  const HISTORY_URL = `/debug/history?machine=${encodeURIComponent(MACHINE)}&session=${encodeURIComponent(SESSION)}`;
+  const REWIND_URL  = v => `/debug/rewind?machine=${encodeURIComponent(MACHINE)}&session=${encodeURIComponent(SESSION)}&version=${v}`;
+  const SSE_URL     = `/events?machine=${encodeURIComponent(MACHINE)}&session=${encodeURIComponent(SESSION)}`;
+
+  let history  = [];
+  let activeVer = null;
+  let playTimer = null;
+  let ignoreVer = null; // version we just rewound to — suppress echo
+
+  // ── data fetch ──────────────────────────────────────────────────────────────
+  function loadHistory() {
+    return fetch(HISTORY_URL).then(r => r.json()).then(snaps => {
+      history = snaps;
+      render();
+      updateCount();
+    });
+  }
+
+  // ── render timeline ──────────────────────────────────────────────────────────
+  function render() {
+    const rail = document.getElementById('rail');
+    rail.innerHTML = '';
+    history.forEach((snap, i) => {
+      if (i > 0) {
+        const line = document.createElement('div');
+        line.className = 'tl-connector';
+        rail.appendChild(line);
+      }
+      const el = document.createElement('div');
+      el.className = 'tl-snap' + (snap.version === activeVer ? ' active' : '');
+      el.dataset.version = snap.version;
+      el.innerHTML =
+        `<div class="tl-snap-ver">v${snap.version}</div>` +
+        `<div class="tl-snap-state">${snap.state}</div>` +
+        `<div class="tl-snap-ev">${snap.last_event || '—'}</div>`;
+      el.addEventListener('click', () => rewindTo(snap.version));
+      rail.appendChild(el);
+    });
+    if (activeVer !== null) scrollToActive();
+  }
+
+  function updateCount() {
+    const idx = history.findIndex(s => s.version === activeVer);
+    const label = idx >= 0
+      ? `step ${idx + 1} / ${history.length}`
+      : `${history.length} steps`;
+    document.getElementById('count').textContent = label;
+  }
+
+  // ── activation ───────────────────────────────────────────────────────────────
+  function activate(version) {
+    activeVer = version;
+    document.querySelectorAll('.tl-snap').forEach(el => {
+      el.classList.toggle('active', +el.dataset.version === version);
+    });
+    const snap = history.find(s => s.version === version);
+    document.getElementById('ctx').textContent = snap
+      ? JSON.stringify(snap.context, null, 2)
+      : '—';
+    updateCount();
+    scrollToActive();
+  }
+
+  function scrollToActive() {
+    const el = document.querySelector(`.tl-snap[data-version="${activeVer}"]`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+  }
+
+  // ── rewind ────────────────────────────────────────────────────────────────────
+  function rewindTo(version) {
+    ignoreVer = version;
+    fetch(REWIND_URL(version), { method: 'POST' });
+    activate(version);
+  }
+
+  // ── play controls ─────────────────────────────────────────────────────────────
+  const btnPlay = document.getElementById('btn-play');
+
+  function stopPlay() {
+    if (!playTimer) return;
+    clearInterval(playTimer);
+    playTimer = null;
+    btnPlay.textContent = '▶ play';
+    btnPlay.classList.remove('playing');
+  }
+
+  function startPlay() {
+    stopPlay();
+    let idx = history.findIndex(s => s.version === activeVer);
+    if (idx < 0 || idx >= history.length - 1) idx = -1; // restart from top
+    const speed = +document.getElementById('speed').value;
+    btnPlay.textContent = '⏸ pause';
+    btnPlay.classList.add('playing');
+    playTimer = setInterval(() => {
+      idx++;
+      if (idx >= history.length) { stopPlay(); return; }
+      rewindTo(history[idx].version);
+    }, speed);
+  }
+
+  btnPlay.addEventListener('click', () => playTimer ? stopPlay() : startPlay());
+
+  document.getElementById('btn-prev').addEventListener('click', () => {
+    stopPlay();
+    const idx = history.findIndex(s => s.version === activeVer);
+    if (idx > 0) rewindTo(history[idx - 1].version);
+  });
+
+  document.getElementById('btn-next').addEventListener('click', () => {
+    stopPlay();
+    const idx = history.findIndex(s => s.version === activeVer);
+    if (idx >= 0 && idx < history.length - 1) rewindTo(history[idx + 1].version);
+  });
+
+  document.getElementById('btn-live').addEventListener('click', () => {
+    stopPlay();
+    loadHistory().then(() => {
+      if (history.length) rewindTo(history[history.length - 1].version);
+    });
+  });
+
+  // ── SSE — live tail ───────────────────────────────────────────────────────────
+  const dot = document.getElementById('dot');
+  const es  = new EventSource(SSE_URL);
+  es.onopen  = () => dot.classList.add('live');
+  es.onerror = () => dot.classList.remove('live');
+
+  const onSseSnap = ev => {
+    let snap;
+    try { snap = JSON.parse(ev.data); } catch (_) { return; }
+    // Rewind echo: server bumps version, so ignore until next live event.
+    if (snap.version === ignoreVer) { ignoreVer = null; return; }
+    ignoreVer = null;
+    if (!history.find(s => s.version === snap.version)) {
+      history.push(snap);
+      render();
+    }
+    activate(snap.version);
+  };
+
+  // patch events don't carry full context — refetch history then activate latest
+  const onSsePatch = () => {
+    if (ignoreVer !== null) { ignoreVer = null; return; }
+    loadHistory().then(() => {
+      if (history.length) activate(history[history.length - 1].version);
+    });
+  };
+
+  es.addEventListener('snapshot', onSseSnap);
+  es.addEventListener('patch',    onSsePatch);
+
+  // ── init ──────────────────────────────────────────────────────────────────────
+  loadHistory().then(() => {
+    if (history.length) activate(history[history.length - 1].version);
+  });
+}());
+"#;
 
 // ── overlay CSS (served by the server so it's in the HTML before WASM runs) ───
 const OVERLAY_CSS: &str = "\

@@ -236,6 +236,8 @@ fn apply_fx_value(root: &Element, ctx: &Value) {
                 input.set_value(&text);
             } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
                 ta.set_value(&text);
+            } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+                sel.set_value(&text);
             }
         }
     }
@@ -399,7 +401,11 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
         });
     });
 
-    root.add_event_listener_with_callback("click", cb.as_ref().unchecked_ref()).unwrap();
+    // Register for click, change (select/input blur), and input (live text) so
+    // fx-on="change->..." and fx-on="input->..." work alongside fx-on="click->...".
+    for ev_type in &["click", "change", "input"] {
+        root.add_event_listener_with_callback(ev_type, cb.as_ref().unchecked_ref()).unwrap();
+    }
     cb.forget();
 }
 
@@ -652,7 +658,7 @@ fn mount_overlay(document: &Document, root: &Element, machine_id: &str, session_
           </div>\
           <div class=\"fx-dbg-links\">\
             <a href=\"/debug/graph?machine={enc_machine}&session={enc_session}\" target=\"_blank\">graph \u{2197}</a>\
-            <a href=\"/debug/history?machine={enc_machine}&session={enc_session}\" target=\"_blank\">history \u{2197}</a>\
+            <a href=\"/debug/timeline?machine={enc_machine}&session={enc_session}\" target=\"_blank\">timeline \u{2197}</a>\
           </div>\
         </div>"
     ));

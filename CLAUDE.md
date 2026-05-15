@@ -18,7 +18,9 @@ foster/
 │   ├── player/            # 6-state media player (port 3001)
 │   ├── kanban/            # Multi-column task board with fx-for (port 3002)
 │   ├── aura/              # CSS animation showcase with fx-class (port 3003)
-│   └── checkout/          # 7-state checkout flow, showcases graph + history (port 3004)
+│   ├── checkout/          # 7-state checkout flow, showcases graph + history (port 3004)
+│   ├── plane/             # Linear-style issue tracker — 5 states, 15 transitions (port 3005)
+│   └── notion/            # Notion-style block editor — 2 states, 10 transitions (port 3006)
 └── scripts/
     ├── build-wasm.sh      # Build foster-client (release); pass --dev for dev overlay
     ├── demo.sh            # Build WASM (dev) + start all demo servers (Ctrl-C stops all)

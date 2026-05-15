@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 if [[ $# -eq 0 ]]; then
-    DEMOS=(counter player kanban aura checkout)
+    DEMOS=(counter player kanban aura checkout plane notion)
 else
     DEMOS=("$@")
 fi
@@ -22,7 +22,9 @@ port_for() {
         kanban)   echo 3002 ;;
         aura)     echo 3003 ;;
         checkout) echo 3004 ;;
-        *) echo "Unknown demo: $1 (choose: counter, player, kanban, aura, checkout)" >&2; exit 1 ;;
+        plane)    echo 3005 ;;
+        notion)   echo 3006 ;;
+        *) echo "Unknown demo: $1 (choose: counter, player, kanban, aura, checkout, plane, notion)" >&2; exit 1 ;;
     esac
 }
 

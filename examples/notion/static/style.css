@@ -1,0 +1,395 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:        #ffffff;
+  --surface:   #f7f7f5;
+  --sidebar-bg: #f7f7f5;
+  --border:    #e9e9e7;
+  --border2:   #d3d3cf;
+  --text:      #37352f;
+  --text-light: #787774;
+  --dim:       #9b9a97;
+  --muted:     #b5b5b2;
+  --accent:    #2383e2;
+  --green:     #0f7b6c;
+  --red:       #e03e3e;
+  --orange:    #d9730d;
+  --purple:    #6940a5;
+  --badge-bg:  #f1f1ef;
+}
+
+html, body { height: 100%; }
+body {
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+/* ── app layout ──────────────────────────────────────────────────────────────── */
+
+.notion-app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── sidebar ─────────────────────────────────────────────────────────────────── */
+
+.notion-sidebar {
+  width: 240px;
+  min-width: 240px;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 8px 0 16px;
+}
+
+.sidebar-workspace {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  border-radius: 4px;
+  margin: 0 4px 4px;
+}
+.sidebar-workspace:hover { background: var(--border); }
+
+.workspace-icon {
+  width: 28px;
+  height: 28px;
+  background: var(--text);
+  color: #fff;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.workspace-info { flex: 1; min-width: 0; }
+.workspace-name { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.workspace-plan { font-size: 11px; color: var(--dim); }
+
+.sidebar-divider { height: 1px; background: var(--border); margin: 8px 0; }
+
+.sidebar-section { padding: 0 4px; }
+.sidebar-section-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  margin-bottom: 2px;
+}
+
+.page-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-light);
+  text-decoration: none;
+  transition: background 0.1s;
+}
+.page-item:hover { background: var(--border); color: var(--text); }
+.page-item-active { background: var(--border) !important; color: var(--text) !important; font-weight: 500; }
+
+.page-icon { font-size: 14px; }
+
+.sidebar-footer {
+  margin-top: auto;
+  padding: 12px 14px 4px;
+}
+.sidebar-stat { font-size: 11px; color: var(--muted); }
+
+/* ── main area ────────────────────────────────────────────────────────────────── */
+
+.notion-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* ── topbar ───────────────────────────────────────────────────────────────────── */
+
+.notion-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  min-height: 46px;
+}
+
+.topbar-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--dim);
+  min-width: 0;
+  overflow: hidden;
+}
+.breadcrumb-dim { color: var(--muted); white-space: nowrap; }
+.breadcrumb-cur { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.topbar-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+/* ── buttons ──────────────────────────────────────────────────────────────────── */
+
+.btn {
+  padding: 5px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+.btn-sm { padding: 3px 10px; font-size: 12px; }
+
+.btn-primary {
+  background: var(--text);
+  color: #fff;
+  border-color: var(--text);
+}
+.btn-primary:hover { background: #1a1a16; }
+
+.btn-outline {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border2);
+}
+.btn-outline:hover { background: var(--surface); }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-light);
+  border-color: transparent;
+}
+.btn-ghost:hover { background: var(--border); color: var(--text); }
+
+/* ── doc content ──────────────────────────────────────────────────────────────── */
+
+.notion-doc {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 0 80px;
+}
+
+.doc-cover {
+  height: 56px;
+  display: flex;
+  align-items: flex-end;
+  padding: 0 96px 8px;
+}
+.doc-emoji { font-size: 40px; line-height: 1; }
+
+.doc-title-row {
+  padding: 0 96px 28px;
+}
+.doc-title-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  font-size: 36px;
+  font-weight: 700;
+  color: var(--text);
+  background: transparent;
+  padding: 0;
+  line-height: 1.2;
+}
+.doc-title-input::placeholder { color: var(--muted); }
+
+/* ── edit panel ───────────────────────────────────────────────────────────────── */
+
+.edit-panel {
+  margin: 0 96px 28px;
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.edit-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.edit-panel-label {
+  font-size: 12px;
+  color: var(--dim);
+}
+.edit-type-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  background: var(--badge-bg);
+  border: 1px solid var(--border2);
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.edit-panel-controls { display: flex; align-items: center; gap: 8px; }
+
+.type-select {
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  color: var(--text);
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.type-select:focus { outline: none; border-color: var(--accent); }
+
+.block-editor {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  border: none;
+  outline: none;
+  resize: vertical;
+  padding: 14px 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  background: var(--surface);
+  color: var(--text);
+  line-height: 1.6;
+}
+.block-editor::placeholder { color: var(--muted); }
+
+.edit-panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 16px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+/* ── block list ───────────────────────────────────────────────────────────────── */
+
+.blocks-area {
+  padding: 0 96px;
+}
+
+.block-row {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 0;
+  border-radius: 4px;
+  min-height: 30px;
+}
+.block-row:hover { background: var(--surface); }
+.block-row:hover .block-controls { opacity: 1; }
+
+.block-type-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.block-type-btn:hover { background: var(--border); }
+
+.block-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dim);
+  font-family: ui-monospace, monospace;
+}
+
+.block-body {
+  padding: 3px 0;
+  min-width: 0;
+}
+
+.block-text {
+  display: block;
+  font-size: 14px;
+  color: var(--text);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.block-controls {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0;
+  transition: opacity 0.1s;
+  flex-shrink: 0;
+  padding-top: 2px;
+}
+
+.ctrl-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--dim);
+  padding: 0;
+  transition: background 0.1s, color 0.1s;
+}
+.ctrl-btn:hover { background: var(--border); color: var(--text); }
+.ctrl-btn-danger:hover { color: var(--red) !important; }
+
+.add-block-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  margin-top: 8px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--muted);
+  font-family: inherit;
+  transition: background 0.1s, color 0.1s;
+}
+.add-block-btn:hover { background: var(--surface); color: var(--text-light); }
+
+/* ── fx-show default (before WASM) ───────────────────────────────────────────── */
+[fx-show] { display: none; }
