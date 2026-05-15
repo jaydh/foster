@@ -200,6 +200,7 @@ Inlined — no external dependencies, compiles to WASM.
 | GET | `/debug/history?machine=<id>&session=<sid>` | JSON | History ring buffer — up to 50 snapshots, oldest first (debug only) |
 | POST | `/debug/rewind?machine=<id>&session=<sid>&version=N` | JSON | Restore a historical snapshot and broadcast via SSE (debug only) |
 | GET | `/debug/graph?machine=<id>&session=<sid>` | HTML | Self-contained state graph visualiser — SVG nodes/edges + live SSE state highlight (debug only) |
+| GET | `/debug/timeline?machine=<id>&session=<sid>` | HTML | History replay timeline — scrub through snapshots, auto-play, live tail (debug only) |
 
 `session` defaults to `"default"` if omitted.
 
@@ -315,9 +316,9 @@ When asked to add a feature, check here first so your design is consistent with 
 - `demo.sh` is self-sufficient: builds dev WASM then starts all servers; `<link rel="icon" href="data:,">` in HTML shell eliminates favicon 404s
 - Multiple machines per page: `fx-machine="counter#1"` / `fx-machine="counter#2"` — fragment appended to session with `.` separator; context cache and dev overlay panels are keyed per instance — `crates/foster-client/src/lib.rs`
 - Generated TypeScript SDK: `foster_testgen::generate_sdk` emits `tests/{name}.sdk.ts` alongside each Playwright spec. Exports `{Name}State`, `{Name}Event`, `{Name}Snapshot`, and `{Name}Client` (with `sendEvent`, `getState`, `setState`). `@msgpack/msgpack` added to all example `devDependencies` — `crates/foster-testgen/src/lib.rs`
-
 - Compiled machine validation: `machine_graph!` proc-macro in `crates/foster-macros/src/lib.rs`, re-exported from `foster-core`. Accepts `{id, initial, states, transitions}` block. Emits `compile_error!` for unknown states in transitions or unreachable states. Generates `{PascalId}State` + `{PascalId}Event` enums with `as_str()`. Used in `examples/counter/src/main.rs`.
 - Generic `AppState<S, P>` + `router_with()`: `AppState` in `crates/foster-server/src/lib.rs` is now generic over `S: StateStore + Clone` and `P: PubSub + Clone`. `pub fn router_with(machines, store, pubsub) -> Router` is the extension point for custom backends (e.g., Redis). `router(machines)` is unchanged — it delegates to `router_with` with `InMemoryStore` / `InMemoryPubSub` defaults. HTTP integration tests added: `http_get_state_*`, `http_post_transition_*`, `http_post_test_state_*`, `http_debug_history_*`.
+- History replay timeline: `GET /debug/timeline?machine=<id>&session=<sid>` — self-contained HTML page with horizontal scrollable snapshot rail, ◀ / ▶ step controls, auto-play with configurable speed, live SSE tail, and context JSON panel. Overlay "history" link updated to point here. Gated by `test_mode` — `crates/foster-server/src/lib.rs`.
 
 ## Security invariants — do not break
 
