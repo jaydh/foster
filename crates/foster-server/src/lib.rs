@@ -502,9 +502,11 @@ async fn get_debug_timeline<S: StateStore + Clone, P: PubSub + Clone>(
 }
 
 fn build_timeline_html(machine: &Machine, session: &str) -> String {
-    let machine_id   = &machine.id;
-    let machine_json = serde_json::json!(machine_id).to_string();
-    let session_json = serde_json::json!(session).to_string();
+    let machine_id      = &machine.id;
+    let machine_json    = serde_json::json!(machine_id).to_string();
+    let session_json    = serde_json::json!(session).to_string();
+    let preview_session = format!("{session}__tl");
+    let preview_json    = serde_json::json!(preview_session).to_string();
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -538,13 +540,20 @@ fn build_timeline_html(machine: &Machine, session: &str) -> String {
 <div class="tl-rail-wrap">
   <div class="tl-rail" id="rail"></div>
 </div>
-<div class="tl-ctx-wrap">
-  <div class="tl-ctx-label">context</div>
-  <pre class="tl-ctx" id="ctx">—</pre>
+<div class="tl-body">
+  <div class="tl-preview-wrap">
+    <div class="tl-panel-label">ui preview</div>
+    <iframe class="tl-preview" id="preview" src="/?session={preview_session}"></iframe>
+  </div>
+  <div class="tl-ctx-wrap">
+    <div class="tl-panel-label">context</div>
+    <pre class="tl-ctx" id="ctx">—</pre>
+  </div>
 </div>
 <script>
-const MACHINE = {machine_json};
-const SESSION = {session_json};
+const MACHINE         = {machine_json};
+const SESSION         = {session_json};
+const PREVIEW_SESSION = {preview_json};
 </script>
 <script>{TIMELINE_JS}</script>
 </body>
@@ -575,8 +584,8 @@ code { background: #222; padding: 1px 5px; border-radius: 3px; font-size: 0.85em
 .speed-label select { font-family: monospace; background: #1a1a1a; border: 1px solid #2a2a2a;
                       color: #888; border-radius: 3px; padding: 2px 4px; font-size: 0.78rem; }
 .tl-count  { font-size: 0.78rem; color: #555; margin-left: auto; }
-.tl-rail-wrap { flex: 1 1 auto; overflow-x: auto; overflow-y: hidden; padding: 24px 16px 16px;
-                min-height: 0; }
+.tl-rail-wrap { height: 130px; flex-shrink: 0; overflow-x: auto; overflow-y: hidden;
+                padding: 16px 16px; border-bottom: 1px solid #1e1e1e; }
 .tl-rail { display: flex; align-items: center; min-width: max-content; gap: 0; height: 100%; }
 .tl-snap { display: flex; flex-direction: column; align-items: center; gap: 6px;
            padding: 10px 14px; border: 1px solid #2a2a2a; border-radius: 6px;
@@ -593,11 +602,18 @@ code { background: #222; padding: 1px 5px; border-radius: 3px; font-size: 0.85em
                  position: relative; }
 .tl-connector::after { content: '▶'; position: absolute; right: -6px; top: -7px;
                        font-size: 10px; color: #333; }
-.tl-ctx-wrap { flex-shrink: 0; padding: 0 16px 16px; max-height: 35vh; overflow: auto; }
-.tl-ctx-label { font-size: 0.7rem; color: #555; text-transform: uppercase;
-                letter-spacing: 0.1em; margin-bottom: 6px; }
-.tl-ctx { font-family: monospace; font-size: 0.8rem; color: #888; white-space: pre-wrap;
-          word-break: break-all; line-height: 1.5; }
+/* ── split body: iframe preview + context JSON ─────────────────────────────── */
+.tl-body { display: flex; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.tl-preview-wrap { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0;
+                   border-right: 1px solid #2a2a2a; }
+.tl-preview { flex: 1; border: none; width: 100%; background: #fff; }
+.tl-ctx-wrap { flex: 0 0 320px; display: flex; flex-direction: column; overflow: hidden; }
+.tl-ctx { flex: 1; font-family: monospace; font-size: 0.8rem; color: #888;
+          white-space: pre-wrap; word-break: break-all; line-height: 1.5;
+          overflow: auto; padding: 12px 16px; }
+.tl-panel-label { font-size: 0.7rem; color: #555; text-transform: uppercase;
+                  letter-spacing: 0.1em; padding: 6px 16px 5px;
+                  border-bottom: 1px solid #1e1e1e; flex-shrink: 0; }
 "#;
 
 const TIMELINE_JS: &str = r#"
@@ -651,6 +667,23 @@ const TIMELINE_JS: &str = r#"
     document.getElementById('count').textContent = label;
   }
 
+  // ── preview injection ─────────────────────────────────────────────────────────
+  // Injects a historical snapshot into the isolated preview session so the iframe
+  // renders the UI exactly as it was at that point in time.
+  function injectPreview(snap) {
+    if (!snap) return;
+    fetch(`/test/state?session=${encodeURIComponent(PREVIEW_SESSION)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        machine_id: MACHINE,
+        state:      snap.state,
+        context:    snap.context,
+        version:    snap.version,
+      }),
+    });
+  }
+
   // ── activation ───────────────────────────────────────────────────────────────
   function activate(version) {
     activeVer = version;
@@ -663,6 +696,7 @@ const TIMELINE_JS: &str = r#"
       : '—';
     updateCount();
     scrollToActive();
+    injectPreview(snap);
   }
 
   function scrollToActive() {
