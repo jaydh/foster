@@ -103,7 +103,8 @@ body {
   transition: background 0.1s;
 }
 .page-item:hover { background: var(--border); color: var(--text); }
-.page-item-active { background: var(--border) !important; color: var(--text) !important; font-weight: 500; }
+.page-item-active,
+.page-item[data-active] { background: var(--border) !important; color: var(--text) !important; font-weight: 500; }
 
 .page-icon { font-size: 14px; }
 
