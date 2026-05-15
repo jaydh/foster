@@ -421,7 +421,7 @@ async fn main() {
         .typed_on("editing", "change_type",  "editing", change_type)
         .template(page("Notion — Block Editor", include_str!("../static/style.css"), html! {
 
-            div[class="notion-app"] {
+            div[class="notion-app", machine="notion"] {
 
                 // ── sidebar ──────────────────────────────────────────────────
                 div[class="notion-sidebar"] {
