@@ -8,7 +8,7 @@ set -euo pipefail
 
 DEMOS=("${@:-counter player kanban aura}")
 if [[ $# -eq 0 ]]; then
-    DEMOS=(counter player kanban aura checkout)
+    DEMOS=(counter player kanban aura checkout plane notion)
 fi
 
 for demo in "${DEMOS[@]}"; do
