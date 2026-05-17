@@ -1,5 +1,7 @@
 pub mod store;
 pub use store::{InMemoryPubSub, InMemoryStore, PubSub, StateStore, StoreError};
+#[cfg(feature = "redis-backend")]
+pub use store::{RedisStore, RedisPubSub};
 
 use axum::{
     body::{Body, Bytes},

@@ -35,6 +35,7 @@ fn main() {
 
     fs::create_dir_all(out_dir).unwrap();
     fs::write(&spec_path, foster_testgen::generate(&machine, base_url)).unwrap();
+    println!("  {}", foster_testgen::summary(&machine));
     println!("wrote  {spec_path}");
 
     fs::write(&sdk_path, foster_testgen::generate_sdk(&machine, base_url)).unwrap();

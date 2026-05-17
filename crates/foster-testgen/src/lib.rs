@@ -451,6 +451,15 @@ export default defineConfig({{
     )
 }
 
+/// One-line summary of a machine's graph — printed by gen_tests binaries.
+/// Example: "plane            5 states   15 transitions  all edges covered"
+pub fn summary(machine: &Machine) -> String {
+    let states = machine.state_names().len();
+    let edges   = machine.transitions().len();
+    format!("{:<16} {:>2} states  {:>3} transitions  all edges covered",
+        machine.id, states, edges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

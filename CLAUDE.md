@@ -20,11 +20,13 @@ foster/
 │   ├── aura/              # CSS animation showcase with fx-class (port 3003)
 │   ├── checkout/          # 7-state checkout flow, showcases graph + history (port 3004)
 │   ├── plane/             # Linear-style issue tracker — 5 states, 15 transitions (port 3005)
-│   └── notion/            # Notion-style block editor — 2 states, 10 transitions (port 3006)
+│   ├── notion/            # Notion-style block editor — 2 states, 10 transitions (port 3006)
+│   ├── form/              # Multi-step conference registration form — 5 states, 11 transitions (port 3007)
+│   └── collab/            # Real-time collab voting poll via Redis pub/sub — 2 states, 3 transitions (port 3008)
 └── scripts/
     ├── build-wasm.sh      # Build foster-client (release); pass --dev for dev overlay
     ├── demo.sh            # Build WASM (dev) + start all demo servers (Ctrl-C stops all)
-    └── gen-tests.sh       # Regenerate Playwright specs for all examples (counter player kanban aura checkout plane notion)
+    └── gen-tests.sh       # Regenerate Playwright specs for all examples (counter player kanban aura checkout plane notion form collab)
 ```
 
 `Cargo.toml` includes native crates only. `crates/foster-client` targets
@@ -246,6 +248,8 @@ All attributes processed client-side by the WASM runtime.
 | `fx-bind-attr` | `fx-bind-attr="href=ctx:url"` | Bind HTML attribute from context or state |
 | `fx-if` | `fx-if="error_msg"` | Show when `context[key]` is truthy; supports comparison object |
 | `fx-animate` | `fx-animate="error:shake:400"` | Add CSS class for N ms when entering a state |
+| `fx-enter` | `fx-enter="open:load_data"` | Fire machine event when entering listed states; `*` fires on any transition |
+| `fx-optimistic` | `fx-optimistic="done"` | Instantly render expected state before server confirms (on `fx-on` buttons) |
 
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
@@ -329,6 +333,13 @@ No pending items — all planned features are implemented. See "Already implemen
 - `fx-animate` — timed CSS class on state enter: `fx-animate="state:class:ms"`, `*` for any state — `crates/foster-client/src/lib.rs`.
 - Session persistence — `resolve_session_id` now persists the session UUID to `localStorage["foster_session"]`; URL `?session=` still takes precedence (Playwright / timeline preview) — `crates/foster-client/src/lib.rs`.
 - `GET /debug/benchmark` — BFS walk of machine graph in-memory; reports full-snapshot vs JSON Patch bytes per transition and overall ratio — `crates/foster-server/src/lib.rs`.
+- `fx-enter` — fire machine event on state entry: `fx-enter="state:event"` space-separated specs; `*` fires on any transition. Max 3 levels of chaining to prevent loops — `crates/foster-client/src/lib.rs`.
+- `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
+- `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
+- `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.
+- `form` example: multi-step conference registration (5 states, 11 transitions) showcasing `fx-if` validation + `fx-optimistic`. Validate self-transitions always succeed and set error fields; advance transitions return `MachineError` when step not valid — port 3007.
+- `collab` example: real-time voting poll via Redis pub/sub — open state votes update all tabs instantly via SSE; poll can be closed (shows ranked results) and reset — port 3008. Requires Redis: `docker compose up -d redis`. `docker-compose.yml` at repo root.
+- `form` and `collab` added to workspace `Cargo.toml`, `scripts/demo.sh`, and `scripts/gen-tests.sh`.
 
 ## Security invariants — do not break
 

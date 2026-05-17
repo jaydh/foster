@@ -6,7 +6,7 @@ set -euo pipefail
 # Steps:
 #   1. cargo check  (fast type check, no codegen)
 #   2. cargo test   (unit tests — foster-core + foster-testgen)
-#   3. gen_tests    (regenerate Playwright specs from machine definitions)
+#   3. gen_tests    (regenerate Playwright specs + print coverage summary)
 #
 # Playwright / browser tests are NOT run here — use `npx playwright test`
 # inside an example directory after starting the server with demo.sh.
@@ -19,20 +19,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 TARGET="${1:-}"
+T0=$SECONDS
 
-echo "▸ cargo check…"
+# ── cargo check ───────────────────────────────────────────────────────────────
+printf "▸ cargo check…  "
 cargo check --workspace 2>&1
+echo "(${SECONDS}s)"
 
-echo "▸ cargo test…"
-cargo test --workspace 2>&1
+# ── cargo test ────────────────────────────────────────────────────────────────
+T1=$SECONDS
+printf "▸ cargo test…   "
+cargo test --workspace --quiet 2>&1
+echo "($((SECONDS - T1))s)"
 
+# ── gen_tests ─────────────────────────────────────────────────────────────────
+T2=$SECONDS
+echo "▸ gen_tests"
 if [[ -n "$TARGET" ]]; then
-    echo "▸ gen_tests  $TARGET"
-    cargo run -q -p "$TARGET" --bin gen_tests
+    cargo run -q -p "$TARGET" --bin gen_tests 2>&1
 else
-    echo "▸ gen_tests  (all)"
-    bash scripts/gen-tests.sh
+    bash scripts/gen-tests.sh 2>&1
 fi
+echo "  ($((SECONDS - T2))s)"
 
 echo ""
-echo "✓ all checks passed"
+echo "✓  all checks passed  (total: $((SECONDS - T0))s)"

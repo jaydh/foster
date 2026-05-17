@@ -85,7 +85,7 @@ async fn bootstrap() {
         // test-inject fires its SSE broadcast before the client is listening,
         // causing the inject to be silently lost.
         attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
-        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone());
+        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
         #[cfg(debug_assertions)]
         mount_overlay(&document, &root, &machine_id, &effective_session);
@@ -172,7 +172,9 @@ fn gen_uuid() -> String {
 
 // ── snapshot application ─────────────────────────────────────────────────────
 
-fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) {
+/// Apply snapshot to the DOM. Returns the previous state (before this update).
+fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> String {
+    let prev = root.get_attribute("data-fx-state").unwrap_or_default();
     root.set_attribute("data-fx-state",   &snap.state).unwrap();
     root.set_attribute("data-fx-version", &snap.version.to_string()).unwrap();
 
@@ -186,18 +188,47 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) {
     apply_fx_animate(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
     apply_fx_for(document, root, &snap.context);
+    prev
 }
 
 /// Only apply if the incoming version is at least as new as what's displayed.
 /// Guards against stale SSE pushes overwriting a more recent interactive transition.
-fn apply_snapshot_if_newer(document: &Document, root: &Element, snap: &Snapshot) {
+/// Returns the previous state if the update was applied, None otherwise.
+fn apply_snapshot_if_newer(document: &Document, root: &Element, snap: &Snapshot) -> Option<String> {
     let current: u64 = root.get_attribute("data-fx-version")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if snap.version >= current {
-        apply_snapshot(document, root, snap);
+        let prev = apply_snapshot(document, root, snap);
         update_debug(document, root, snap);
+        Some(prev)
+    } else {
+        None
     }
+}
+
+// ── fx-enter — fire machine events on state entry ─────────────────────────────
+//
+// `fx-enter="loading:begin_fetch confirmed:celebrate"` fires machine events
+// when the machine enters the listed states.  Use `*` to fire on any transition.
+// Placed on any element inside the machine root.
+
+fn collect_enter_events(root: &Element, prev_state: &str, new_state: &str) -> Vec<String> {
+    if prev_state == new_state { return vec![]; }
+    let mut events = vec![];
+    let Ok(els) = root.query_selector_all("[fx-enter]") else { return events };
+    for i in 0..els.length() {
+        let Ok(el) = els.item(i).unwrap().dyn_into::<Element>() else { continue };
+        let attr = el.get_attribute("fx-enter").unwrap_or_default();
+        for spec in attr.split_whitespace() {
+            if let Some((state, event)) = spec.split_once(':') {
+                if state == new_state || state == "*" {
+                    events.push(event.to_string());
+                }
+            }
+        }
+    }
+    events
 }
 
 // ── attribute processors ─────────────────────────────────────────────────────
@@ -476,7 +507,7 @@ fn apply_fx_fields(root: &Element, item: &Value) {
 
 // ── event delegation ──────────────────────────────────────────────────────────
 
-fn attach_delegating_listener(document: Document, root: Element, machine_id: String, session_id: String) {
+fn attach_delegating_listener(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
     let root_for_listener = root.clone();
     let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
         let root = &root_for_listener;
@@ -491,17 +522,44 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
 
         if event.type_() != dom_event { return; }
 
-        let payload = build_payload(&fx_on_el, root);
-        let mid = machine_id.clone();
-        let sid = session_id.clone();
-        let root_clone = root.clone();
-        let doc_clone = document.clone();
+        let payload         = build_payload(&fx_on_el, root);
+        let optimistic_state = fx_on_el.get_attribute("fx-optimistic");
+        let mid             = machine_id.clone();
+        let sid             = session_id.clone();
+        let ck              = cache_key.clone();
+        let root_clone      = root.clone();
+        let doc_clone       = document.clone();
 
         spawn_local(async move {
+            // fx-optimistic: paint expected state immediately before the round-trip.
+            if let Some(ref opt) = optimistic_state {
+                let fake = Snapshot {
+                    machine_id: mid.clone(),
+                    state:      opt.clone(),
+                    version:    0,          // real response will overwrite
+                    last_event: None,
+                    context:    load_context(&ck),
+                };
+                apply_snapshot(&doc_clone, &root_clone, &fake);
+            }
+
             match send_transition(&mid, &machine_event, payload, &sid).await {
                 Ok(snap) => {
-                    apply_snapshot(&doc_clone, &root_clone, &snap);
+                    let prev = apply_snapshot(&doc_clone, &root_clone, &snap);
                     update_debug(&doc_clone, &root_clone, &snap);
+                    // fx-enter: fire follow-up events triggered by state entry.
+                    for ev in collect_enter_events(&root_clone, &prev, &snap.state) {
+                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid).await {
+                            let prev2 = apply_snapshot(&doc_clone, &root_clone, &s2);
+                            update_debug(&doc_clone, &root_clone, &s2);
+                            for ev2 in collect_enter_events(&root_clone, &prev2, &s2.state) {
+                                if let Ok(s3) = send_transition(&mid, &ev2, serde_json::json!({}), &sid).await {
+                                    apply_snapshot(&doc_clone, &root_clone, &s3);
+                                    update_debug(&doc_clone, &root_clone, &s3);
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(e) => web_sys::console::error_1(&e),
             }
@@ -527,27 +585,41 @@ fn attach_sse_listener(document: Document, root: Element, machine_id: String, se
     let Ok(es) = EventSource::new(&url) else { return };
 
     // "snapshot" — full state; first event on each SSE connection (or reconnect).
-    // Always update the context cache so subsequent patches have a valid base,
-    // even if the DOM version check skips the render.
     {
-        let document = document.clone();
-        let root = root.clone();
+        let document  = document.clone();
+        let root      = root.clone();
         let cache_key = cache_key.clone();
+        let mid       = machine_id.clone();
+        let sid       = session_id.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             let data = match e.data().as_string() { Some(s) => s, None => return };
             let snap: Snapshot = match serde_json::from_str(&data) { Ok(s) => s, Err(_) => return };
             store_context(&cache_key, snap.context.clone());
-            apply_snapshot_if_newer(&document, &root, &snap);
+            if let Some(prev) = apply_snapshot_if_newer(&document, &root, &snap) {
+                let root2 = root.clone();
+                let doc2  = document.clone();
+                let mid2  = mid.clone();
+                let sid2  = sid.clone();
+                let new_state = snap.state.clone();
+                spawn_local(async move {
+                    for ev in collect_enter_events(&root2, &prev, &new_state) {
+                        if let Ok(s2) = send_transition(&mid2, &ev, serde_json::json!({}), &sid2).await {
+                            apply_snapshot(&doc2, &root2, &s2);
+                            update_debug(&doc2, &root2, &s2);
+                        }
+                    }
+                });
+            }
         });
         es.add_event_listener_with_callback("snapshot", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
 
     // "patch" — RFC 6902 JSON Patch of the context field only.
-    // Always apply the patch to the cache (keeps the diff chain intact even when
-    // the DOM is already at a newer version from a direct transition response).
     {
         let cache_key = cache_key.clone();
+        let mid       = machine_id.clone();
+        let sid       = session_id.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
             let data = match e.data().as_string() { Some(s) => s, None => return };
             let pe: ContextPatch = match serde_json::from_str(&data) { Ok(p) => p, Err(_) => return };
@@ -561,7 +633,21 @@ fn attach_sse_listener(document: Document, root: Element, machine_id: String, se
                 last_event: pe.last_event,
                 context: ctx,
             };
-            apply_snapshot_if_newer(&document, &root, &snap);
+            if let Some(prev) = apply_snapshot_if_newer(&document, &root, &snap) {
+                let root2 = root.clone();
+                let doc2  = document.clone();
+                let mid2  = mid.clone();
+                let sid2  = sid.clone();
+                let new_state = snap.state.clone();
+                spawn_local(async move {
+                    for ev in collect_enter_events(&root2, &prev, &new_state) {
+                        if let Ok(s2) = send_transition(&mid2, &ev, serde_json::json!({}), &sid2).await {
+                            apply_snapshot(&doc2, &root2, &s2);
+                            update_debug(&doc2, &root2, &s2);
+                        }
+                    }
+                });
+            }
         });
         es.add_event_listener_with_callback("patch", cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
