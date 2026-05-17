@@ -125,12 +125,16 @@ fn split_instance(raw: &str) -> (String, String) {
 
 // ── session ID ────────────────────────────────────────────────────────────────
 //
-// Reads `?session=<id>` from the URL; generates a random ID if absent.
-// The session ID is stable for the lifetime of the page and is stamped onto
-// `[fx-machine]` as `data-fx-session` so Playwright can pick it up and pass it
-// to `POST /test/state?session=<id>` without a page.reload().
+// Resolution order:
+//   1. `?session=<id>` URL query param (Playwright / timeline preview pass this)
+//   2. `localStorage["foster_session"]` — survives page reloads within the origin
+//   3. Freshly generated UUID, persisted to localStorage for future loads
+//
+// localStorage is scoped per origin (protocol + host + port), so localhost:3000
+// and localhost:3001 maintain independent sessions automatically.
 
 fn resolve_session_id(window: &web_sys::Window) -> String {
+    // 1. URL query param takes precedence (Playwright / timeline preview iframes).
     if let Ok(search) = window.location().search() {
         for pair in search.trim_start_matches('?').split('&') {
             let mut parts = pair.splitn(2, '=');
@@ -143,7 +147,22 @@ fn resolve_session_id(window: &web_sys::Window) -> String {
             }
         }
     }
-    // Generate a 128-bit random ID from Math.random (good enough for tab isolation).
+    // 2 & 3. localStorage persistence.
+    const LS_KEY: &str = "foster_session";
+    if let Ok(Some(storage)) = window.local_storage() {
+        if let Ok(Some(existing)) = storage.get_item(LS_KEY) {
+            if !existing.is_empty() {
+                return existing;
+            }
+        }
+        let id = gen_uuid();
+        let _ = storage.set_item(LS_KEY, &id);
+        return id;
+    }
+    gen_uuid()
+}
+
+fn gen_uuid() -> String {
     let a = (js_sys::Math::random() * u32::MAX as f64) as u32;
     let b = (js_sys::Math::random() * u32::MAX as f64) as u32;
     let c = (js_sys::Math::random() * u32::MAX as f64) as u32;
@@ -158,11 +177,13 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) {
     root.set_attribute("data-fx-version", &snap.version.to_string()).unwrap();
 
     apply_fx_show(root, &snap.state);
+    apply_fx_if(root, &snap.context);
     apply_fx_text(root, &snap.context);
     apply_fx_disable(root, &snap.state);
     apply_fx_state_label(root, &snap.state);
     apply_fx_value(root, &snap.context);
     apply_fx_class(root, &snap.state);
+    apply_fx_animate(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
     apply_fx_for(document, root, &snap.context);
 }
@@ -288,6 +309,92 @@ fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
                     let _ = el.remove_attribute(attr);
                 }
             }
+        }
+    }
+}
+
+/// `fx-if="field"` — show element when `ctx[field]` is truthy.
+/// `fx-if='{"field":"f","op":"eq|neq|gt|lt|gte|lte","value":...}'` — comparison.
+///
+/// Truthy: non-null, non-false, non-zero, non-empty string/array/object.
+fn apply_fx_if(root: &Element, ctx: &Value) {
+    let els = root.query_selector_all("[fx-if]").unwrap();
+    for i in 0..els.length() {
+        let el: HtmlElement = els.item(i).unwrap().dyn_into().unwrap();
+        let attr = el.get_attribute("fx-if").unwrap_or_default();
+        let visible = eval_condition(&attr, ctx);
+        el.style()
+            .set_property("display", if visible { "block" } else { "none" })
+            .unwrap();
+    }
+}
+
+fn eval_condition(attr: &str, ctx: &Value) -> bool {
+    if let Ok(cond) = serde_json::from_str::<Value>(attr) {
+        if let (Some(field), Some(op)) = (cond["field"].as_str(), cond["op"].as_str()) {
+            let lhs = &ctx[field];
+            let rhs = &cond["value"];
+            return match op {
+                "eq"  => lhs == rhs,
+                "neq" => lhs != rhs,
+                "gt"  => cmp_nums(lhs, rhs) > 0,
+                "lt"  => cmp_nums(lhs, rhs) < 0,
+                "gte" => cmp_nums(lhs, rhs) >= 0,
+                "lte" => cmp_nums(lhs, rhs) <= 0,
+                _ => false,
+            };
+        }
+    }
+    is_truthy(&ctx[attr])
+}
+
+fn is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Null        => false,
+        Value::Bool(b)     => *b,
+        Value::Number(n)   => n.as_f64().unwrap_or(0.0) != 0.0,
+        Value::String(s)   => !s.is_empty(),
+        Value::Array(a)    => !a.is_empty(),
+        Value::Object(o)   => !o.is_empty(),
+    }
+}
+
+fn cmp_nums(a: &Value, b: &Value) -> i32 {
+    let fa = a.as_f64().unwrap_or(0.0);
+    let fb = b.as_f64().unwrap_or(0.0);
+    fa.partial_cmp(&fb).map(|o| o as i32).unwrap_or(0)
+}
+
+/// `fx-animate="state:css-class:duration_ms"` — add a CSS class for a fixed
+/// duration whenever the machine enters the given state.  Multiple space-separated
+/// specs are supported.  Use `*` as the state to animate on every transition.
+///
+/// Example: `fx-animate="error:shake:400 confirmed:pop-in:600"`
+fn apply_fx_animate(root: &Element, state: &str) {
+    let window = match web_sys::window() { Some(w) => w, None => return };
+    let els = root.query_selector_all("[fx-animate]").unwrap();
+    for i in 0..els.length() {
+        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+        let attr = el.get_attribute("fx-animate").unwrap_or_default();
+        for spec in attr.split_whitespace() {
+            let parts: Vec<&str> = spec.splitn(3, ':').collect();
+            let (target, class, ms) = match parts.len() {
+                3 => (parts[0], parts[1], parts[2].parse::<i32>().unwrap_or(300)),
+                2 => (parts[0], parts[1], 300i32),
+                _ => continue,
+            };
+            if target != "*" && target != state { continue; }
+            let cl = el.class_list();
+            let _ = cl.add_1(class);
+            let class_owned = class.to_string();
+            let el_clone = el.clone();
+            let cb = Closure::once(move || {
+                let _ = el_clone.class_list().remove_1(&class_owned);
+            });
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(), ms,
+            );
+            cb.forget();
         }
     }
 }

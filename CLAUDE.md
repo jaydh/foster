@@ -201,6 +201,7 @@ Inlined — no external dependencies, compiles to WASM.
 | POST | `/debug/rewind?machine=<id>&session=<sid>&version=N` | JSON | Restore a historical snapshot and broadcast via SSE (debug only) |
 | GET | `/debug/graph?machine=<id>&session=<sid>` | HTML | Self-contained state graph visualiser — SVG nodes/edges + live SSE state highlight (debug only) |
 | GET | `/debug/timeline?machine=<id>&session=<sid>` | HTML | History replay timeline — scrub through snapshots, auto-play, live tail (debug only) |
+| GET | `/debug/benchmark?machine=<id>` | JSON | Walk machine graph in-memory; report full-snapshot vs JSON Patch sizes per transition (debug only) |
 
 `session` defaults to `"default"` if omitted.
 
@@ -243,12 +244,25 @@ All attributes processed client-side by the WASM runtime.
 | `fx-payload` | `fx-payload='{"col":"done"}'` | Static JSON merged into transition payload |
 | `fx-class` | `fx-class="calm:is-active"` | Add CSS class when in named state |
 | `fx-bind-attr` | `fx-bind-attr="href=ctx:url"` | Bind HTML attribute from context or state |
+| `fx-if` | `fx-if="error_msg"` | Show when `context[key]` is truthy; supports comparison object |
+| `fx-animate` | `fx-animate="error:shake:400"` | Add CSS class for N ms when entering a state |
 
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
 - `attr=state:name` — set `attr=""` when in that state (use for `disabled`, `hidden`, `aria-current`)
 
+**`fx-if` format:**
+- `fx-if="field"` — show when `context[field]` is truthy (non-null, non-false, non-zero, non-empty)
+- `fx-if='{"field":"count","op":"gt","value":0}'` — comparison; ops: `eq neq gt lt gte lte`
+
+**`fx-animate` format:** space-separated `state:class:duration_ms` specs.
+- `fx-animate="confirmed:pop-in:600"` — adds `pop-in` class for 600 ms when entering `confirmed`
+- `fx-animate="*:flash:200"` — fires on every state transition
+- Multiple: `fx-animate="error:shake:400 confirmed:pop-in:600"`
+
 CSS convention: `[fx-show] { display: none; }` hides showable elements before WASM loads.
+
+**Session persistence:** The WASM client stores the session ID in `localStorage["foster_session"]` so state survives page reloads. Resolution order: URL `?session=` param → localStorage → new UUID (persisted). Each origin (host + port) has an independent localStorage scope.
 
 ## Playwright integration
 
@@ -311,6 +325,10 @@ No pending items — all planned features are implemented. See "Already implemen
 - Generic `AppState<S, P>` + `router_with()`: generic over `S: StateStore + Clone + 'static` and `P: PubSub + Clone + 'static` with default type params. HTTP integration tests in `crates/foster-server/src/lib.rs`. `RedisStore` + `RedisPubSub` behind `--features redis-backend` in `crates/foster-server/src/store.rs`.
 - History replay timeline: `GET /debug/timeline?machine=<id>&session=<sid>` — self-contained HTML page with horizontal scrollable snapshot rail, ◀ / ▶ step controls, auto-play with configurable speed, live SSE tail, and split bottom panel: **live UI preview iframe** (left, shows the actual app UI at the selected snapshot via isolated `{session}__tl` preview session + `POST /test/state` injection) and context JSON (right, 320 px). Overlay "history" link updated to point here. Gated by `test_mode` — `crates/foster-server/src/lib.rs`.
 - `plane` and `notion` added to `gen-tests.sh` and `check.sh` gen_tests loop so their Playwright specs are regenerated on every `./scripts/check.sh` run.
+- `fx-if` — context-conditional visibility: `fx-if="field"` (truthy check) or `fx-if='{"field":"f","op":"eq|neq|gt|lt|gte|lte","value":...}'` — `crates/foster-client/src/lib.rs`.
+- `fx-animate` — timed CSS class on state enter: `fx-animate="state:class:ms"`, `*` for any state — `crates/foster-client/src/lib.rs`.
+- Session persistence — `resolve_session_id` now persists the session UUID to `localStorage["foster_session"]`; URL `?session=` still takes precedence (Playwright / timeline preview) — `crates/foster-client/src/lib.rs`.
+- `GET /debug/benchmark` — BFS walk of machine graph in-memory; reports full-snapshot vs JSON Patch bytes per transition and overall ratio — `crates/foster-server/src/lib.rs`.
 
 ## Security invariants — do not break
 

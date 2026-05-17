@@ -125,7 +125,8 @@ where
         .route("/debug/history", get(get_debug_history::<S, P>))
         .route("/debug/rewind", post(post_debug_rewind::<S, P>))
         .route("/debug/graph", get(get_debug_graph::<S, P>))
-        .route("/debug/timeline", get(get_debug_timeline::<S, P>))
+        .route("/debug/timeline",   get(get_debug_timeline::<S, P>))
+        .route("/debug/benchmark",  get(get_debug_benchmark::<S, P>))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(app);
 
@@ -499,6 +500,79 @@ async fn get_debug_timeline<S: StateStore + Clone, P: PubSub + Clone>(
             .into_response();
     };
     Html(build_timeline_html(&machine, q.session_id())).into_response()
+}
+
+/// `GET /debug/benchmark?machine=<id>`
+///
+/// Walks the machine graph in-memory from the initial state, firing every
+/// reachable transition in BFS order.  For each step records the full-snapshot
+/// context size vs the RFC 6902 JSON Patch size relative to the previous
+/// context, showing exactly how much differential SSE saves.  Returns JSON.
+/// Gated by `test_mode`.
+async fn get_debug_benchmark<S: StateStore + Clone, P: PubSub + Clone>(
+    Query(q): Query<MachineQuery>,
+    State(app): State<AppState<S, P>>,
+) -> Response {
+    if !app.test_mode {
+        return (StatusCode::FORBIDDEN,
+            "debug endpoints are disabled; set FOSTER_TEST_MODE=1").into_response();
+    }
+    let Some(machine) = app.machines.get(&q.machine).cloned() else {
+        return (StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine))
+            .into_response();
+    };
+
+    // Walk the machine graph in-memory: BFS over (state → events).
+    // Each step fires the event on a fresh instance restored to that state's
+    // context, so we get realistic context diffs without touching any real session.
+    let inst = MachineInstance::new(Arc::clone(&machine));
+    let initial_snap = inst.snapshot();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut prev_ctx = initial_snap.context.clone();
+    let mut queue: std::collections::VecDeque<Snapshot> = std::collections::VecDeque::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    queue.push_back(initial_snap);
+
+    while let Some(snap) = queue.pop_front() {
+        if !visited.insert(snap.state.clone()) { continue; }
+        for (from, event, _to) in machine.transitions() {
+            if from != snap.state { continue; }
+            let mut step = MachineInstance::new(Arc::clone(&machine));
+            if step.restore(snap.clone()).is_err() { continue; }
+            let Ok(new_snap) = step.send(event, serde_json::Value::Null) else { continue };
+
+            let full_bytes  = serde_json::to_vec(&new_snap.context).unwrap_or_default().len();
+            let patch       = json_patch::diff(&prev_ctx, &new_snap.context);
+            let patch_bytes = serde_json::to_vec(&patch).unwrap_or_default().len();
+            let patch_pct   = if full_bytes > 0 { patch_bytes * 100 / full_bytes } else { 100 };
+
+            rows.push(serde_json::json!({
+                "from":        from,
+                "event":       event,
+                "to":          new_snap.state,
+                "full_bytes":  full_bytes,
+                "patch_bytes": patch_bytes,
+                "patch_pct":   patch_pct,
+            }));
+
+            prev_ctx = new_snap.context.clone();
+            queue.push_back(new_snap);
+        }
+    }
+
+    let total_full:  usize = rows.iter().filter_map(|r| r["full_bytes"].as_u64()).map(|n| n as usize).sum();
+    let total_patch: usize = rows.iter().filter_map(|r| r["patch_bytes"].as_u64()).map(|n| n as usize).sum();
+    let overall_pct = if total_full > 0 { total_patch * 100 / total_full } else { 100 };
+
+    axum::Json(serde_json::json!({
+        "machine":            machine.id,
+        "transitions_walked": rows.len(),
+        "total_full_bytes":   total_full,
+        "total_patch_bytes":  total_patch,
+        "overall_patch_pct":  overall_pct,
+        "note": "patch_pct = patch size as % of full snapshot (lower = more SSE savings)",
+        "steps": rows,
+    })).into_response()
 }
 
 fn build_timeline_html(machine: &Machine, session: &str) -> String {
