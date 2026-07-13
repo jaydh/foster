@@ -57,8 +57,19 @@
     }
     .logo { font-weight: 700; font-size: 1.1rem; color: var(--text); }
     .nav-links { display: flex; margin-left: auto; align-items: center; gap: 0.25rem; }
-    .nav-links a { padding: 0.5rem 1rem; color: var(--text); }
+    .nav-links a { padding: 0.5rem 1rem; color: var(--text); position: relative; }
     .nav-links a:hover { color: var(--accent); }
+    .nav-links a.active {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .nav-links a.active::after {
+      content: "";
+      position: absolute;
+      left: 1rem; right: 1rem; bottom: 0;
+      height: 2px;
+      background: var(--accent);
+    }
 
     button.icon-btn {
       background: none;
@@ -86,7 +97,7 @@
     .contact-menu a { display: block; padding: 0.75rem 1rem; color: var(--text); }
     .contact-menu a:hover { background: var(--border); text-decoration: none; }
 
-    main { max-width: 860px; margin: 0 auto; padding: 4rem 2rem; }
+    main { max-width: 860px; margin: 0 auto; padding: 4rem 2rem; min-height: 80vh; }
     h1 { font-size: 1.75rem; margin-bottom: 1.5rem; }
     p { color: var(--text-light); margin-bottom: 1rem; }
 
@@ -129,8 +140,9 @@
 <div fx-machine="theme" class="page" fx-class="dark:theme-dark">
   <nav>
     <a href="#about" class="logo">Jay Dan Howard</a>
-    <div class="nav-links">
-      <a href="#about">About</a>
+    <div class="nav-links" id="scroll-spy-links">
+      <a href="#about" data-spy="about">About</a>
+      <a href="#life" data-spy="life">Game of Life</a>
 
       <button class="icon-btn" fx-on="click->toggle_theme" aria-label="Toggle dark mode">
         <span fx-show="light">&#9789;</span>
@@ -163,6 +175,14 @@
       (<code>closed</code>/<code>open</code>) is nested inside it for the
       dropdown alone. Every click here is a full HTTP round trip to the
       server and back before the DOM updates.
+    </p>
+    <p>
+      The highlighted nav link above, though, is deliberately <em>not</em> a
+      machine — scroll position fires many times a second, and a state
+      machine that means an HTTP round trip per transition. Continuous,
+      high-frequency UI state like this belongs in plain JS
+      (<code>static/scrollspy.js</code>, an <code>IntersectionObserver</code>
+      toggling a class directly) sitting next to Foster, not modeled inside it.
     </p>
   </main>
 
@@ -205,8 +225,10 @@
 <script type="module">
   import init from '/pkg/foster_client.js';
   import { initLife } from '/life.js';
+  import { initScrollSpy } from '/scrollspy.js';
   init();
   initLife();
+  initScrollSpy();
 </script>
 </body>
 </html>
