@@ -216,9 +216,7 @@ fn apply_snapshot_if_newer(document: &Document, root: &Element, snap: &Snapshot)
 fn collect_enter_events(root: &Element, prev_state: &str, new_state: &str) -> Vec<String> {
     if prev_state == new_state { return vec![]; }
     let mut events = vec![];
-    let Ok(els) = root.query_selector_all("[fx-enter]") else { return events };
-    for i in 0..els.length() {
-        let Ok(el) = els.item(i).unwrap().dyn_into::<Element>() else { continue };
+    for el in self_and_descendants(root, "[fx-enter]") {
         let attr = el.get_attribute("fx-enter").unwrap_or_default();
         for spec in attr.split_whitespace() {
             if let Some((state, event)) = spec.split_once(':') {
@@ -233,10 +231,50 @@ fn collect_enter_events(root: &Element, prev_state: &str, new_state: &str) -> Ve
 
 // ── attribute processors ─────────────────────────────────────────────────────
 
+/// `Element::query_selector_all` only matches descendants, never `root` itself —
+/// so any `fx-*` attribute placed directly on the `[fx-machine]` root (a common
+/// thing to want, e.g. a whole-page theme class) was silently ignored. This
+/// collects matches from `root` and its descendants together.
+///
+/// Also excludes descendants that actually belong to a more deeply-nested
+/// `[fx-machine]` (e.g. a page-wide "theme" machine wrapping a "nav" machine
+/// for a dropdown) — those elements are owned by the nested machine's own
+/// snapshot application, not this one, even though they're structurally
+/// inside `root`'s subtree.
+fn self_and_descendants(root: &Element, selector: &str) -> Vec<Element> {
+    let mut out = Vec::new();
+    if root.matches(selector).unwrap_or(false) {
+        out.push(root.clone());
+    }
+    if let Ok(list) = root.query_selector_all(selector) {
+        for i in 0..list.length() {
+            if let Some(Ok(el)) = list.item(i).map(|n| n.dyn_into::<Element>()) {
+                if owning_machine_root(&el).as_ref() == Some(root) {
+                    out.push(el);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Nearest `[fx-machine]` ancestor-or-self of `el`. See the note on
+/// `self_and_descendants` and the delegated click listener for why this
+/// matters: without it, an outer machine's snapshot application (or click
+/// delegation) reaches into a nested machine's own elements.
+fn owning_machine_root(el: &Element) -> Option<Element> {
+    let mut cur: Option<Element> = Some(el.clone());
+    while let Some(c) = cur {
+        if c.has_attribute("fx-machine") { return Some(c); }
+        cur = c.parent_element();
+    }
+    None
+}
+
 fn apply_fx_show(root: &Element, state: &str) {
-    let els = root.query_selector_all("[fx-show]").unwrap();
-    for i in 0..els.length() {
-        let el: HtmlElement = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-show]");
+    for el in els {
+        let el: HtmlElement = el.dyn_into().unwrap();
         let attr = el.get_attribute("fx-show").unwrap_or_default();
         let visible = attr.split(',').any(|s| s.trim() == state);
         el.style()
@@ -246,9 +284,8 @@ fn apply_fx_show(root: &Element, state: &str) {
 }
 
 fn apply_fx_text(root: &Element, ctx: &Value) {
-    let els = root.query_selector_all("[fx-text]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-text]");
+    for el in els {
         let key = el.get_attribute("fx-text").unwrap_or_default();
         if let Some(val) = ctx.get(&key) {
             el.set_text_content(Some(&val_to_string(val)));
@@ -257,9 +294,8 @@ fn apply_fx_text(root: &Element, ctx: &Value) {
 }
 
 fn apply_fx_disable(root: &Element, state: &str) {
-    let els = root.query_selector_all("[fx-disable]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-disable]");
+    for el in els {
         let attr = el.get_attribute("fx-disable").unwrap_or_default();
         if attr.split(',').any(|s| s.trim() == state) {
             el.set_attribute("disabled", "").unwrap();
@@ -270,17 +306,15 @@ fn apply_fx_disable(root: &Element, state: &str) {
 }
 
 fn apply_fx_state_label(root: &Element, state: &str) {
-    let els = root.query_selector_all("[fx-state-label]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-state-label]");
+    for el in els {
         el.set_text_content(Some(state));
     }
 }
 
 fn apply_fx_value(root: &Element, ctx: &Value) {
-    let els = root.query_selector_all("[fx-value]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-value]");
+    for el in els {
         let key = el.get_attribute("fx-value").unwrap_or_default();
         if let Some(val) = ctx.get(&key) {
             let text = val_to_string(val);
@@ -297,9 +331,8 @@ fn apply_fx_value(root: &Element, ctx: &Value) {
 
 /// `fx-class="calm:gentle energized:vivid"` — toggle CSS classes based on state.
 fn apply_fx_class(root: &Element, state: &str) {
-    let els = root.query_selector_all("[fx-class]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-class]");
+    for el in els {
         let attr = el.get_attribute("fx-class").unwrap_or_default();
         let class_list = el.class_list();
         for pair in attr.split_whitespace() {
@@ -321,9 +354,8 @@ fn apply_fx_class(root: &Element, state: &str) {
 ///   `attr=ctx:key`        — set `attr` from `context[key]`
 ///   `attr=state:statename` — set `attr=""` when in that state, remove otherwise
 fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
-    let els = root.query_selector_all("[fx-bind-attr]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-bind-attr]");
+    for el in els {
         let attr_val = el.get_attribute("fx-bind-attr").unwrap_or_default();
         for pair in attr_val.split_whitespace() {
             let mut parts = pair.splitn(2, '=');
@@ -349,9 +381,9 @@ fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
 ///
 /// Truthy: non-null, non-false, non-zero, non-empty string/array/object.
 fn apply_fx_if(root: &Element, ctx: &Value) {
-    let els = root.query_selector_all("[fx-if]").unwrap();
-    for i in 0..els.length() {
-        let el: HtmlElement = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-if]");
+    for el in els {
+        let el: HtmlElement = el.dyn_into().unwrap();
         let attr = el.get_attribute("fx-if").unwrap_or_default();
         let visible = eval_condition(&attr, ctx);
         el.style()
@@ -403,9 +435,8 @@ fn cmp_nums(a: &Value, b: &Value) -> i32 {
 /// Example: `fx-animate="error:shake:400 confirmed:pop-in:600"`
 fn apply_fx_animate(root: &Element, state: &str) {
     let window = match web_sys::window() { Some(w) => w, None => return };
-    let els = root.query_selector_all("[fx-animate]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-animate]");
+    for el in els {
         let attr = el.get_attribute("fx-animate").unwrap_or_default();
         for spec in attr.split_whitespace() {
             let parts: Vec<&str> = spec.splitn(3, ':').collect();
@@ -431,9 +462,8 @@ fn apply_fx_animate(root: &Element, state: &str) {
 }
 
 fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
-    let containers = root.query_selector_all("[fx-for]").unwrap();
-    for i in 0..containers.length() {
-        let container: Element = containers.item(i).unwrap().dyn_into().unwrap();
+    let containers = self_and_descendants(root, "[fx-for]");
+    for container in containers {
         let key = container.get_attribute("fx-for").unwrap_or_default();
 
         let Some(full_array) = ctx.get(&key).and_then(|v| v.as_array()) else {
@@ -479,9 +509,8 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
 }
 
 fn save_for_templates(root: &Element) {
-    let containers = root.query_selector_all("[fx-for]").unwrap();
-    for i in 0..containers.length() {
-        let container: Element = containers.item(i).unwrap().dyn_into().unwrap();
+    let containers = self_and_descendants(root, "[fx-for]");
+    for container in containers {
         if container.get_attribute("data-fx-template-html").is_none() {
             let html = container.inner_html();
             container.set_attribute("data-fx-template-html", &html).unwrap();
@@ -515,6 +544,14 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
         let Ok(target_el): Result<Element, _> = target.dyn_into() else { return };
 
         let Some(fx_on_el) = find_fx_on_ancestor(&target_el, root) else { return };
+
+        // If `fx_on_el` actually belongs to a more deeply-nested machine (its
+        // nearest `[fx-machine]` ancestor isn't `root`), that machine's own
+        // listener owns this click — bail out instead of firing it here too.
+        match owning_machine_root(&fx_on_el) {
+            Some(owner) if owner == *root => {}
+            _ => return,
+        }
 
         let fx_on = fx_on_el.get_attribute("fx-on").unwrap_or_default();
         let mut parts = fx_on.splitn(2, "->").map(|s| s.trim().to_string());
@@ -670,9 +707,8 @@ fn find_fx_on_ancestor(el: &Element, root: &Element) -> Option<Element> {
 fn build_payload(fx_on_el: &Element, root: &Element) -> Value {
     let mut map = serde_json::Map::new();
 
-    let els = root.query_selector_all("[fx-collect]").unwrap();
-    for i in 0..els.length() {
-        let el: Element = els.item(i).unwrap().dyn_into().unwrap();
+    let els = self_and_descendants(root, "[fx-collect]");
+    for el in els {
         let key = el.get_attribute("fx-collect").unwrap_or_default();
         if let Some(val) = read_input_value(&el) {
             map.insert(key, Value::String(val));

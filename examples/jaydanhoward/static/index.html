@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jay Dan Howard · Foster port</title>
+  <link rel="icon" href="data:,">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #f7f7f8;
+      --surface: #ffffff;
+      --border: #e5e5e8;
+      --text: #1e1e1e;
+      --text-light: #555555;
+      --accent: #3b82f6;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+
+    .page {
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    [fx-show] { display: none; }
+
+    /* ── theme ─────────────────────────────────────────────── */
+    .theme-dark {
+      --bg: #0b0e14;
+      --surface: #0f1420;
+      --border: #1f2637;
+      --text: #e5e7eb;
+      --text-light: #9aa3b2;
+      --accent: #60a5fa;
+    }
+
+    /* ── nav ───────────────────────────────────────────────── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      display: flex;
+      align-items: center;
+      gap: 2rem;
+      padding: 1.25rem 2rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .logo { font-weight: 700; font-size: 1.1rem; color: var(--text); }
+    .nav-links { display: flex; margin-left: auto; align-items: center; gap: 0.25rem; }
+    .nav-links a { padding: 0.5rem 1rem; color: var(--text); }
+    .nav-links a:hover { color: var(--accent); }
+
+    button.icon-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 0.5rem;
+      color: var(--text);
+      font-size: 1.1rem;
+    }
+    button.icon-btn:hover { color: var(--accent); }
+
+    .contact-wrap { position: relative; }
+    .contact-menu {
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 0.5rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      min-width: 160px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    }
+    .contact-menu a { display: block; padding: 0.75rem 1rem; color: var(--text); }
+    .contact-menu a:hover { background: var(--border); text-decoration: none; }
+
+    main { max-width: 860px; margin: 0 auto; padding: 4rem 2rem; }
+    h1 { font-size: 1.75rem; margin-bottom: 1.5rem; }
+    p { color: var(--text-light); margin-bottom: 1rem; }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem;
+      text-align: center;
+      color: var(--text-light);
+      font-size: 0.85rem;
+    }
+
+    details { max-width: 860px; margin: 0 auto 3rem; padding: 0 2rem; }
+    pre { font-size: 0.75rem; overflow-x: auto; }
+  </style>
+</head>
+<body>
+
+<div fx-machine="theme" class="page" fx-class="dark:theme-dark">
+  <nav>
+    <a href="#about" class="logo">Jay Dan Howard</a>
+    <div class="nav-links">
+      <a href="#about">About</a>
+
+      <button class="icon-btn" fx-on="click->toggle_theme" aria-label="Toggle dark mode">
+        <span fx-show="light">&#9789;</span>
+        <span fx-show="dark">&#9788;</span>
+      </button>
+
+      <div fx-machine="nav" class="contact-wrap">
+        <button class="icon-btn" fx-on="click->toggle_contact">Contact &#9662;</button>
+        <div class="contact-menu" fx-show="open">
+          <a href="https://github.com/jaydh" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://www.linkedin.com/in/jaydanhoward/" target="_blank" rel="noreferrer">LinkedIn</a>
+          <a href="mailto:hello@jaydanhoward.com">Email</a>
+        </div>
+      </div><!-- /fx-machine=nav -->
+    </div>
+  </nav>
+
+  <main id="about">
+    <h1>About</h1>
+    <p>
+      This page is a proof-of-concept port of jaydanhoward.com's nav shell onto
+      <a href="https://github.com/jaydh/foster" target="_blank" rel="noreferrer">Foster</a> —
+      a Rust web UI framework where the server owns all state and a thin WASM
+      client just patches the DOM from <code>fx-*</code> attributes.
+    </p>
+    <p>
+      Dark mode and the contact dropdown are two independent machines sharing
+      this page — <code>theme</code> (<code>light</code>/<code>dark</code>)
+      wraps everything so its class applies site-wide, and <code>nav</code>
+      (<code>closed</code>/<code>open</code>) is nested inside it for the
+      dropdown alone. Every click here is a full HTTP round trip to the
+      server and back before the DOM updates.
+    </p>
+  </main>
+
+  <footer>
+    Ported from <a href="https://jaydanhoward.com" target="_blank" rel="noreferrer">jaydanhoward.com</a>
+  </footer>
+</div><!-- /fx-machine=theme -->
+
+<details>
+  <summary>snapshot</summary>
+  <pre id="debug-snapshot">{}</pre>
+</details>
+
+<script type="module">
+  import init from '/pkg/foster_client.js';
+  init();
+</script>
+</body>
+</html>

@@ -78,20 +78,26 @@ where
     S: StateStore + Clone + 'static,
     P: PubSub + Clone + 'static,
 {
-    // Validate all templates at startup — unknown fx-show states or fx-on events panic immediately
-    // rather than silently misbehaving at runtime.
-    for (id, machine) in &machines {
-        if let Err(errors) = machine.validate_template() {
-            panic!(
-                "Machine '{}' template validation failed:\n{}",
-                id,
-                errors.join("\n")
-            );
+    // Collect template HTML and machine metadata before machines are moved into AppState.
+    // Only one machine needs `.template(...)` set — the whole page is shared, and each
+    // machine below validates only its own `[fx-machine="{id}"]` subtree(s) within it.
+    let index_html = machines.values().find_map(|m| m.template.clone());
+
+    // Validate every machine's own subtree(s) of the shared page — unknown fx-show
+    // states or fx-on events panic immediately rather than silently misbehaving at
+    // runtime. Scoped per-machine so multiple distinct machines can share one page
+    // without each one's vocabulary being checked against the others' markup.
+    if let Some(html) = &index_html {
+        for (id, machine) in &machines {
+            if let Err(errors) = machine.validate_in(html) {
+                panic!(
+                    "Machine '{}' template validation failed:\n{}",
+                    id,
+                    errors.join("\n")
+                );
+            }
         }
     }
-
-    // Collect template HTML and machine metadata before machines are moved into AppState.
-    let index_html = machines.values().find_map(|m| m.template.clone());
 
     let test_mode = cfg!(debug_assertions)
         || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);

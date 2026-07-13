@@ -13,6 +13,7 @@ members = [
     "examples/notion",
     "examples/form",
     "examples/collab",
+    "examples/jaydanhoward",
 ]
 # foster-client is wasm-only — build it separately with wasm-pack
 exclude = ["crates/foster-client"]

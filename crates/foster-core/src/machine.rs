@@ -71,12 +71,22 @@ impl Machine {
     ///
     /// Called automatically by `foster_server::router` at startup — a misconfigured template
     /// panics the server immediately rather than silently misbehaving at runtime.
+    ///
+    /// Only validates within this machine's own `[fx-machine="{id}"]` subtree(s) — see
+    /// [`Self::validate_in`] for the multi-machine-per-page case.
     pub fn validate_template(&self) -> Result<(), Vec<String>> {
-        let html = match &self.template {
-            Some(h) => h,
-            None => return Ok(()),
-        };
+        match &self.template {
+            Some(html) => self.validate_in(html),
+            None => Ok(()),
+        }
+    }
 
+    /// Like [`Self::validate_template`], but takes an externally-supplied page HTML
+    /// instead of `self.template`. Used when several distinct machines share one
+    /// page: each machine only owns the `[fx-machine="{id}"]` / `[fx-machine="{id}#..."]`
+    /// subtree(s) matching its own id, so validation is scoped to those subtrees
+    /// rather than the whole document (which may contain other machines' vocabulary).
+    pub fn validate_in(&self, html: &str) -> Result<(), Vec<String>> {
         let valid_states: std::collections::HashSet<&str> =
             self.states.keys().map(|s| s.as_str()).collect();
         let valid_events: std::collections::HashSet<&str> = self
@@ -85,28 +95,52 @@ impl Machine {
             .flat_map(|events| events.keys().map(|e| e.as_str()))
             .collect();
 
+        let subtrees = extract_machine_subtrees(html, &self.id);
+        // No `[fx-machine="{id}"]` wrapper found at all: either this fragment predates
+        // the wrapper convention (tests often pass bare fragments), or it belongs to a
+        // different machine sharing this page — validate the whole thing either way,
+        // since a false negative (silently skipping validation) is worse than a false
+        // positive on a machine that turns out to have no markup on this page.
+        let owned_subtrees: Vec<String>;
+        let scopes: &[String] = if subtrees.is_empty() {
+            owned_subtrees = vec![html.to_string()];
+            &owned_subtrees
+        } else {
+            &subtrees
+        };
+
         let mut errors = Vec::new();
 
-        for val in extract_attr_values(html, "fx-show") {
-            for state in val.split(',') {
-                let state = state.trim();
-                if !state.is_empty() && !valid_states.contains(state) {
-                    errors.push(format!(
-                        "fx-show=\"{val}\": state '{state}' not defined in machine '{}'",
-                        self.id
-                    ));
+        for subtree in scopes {
+            // A machine's subtree may itself contain a *nested* `[fx-machine]` of a
+            // different id — e.g. a page-wide "theme" wrapper containing a "nav"
+            // machine for a dropdown. That nested region belongs to the other
+            // machine, not this one, so carve it out before scanning for our own
+            // fx-show/fx-on references.
+            let subtree = strip_nested_machines(subtree);
+            let subtree = subtree.as_str();
+
+            for val in extract_attr_values(subtree, "fx-show") {
+                for state in val.split(',') {
+                    let state = state.trim();
+                    if !state.is_empty() && !valid_states.contains(state) {
+                        errors.push(format!(
+                            "fx-show=\"{val}\": state '{state}' not defined in machine '{}'",
+                            self.id
+                        ));
+                    }
                 }
             }
-        }
 
-        for val in extract_attr_values(html, "fx-on") {
-            if let Some(event) = val.splitn(2, "->").nth(1) {
-                let event = event.trim();
-                if !event.is_empty() && !valid_events.contains(event) {
-                    errors.push(format!(
-                        "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
-                        self.id
-                    ));
+            for val in extract_attr_values(subtree, "fx-on") {
+                if let Some(event) = val.splitn(2, "->").nth(1) {
+                    let event = event.trim();
+                    if !event.is_empty() && !valid_events.contains(event) {
+                        errors.push(format!(
+                            "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
+                            self.id
+                        ));
+                    }
                 }
             }
         }
@@ -135,6 +169,152 @@ fn extract_attr_values(html: &str, attr: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Find the element(s) with `fx-machine="{machine_id}"` or `fx-machine="{machine_id}#..."`
+/// (the `#instance` fragment used for multiple instances of the same machine on one
+/// page) and return each one's full outer HTML, tag depth-matched to its closing tag.
+///
+/// Fast string scan in the same spirit as `extract_attr_values` — not a real HTML
+/// parser, so it assumes well-formed, non-self-closing markup for the matched tag.
+fn extract_machine_subtrees(html: &str, machine_id: &str) -> Vec<String> {
+    let needle = format!("fx-machine=\"{machine_id}");
+    let mut out = Vec::new();
+    let mut search_from = 0;
+
+    while let Some(rel) = html[search_from..].find(needle.as_str()) {
+        let attr_pos = search_from + rel;
+        let after = &html[attr_pos + needle.len()..];
+        // Must be an exact id match: value ends here (`"`) or continues as `#instance` (`#`).
+        // Otherwise this is a different id with the same prefix (e.g. "counter" vs "counter2").
+        if !(after.starts_with('"') || after.starts_with('#')) {
+            search_from = attr_pos + needle.len();
+            continue;
+        }
+
+        let Some(tag_start) = html[..attr_pos].rfind('<') else {
+            search_from = attr_pos + needle.len();
+            continue;
+        };
+        let tag_name_start = tag_start + 1;
+        let tag_name_end = html[tag_name_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .map(|o| tag_name_start + o)
+            .unwrap_or(html.len());
+        let tag_name = &html[tag_name_start..tag_name_end];
+
+        let Some(open_tag_end_rel) = html[tag_start..].find('>') else {
+            search_from = attr_pos + needle.len();
+            continue;
+        };
+        let content_start = tag_start + open_tag_end_rel + 1;
+
+        match find_matching_close(html, tag_name, content_start) {
+            Some(end) => {
+                out.push(html[tag_start..end].to_string());
+                search_from = end;
+            }
+            None => {
+                // Malformed / no closing tag — take the rest of the document rather
+                // than silently dropping this machine's validation.
+                out.push(html[tag_start..].to_string());
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+/// Remove any nested `[fx-machine="..."]` subtree(s) from `subtree` (which itself starts
+/// at some outer `<tag fx-machine="...">` and ends at its matching close tag). Skips past
+/// the outer tag's own opening `>` first, so the outer wrapper's own `fx-machine` attribute
+/// is never mistaken for a nested one.
+fn strip_nested_machines(subtree: &str) -> String {
+    let Some(first_gt) = subtree.find('>') else {
+        return subtree.to_string();
+    };
+    let (head, body) = subtree.split_at(first_gt + 1);
+
+    let mut result = String::from(head);
+    let mut rest = body;
+    loop {
+        let Some(rel) = rest.find("fx-machine=\"") else {
+            result.push_str(rest);
+            break;
+        };
+        let Some(tag_start) = rest[..rel].rfind('<') else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..tag_start]);
+
+        let tag_name_start = tag_start + 1;
+        let tag_name_end = rest[tag_name_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .map(|o| tag_name_start + o)
+            .unwrap_or(rest.len());
+        let tag_name = &rest[tag_name_start..tag_name_end].to_string();
+
+        let Some(open_end_rel) = rest[tag_start..].find('>') else {
+            result.push_str(&rest[tag_start..]);
+            break;
+        };
+        let content_start = tag_start + open_end_rel + 1;
+
+        match find_matching_close(rest, tag_name, content_start) {
+            Some(end) => rest = &rest[end..],
+            None => break,
+        }
+    }
+    result
+}
+
+/// From `from` (just after an opening `<tag ...>`), depth-count nested `<tag` / `</tag>`
+/// occurrences of the same tag name and return the index just past the matching `</tag>`.
+fn find_matching_close(html: &str, tag: &str, from: usize) -> Option<usize> {
+    let mut depth = 1u32;
+    let mut pos = from;
+    loop {
+        let next_open = find_tag_boundary(html, tag, pos, false);
+        let next_close = find_tag_boundary(html, tag, pos, true);
+        match (next_open, next_close) {
+            (_, None) => return None,
+            (Some(o), Some(c)) if o < c => {
+                depth += 1;
+                pos = o + 1 + tag.len();
+            }
+            (_, Some(c)) => {
+                depth -= 1;
+                let close_end = html[c..].find('>').map(|o| c + o + 1)?;
+                if depth == 0 {
+                    return Some(close_end);
+                }
+                pos = close_end;
+            }
+        }
+    }
+}
+
+/// Find the next `<tag` (or `</tag` when `closing`) at a proper tag-name boundary
+/// (followed by whitespace, `>`, or `/`) starting at or after `from`.
+fn find_tag_boundary(html: &str, tag: &str, from: usize, closing: bool) -> Option<usize> {
+    let needle = if closing { format!("</{tag}") } else { format!("<{tag}") };
+    let mut search_from = from;
+    loop {
+        let rel = html[search_from..].find(needle.as_str())?;
+        let idx = search_from + rel;
+        let after = idx + needle.len();
+        let boundary = html[after..]
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace() || c == '>' || c == '/')
+            .unwrap_or(true);
+        if boundary {
+            return Some(idx);
+        }
+        search_from = idx + needle.len();
+    }
 }
 
 /// Builder for `Machine`.  All methods consume and return `Self` for chaining.
@@ -658,6 +838,86 @@ mod tests {
             .build();
 
         assert!(machine.validate_template().is_ok());
+    }
+
+    #[test]
+    fn validate_in_scopes_to_own_machine_subtree() {
+        // Two distinct machines sharing one page: "theme" only knows
+        // light/dark + toggle_theme, "nav" only knows closed/open + toggle_contact.
+        // Each must validate cleanly even though the *other* machine's vocabulary
+        // appears elsewhere in the same document.
+        let html = r#"
+            <div fx-machine="theme" fx-class="dark:is-dark">
+              <button fx-on="click->toggle_theme">theme</button>
+            </div>
+            <div fx-machine="nav">
+              <button fx-on="click->toggle_contact">contact</button>
+              <div fx-show="open">menu</div>
+            </div>
+        "#;
+
+        let theme = MachineBuilder::new("theme", "light", json!({}))
+            .state("dark")
+            .pass("light", "toggle_theme", "dark")
+            .pass("dark", "toggle_theme", "light")
+            .build();
+        let nav = MachineBuilder::new("nav", "closed", json!({}))
+            .state("open")
+            .pass("closed", "toggle_contact", "open")
+            .pass("open", "toggle_contact", "closed")
+            .build();
+
+        assert!(theme.validate_in(html).is_ok());
+        assert!(nav.validate_in(html).is_ok());
+    }
+
+    #[test]
+    fn validate_in_still_catches_errors_within_own_subtree() {
+        let html = r#"
+            <div fx-machine="nav">
+              <button fx-on="click->toggle_contct">typo</button>
+            </div>
+        "#;
+        let nav = MachineBuilder::new("nav", "closed", json!({}))
+            .state("open")
+            .pass("closed", "toggle_contact", "open")
+            .pass("open", "toggle_contact", "closed")
+            .build();
+
+        let errs = nav.validate_in(html).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("'toggle_contct'")));
+    }
+
+    #[test]
+    fn validate_in_scopes_correctly_when_nested() {
+        // A common real layout: a page-wide "theme" machine wraps everything
+        // (so its dark-mode class applies to the whole page), with a "nav"
+        // machine nested inside it for an unrelated dropdown. theme's own
+        // validation must not choke on nav's vocabulary just because nav's
+        // markup happens to be a descendant of theme's root.
+        let html = r#"
+            <div fx-machine="theme" fx-class="dark:is-dark">
+              <button fx-on="click->toggle_theme">theme</button>
+              <div fx-machine="nav">
+                <button fx-on="click->toggle_contact">contact</button>
+                <div fx-show="open">menu</div>
+              </div>
+            </div>
+        "#;
+
+        let theme = MachineBuilder::new("theme", "light", json!({}))
+            .state("dark")
+            .pass("light", "toggle_theme", "dark")
+            .pass("dark", "toggle_theme", "light")
+            .build();
+        let nav = MachineBuilder::new("nav", "closed", json!({}))
+            .state("open")
+            .pass("closed", "toggle_contact", "open")
+            .pass("open", "toggle_contact", "closed")
+            .build();
+
+        assert!(theme.validate_in(html).is_ok());
+        assert!(nav.validate_in(html).is_ok());
     }
 
     // ── machine_graph! macro tests ──────────────────────────────────────────
