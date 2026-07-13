@@ -610,6 +610,7 @@ dependencies = [
  "foster-core",
  "foster-server",
  "foster-testgen",
+ "serde",
  "serde_json",
  "tokio",
  "tower-http",

@@ -1,3 +1,7 @@
+mod screening;
+
+use axum::routing::{get, post};
+use axum::Router;
 use foster_core::MachineBuilder;
 use std::collections::HashMap;
 use tower_http::services::ServeDir;
@@ -79,16 +83,38 @@ async fn main() {
     .on("paused", "toggle_geo", "paused", toggle_bool("show_geo"))
     .build();
 
+    // Conjunction-screening analog. Foster's role here is deliberately tiny —
+    // just remembering that the button has been clicked at least once, so the
+    // label can change from "Screen" to "Screen again". The actual status
+    // (running/complete) and the event list come from an independent
+    // setInterval poll against /api/screening (see screening.rs and
+    // static/screening.js), a background job that finishes on its own
+    // without any further client request — same shape as the real site's
+    // conjunction screening. Both this machine's SSE connection and the
+    // widget's own poll loop run concurrently on the same page.
+    let conjunction = MachineBuilder::new("conjunction", "idle", serde_json::json!({}))
+        .state("started")
+        .pass("idle", "start_screening", "started")
+        .pass("started", "start_screening", "started")
+        .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
     machines.insert("satellites".to_string(), satellites);
+    machines.insert("conjunction".to_string(), conjunction);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
 
+    let screening_router = Router::new()
+        .route("/api/screening", get(screening::get_screening))
+        .route("/api/screening/start", post(screening::start_screening))
+        .with_state(screening::initial_state());
+
     let app = foster_server::router(machines)
+        .merge(screening_router)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
         .fallback_service(ServeDir::new(static_dir));
 
