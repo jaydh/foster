@@ -25,9 +25,33 @@ async fn main() {
         .template(include_str!("../static/index.html"))
         .build();
 
+    // Play/pause + reset chrome for the Game of Life canvas below. The actual
+    // simulation is a hand-rolled requestAnimationFrame loop over raw
+    // wasm-bindgen/web-sys canvas code (see static/life.js) — Foster only
+    // owns the button state, not the per-frame work. The loop reads this
+    // machine's `data-fx-state` off the DOM each frame to know whether to
+    // step, and watches `reset_nonce` (via `fx-text`) to know when to
+    // reseed the grid. That's the actual integration boundary this example
+    // exists to test: does a real canvas widget coexist with Foster's
+    // server-authoritative chrome without a Rust-side binding between them.
+    let life = MachineBuilder::new("life", "paused", serde_json::json!({ "reset_nonce": 0 }))
+        .state("running")
+        .pass("paused", "toggle_run", "running")
+        .pass("running", "toggle_run", "paused")
+        .on("paused", "reset", "paused", |ctx, _| {
+            let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({ "reset_nonce": n + 1 }))
+        })
+        .on("running", "reset", "running", |ctx, _| {
+            let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+            Ok(serde_json::json!({ "reset_nonce": n + 1 }))
+        })
+        .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
+    machines.insert("life".to_string(), life);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
