@@ -133,6 +133,36 @@
       font: inherit;
     }
     .life-controls button:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── satellites ────────────────────────────────────────── */
+    #sat-canvas {
+      display: block;
+      width: 100%;
+      max-width: 480px;
+      aspect-ratio: 1;
+      margin: 0 auto;
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      background: var(--surface);
+    }
+    .sat-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin: 1rem 0;
+      justify-content: center;
+    }
+    .sat-controls button {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 0.375rem;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      font: inherit;
+    }
+    .sat-controls button:hover { border-color: var(--accent); color: var(--accent); }
+    .sat-controls button.ring-off { opacity: 0.5; }
   </style>
 </head>
 <body>
@@ -142,6 +172,7 @@
     <a href="#about" class="logo">Jay Dan Howard</a>
     <div class="nav-links" id="scroll-spy-links">
       <a href="#about" data-spy="about">About</a>
+      <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#life" data-spy="life">Game of Life</a>
 
       <button class="icon-btn" fx-on="click->toggle_theme" aria-label="Toggle dark mode">
@@ -186,6 +217,43 @@
     </p>
   </main>
 
+  <main id="satellites">
+    <h1>Satellites</h1>
+    <p>
+      Heavier version of the same test: dozens of points animating every
+      frame, not a coarse simulation step. <code>static/satellites.js</code>
+      does the orbital math and drawing by hand; Foster owns run/pause and
+      the three ring-visibility toggles below via a fourth independent
+      machine (<code>satellites</code>), and the loop reads all four straight
+      off the DOM — <code>data-fx-state</code> plus three <code>fx-if</code>
+      marker elements, one per ring.
+    </p>
+    <div fx-machine="satellites">
+      <canvas id="sat-canvas" width="480" height="480"></canvas>
+      <div class="sat-controls">
+        <button fx-on="click->toggle_run">
+          <span fx-show="running">&#10074;&#10074; Pause</span>
+          <span fx-show="paused">&#9654; Run</span>
+        </button>
+        <button fx-on="click->toggle_leo">
+          <span fx-if="show_leo">LEO &#10003;</span>
+          <span fx-if='{"field":"show_leo","op":"eq","value":false}'>LEO &#10007;</span>
+        </button>
+        <button fx-on="click->toggle_meo">
+          <span fx-if="show_meo">MEO &#10003;</span>
+          <span fx-if='{"field":"show_meo","op":"eq","value":false}'>MEO &#10007;</span>
+        </button>
+        <button fx-on="click->toggle_geo">
+          <span fx-if="show_geo">GEO &#10003;</span>
+          <span fx-if='{"field":"show_geo","op":"eq","value":false}'>GEO &#10007;</span>
+        </button>
+      </div>
+      <span id="flag-leo" fx-if="show_leo" style="display:none;width:0;height:0;overflow:hidden"></span>
+      <span id="flag-meo" fx-if="show_meo" style="display:none;width:0;height:0;overflow:hidden"></span>
+      <span id="flag-geo" fx-if="show_geo" style="display:none;width:0;height:0;overflow:hidden"></span>
+    </div><!-- /fx-machine=satellites -->
+  </main>
+
   <main id="life">
     <h1>Conway's Game of Life</h1>
     <p>
@@ -225,9 +293,11 @@
 <script type="module">
   import init from '/pkg/foster_client.js';
   import { initLife } from '/life.js';
+  import { initSatellites } from '/satellites.js';
   import { initScrollSpy } from '/scrollspy.js';
   init();
   initLife();
+  initSatellites();
   initScrollSpy();
 </script>
 </body>

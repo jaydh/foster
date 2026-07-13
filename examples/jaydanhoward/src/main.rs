@@ -48,10 +48,42 @@ async fn main() {
         })
         .build();
 
+    // Satellite tracker: same pattern as "life" (Foster owns run/pause + the
+    // per-ring visibility toggles, a hand-rolled canvas loop in
+    // static/satellites.js does the actual per-frame orbital math and
+    // drawing), but heavier — continuous animation of many points at once,
+    // not a coarse simulation step every ~90ms. Tests whether the
+    // DOM-attribute integration boundary (data-fx-state + fx-if markers)
+    // still holds up at real animation frame rate.
+    fn toggle_bool(key: &'static str) -> impl Fn(serde_json::Value, serde_json::Value) -> Result<serde_json::Value, foster_core::MachineError> + Clone {
+        move |mut ctx, _payload| {
+            let v = ctx.get(key).and_then(|v| v.as_bool()).unwrap_or(true);
+            ctx[key] = serde_json::json!(!v);
+            Ok(ctx)
+        }
+    }
+
+    let satellites = MachineBuilder::new(
+        "satellites",
+        "running",
+        serde_json::json!({ "show_leo": true, "show_meo": true, "show_geo": true }),
+    )
+    .state("paused")
+    .pass("running", "toggle_run", "paused")
+    .pass("paused", "toggle_run", "running")
+    .on("running", "toggle_leo", "running", toggle_bool("show_leo"))
+    .on("paused", "toggle_leo", "paused", toggle_bool("show_leo"))
+    .on("running", "toggle_meo", "running", toggle_bool("show_meo"))
+    .on("paused", "toggle_meo", "paused", toggle_bool("show_meo"))
+    .on("running", "toggle_geo", "running", toggle_bool("show_geo"))
+    .on("paused", "toggle_geo", "paused", toggle_bool("show_geo"))
+    .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
+    machines.insert("satellites".to_string(), satellites);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
