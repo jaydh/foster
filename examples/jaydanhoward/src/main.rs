@@ -1,3 +1,4 @@
+mod cluster;
 mod request_trace;
 mod screening;
 
@@ -17,6 +18,12 @@ use tower_http::services::ServeDir;
 // `[fx-machine="{id}"]` subtree) — this is the real, two-machine version.
 #[tokio::main]
 async fn main() {
+    // kube's rustls-tls feature needs an explicit process-level crypto
+    // provider — same fix the real jaydanhoward site's main.rs applies.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let theme = MachineBuilder::new("theme", "light", serde_json::json!({}))
         .state("dark")
         .pass("light", "toggle_theme", "dark")
@@ -100,12 +107,28 @@ async fn main() {
         .pass("started", "start_screening", "started")
         .build();
 
+    // Real GitOps (Flux) status + backup Job status via the kube crate
+    // against the actual homelab cluster (see cluster.rs) — deliberately
+    // not the Prometheus-backed CPU/mem/disk/Ceph panel from the real site's
+    // cluster_stats.rs, since Prometheus's NodePort isn't reachable from
+    // this machine (LAN-only, we're on Tailscale). "Refresh" re-queries the
+    // cluster synchronously inside the reducer (via block_in_place since
+    // Foster's reducers are plain sync Fn, no async support) — acceptable
+    // for a quick API read, unlike the background-job pattern used by life/
+    // satellites/conjunction.
+    let cluster = MachineBuilder::new("cluster", "loaded", cluster::fetch_cluster_status())
+        .on("loaded", "refresh", "loaded", |_ctx, _payload| {
+            Ok(cluster::fetch_cluster_status())
+        })
+        .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
     machines.insert("satellites".to_string(), satellites);
     machines.insert("conjunction".to_string(), conjunction);
+    machines.insert("cluster".to_string(), cluster);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");

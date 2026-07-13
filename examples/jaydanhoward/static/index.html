@@ -210,6 +210,23 @@
       font-size: 0.8rem; margin-bottom: 1rem;
     }
     #request-trace-refresh:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── cluster ───────────────────────────────────────────── */
+    .cluster-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 1rem; }
+    @media (max-width: 640px) { .cluster-grid { grid-template-columns: 1fr; } }
+    .cluster-box { border: 1px solid var(--border); border-radius: 0.5rem; padding: 1rem; background: var(--surface); max-height: 22rem; overflow-y: auto; align-self: start; }
+    .cluster-box h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); margin-bottom: 0.6rem; }
+    .flux-row, .backup-row { display: flex; gap: 0.6rem; align-items: baseline; font-size: 0.8rem; font-family: ui-monospace, monospace; padding: 0.25rem 0; border-bottom: 1px solid var(--border); }
+    .flux-row:last-child, .backup-row:last-child { border-bottom: none; }
+    .flux-kind { color: var(--text-light); width: 6rem; flex-shrink: 0; }
+    .flux-name { flex: 1; word-break: break-all; }
+    #cluster-refresh {
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 0.375rem; padding: 0.4rem 0.9rem; cursor: pointer; font: inherit;
+      font-size: 0.8rem;
+    }
+    #cluster-refresh:hover { border-color: var(--accent); color: var(--accent); }
+    .cluster-error { color: var(--text-light); font-size: 0.85rem; font-family: ui-monospace, monospace; }
   </style>
 </head>
 <body>
@@ -220,6 +237,7 @@
     <div class="nav-links" id="scroll-spy-links">
       <a href="#about" data-spy="about">About</a>
       <a href="#trace" data-spy="trace">Request Trace</a>
+      <a href="#cluster" data-spy="cluster">Cluster</a>
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
@@ -281,6 +299,50 @@
     </p>
     <button id="request-trace-refresh">&#8635; Refresh</button>
     <div id="request-trace-container"></div>
+  </main>
+
+  <main id="cluster">
+    <h1>Cluster</h1>
+    <p>
+      Real Kubernetes data — <code>src/cluster.rs</code> uses the
+      <code>kube</code> crate's <code>Client::try_default()</code> against
+      the actual homelab k3s cluster this laptop already has kubectl access
+      to (in-cluster service account first, local kubeconfig fallback, same
+      as the real site). Deliberately <em>not</em> the CPU/mem/disk/Ceph
+      panel from the production site — that's Prometheus-backed, and
+      Prometheus's NodePort is bound to the home LAN interface only; this
+      machine reaches the cluster over Tailscale, so that data genuinely
+      isn't reachable from here. GitOps status and backup Job status both go
+      through the k8s API server directly, which is reachable, so those are
+      real. A single Foster machine (<code>cluster</code>) holds both lists
+      in context; "Refresh" re-queries the cluster synchronously inside the
+      transition's reducer.
+    </p>
+    <div fx-machine="cluster">
+      <button id="cluster-refresh" fx-on="click->refresh">&#8635; Refresh</button>
+      <div class="cluster-grid">
+        <div class="cluster-box">
+          <h3>Flux GitOps</h3>
+          <div fx-for="flux">
+            <div class="flux-row">
+              <span class="flux-kind" fx-field="kind"></span>
+              <span class="flux-name" fx-field="name"></span>
+              <span fx-field="ready_icon"></span>
+            </div>
+          </div>
+        </div>
+        <div class="cluster-box">
+          <h3>Backup Jobs</h3>
+          <div fx-for="backups">
+            <div class="backup-row">
+              <span fx-field="status_icon"></span>
+              <span class="flux-name" fx-field="name"></span>
+              <span class="flux-kind" fx-field="status_label"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /fx-machine=cluster -->
   </main>
 
   <main id="satellites">
