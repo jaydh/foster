@@ -1,9 +1,11 @@
+mod request_trace;
 mod screening;
 
 use axum::routing::{get, post};
 use axum::Router;
 use foster_core::MachineBuilder;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use tower_http::services::ServeDir;
 
 // Two independent machines sharing one page: theme (light/dark) and nav
@@ -113,12 +115,23 @@ async fn main() {
         .route("/api/screening/start", post(screening::start_screening))
         .with_state(screening::initial_state());
 
+    // Real per-request data (see request_trace.rs) — needs the client's real
+    // socket address, which requires opting into ConnectInfo below.
+    let trace_router: Router = Router::new()
+        .route("/api/request-trace", get(request_trace::get_request_trace));
+
     let app = foster_server::router(machines)
         .merge(screening_router)
+        .merge(trace_router)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
         .fallback_service(ServeDir::new(static_dir));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3009").await.unwrap();
     println!("Foster jaydanhoward → http://localhost:3009");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

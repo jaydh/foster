@@ -191,6 +191,25 @@
       margin-bottom: 0.75rem;
     }
     #screening-start:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── request trace ─────────────────────────────────────── */
+    #request-trace-container { display: flex; flex-direction: column; align-items: center; max-width: 32rem; margin: 0 auto; }
+    .trace-loading, .trace-error { color: var(--text-light); font-size: 0.85rem; padding: 2rem 0; font-family: ui-monospace, monospace; }
+    .trace-card { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 0.5rem; padding: 1rem; }
+    .trace-label { font-size: 0.7rem; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.6rem; }
+    .trace-rows { display: flex; flex-direction: column; gap: 0.4rem; }
+    .trace-row { display: flex; gap: 0.75rem; font-size: 0.75rem; font-family: ui-monospace, monospace; }
+    .trace-key { color: var(--text-light); width: 5rem; flex-shrink: 0; }
+    .trace-val { color: var(--text); word-break: break-all; }
+    .trace-hop { display: flex; flex-direction: column; align-items: center; padding: 0.15rem 0; }
+    .trace-hop-line { width: 1px; height: 1rem; background: var(--border); }
+    .trace-hop-label { font-size: 0.6rem; color: var(--text-light); font-family: ui-monospace, monospace; padding: 0.1rem 0.5rem; background: var(--bg); border: 1px solid var(--border); border-radius: 0.25rem; }
+    #request-trace-refresh {
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 0.375rem; padding: 0.4rem 0.9rem; cursor: pointer; font: inherit;
+      font-size: 0.8rem; margin-bottom: 1rem;
+    }
+    #request-trace-refresh:hover { border-color: var(--accent); color: var(--accent); }
   </style>
 </head>
 <body>
@@ -200,6 +219,7 @@
     <a href="#about" class="logo">Jay Dan Howard</a>
     <div class="nav-links" id="scroll-spy-links">
       <a href="#about" data-spy="about">About</a>
+      <a href="#trace" data-spy="trace">Request Trace</a>
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
@@ -244,6 +264,23 @@
       (<code>static/scrollspy.js</code>, an <code>IntersectionObserver</code>
       toggling a class directly) sitting next to Foster, not modeled inside it.
     </p>
+  </main>
+
+  <main id="trace">
+    <h1>Request Trace</h1>
+    <p>
+      Real data, no Foster machine at all — this snapshot of the request
+      that already happened (client IP, geo via a real
+      <code>ip-api.com</code> lookup, User-Agent, real process env vars) has
+      nothing discrete or event-driven about it, so a plain
+      <code>fetch()</code> in <code>static/request_trace.js</code> against a
+      hand-rolled <code>GET /api/request-trace</code> route
+      (<code>src/request_trace.rs</code>) is the whole implementation. This
+      demo isn't behind Cloudflare, so the Cloudflare-specific fields are
+      honestly absent rather than faked.
+    </p>
+    <button id="request-trace-refresh">&#8635; Refresh</button>
+    <div id="request-trace-container"></div>
   </main>
 
   <main id="satellites">
@@ -352,11 +389,13 @@
   import { initLife } from '/life.js';
   import { initSatellites } from '/satellites.js';
   import { initScreening } from '/screening.js';
+  import { initRequestTrace } from '/request_trace.js';
   import { initScrollSpy } from '/scrollspy.js';
   init();
   initLife();
   initSatellites();
   initScreening();
+  initRequestTrace();
   initScrollSpy();
 </script>
 </body>
