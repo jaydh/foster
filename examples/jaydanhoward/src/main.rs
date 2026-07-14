@@ -1,5 +1,6 @@
 mod cluster;
 mod lighthouse;
+mod photography;
 mod request_trace;
 mod satellites;
 mod screening;
@@ -237,10 +238,65 @@ async fn main() {
         .pass("started", "start_lighthouse", "started")
         .build();
 
+    // Real photo gallery — points at the real, live production CDN
+    // (caddy.jaydanhoward.com, confirmed publicly reachable) rather than
+    // standing up an equivalent. "view"/"next"/"prev"/"close" is a small
+    // lightbox machine; each fx-on="click->view" thumbnail is rendered via
+    // fx-for, so foster-client automatically merges that item's own JSON
+    // (including the "index" field set in photography.rs) into the
+    // transition payload — no per-item fx-payload templating needed.
+    let photography = {
+        let initial = photography::fetch_photos();
+        let photos_for_reducers = initial["photos"].clone();
+        let photo_count = photos_for_reducers.as_array().map(|a| a.len()).unwrap_or(0) as i64;
+
+        // fx-bind-attr can only bind a top-level context scalar, not an
+        // indexed lookup into an array — so alongside viewing_index, mirror
+        // the currently-viewed photo's URL/name into their own top-level
+        // fields whenever the index changes, so the lightbox <img> can bind
+        // to them directly.
+        fn set_viewing(mut ctx: serde_json::Value, photos: &serde_json::Value, index: i64) -> serde_json::Value {
+            ctx["viewing_index"] = serde_json::json!(index);
+            if index >= 0 {
+                if let Some(photo) = photos.as_array().and_then(|a| a.get(index as usize)) {
+                    ctx["viewing_url"] = photo["medium_url"].clone();
+                    ctx["viewing_name"] = photo["name"].clone();
+                }
+            } else {
+                ctx["viewing_url"] = serde_json::json!("");
+                ctx["viewing_name"] = serde_json::json!("");
+            }
+            ctx
+        }
+
+        let photos_1 = photos_for_reducers.clone();
+        let photos_2 = photos_for_reducers.clone();
+        let photos_3 = photos_for_reducers.clone();
+
+        MachineBuilder::new("photography", "loaded", initial)
+            .on("loaded", "view", "loaded", move |ctx, payload| {
+                let i = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(-1);
+                Ok(set_viewing(ctx, &photos_1, i))
+            })
+            .on("loaded", "close", "loaded", |ctx, _| Ok(set_viewing(ctx, &serde_json::Value::Null, -1)))
+            .on("loaded", "next", "loaded", move |ctx, _| {
+                let i = ctx["viewing_index"].as_i64().unwrap_or(-1);
+                let next = if photo_count > 0 && i >= 0 { (i + 1) % photo_count } else { i };
+                Ok(set_viewing(ctx, &photos_2, next))
+            })
+            .on("loaded", "prev", "loaded", move |ctx, _| {
+                let i = ctx["viewing_index"].as_i64().unwrap_or(-1);
+                let prev = if photo_count > 0 && i >= 0 { (i - 1 + photo_count) % photo_count } else { i };
+                Ok(set_viewing(ctx, &photos_3, prev))
+            })
+            .build()
+    };
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
+    machines.insert("photography".to_string(), photography);
     machines.insert("pathfinding".to_string(), pathfinding);
     machines.insert("satellites".to_string(), satellites);
     machines.insert("security_audit".to_string(), security_audit);
