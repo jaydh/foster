@@ -1,6 +1,7 @@
 mod cluster;
 mod request_trace;
 mod screening;
+mod security_audit;
 mod visitors;
 
 use axum::routing::{get, post};
@@ -147,11 +148,26 @@ async fn main() {
         .build()
     };
 
+    // Real `cargo audit` against foster's own Cargo.lock — see
+    // security_audit.rs. Starts idle rather than running at boot (the
+    // advisory-db check can take a few seconds) — "Run audit" fires it for
+    // real, on demand.
+    let security_audit = MachineBuilder::new("security_audit", "idle", serde_json::json!({}))
+        .state("loaded")
+        .on("idle", "run_audit", "loaded", |_ctx, _payload| {
+            Ok(security_audit::run_audit())
+        })
+        .on("loaded", "run_audit", "loaded", |_ctx, _payload| {
+            Ok(security_audit::run_audit())
+        })
+        .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
     machines.insert("satellites".to_string(), satellites);
+    machines.insert("security_audit".to_string(), security_audit);
     machines.insert("conjunction".to_string(), conjunction);
     machines.insert("cluster".to_string(), cluster);
     machines.insert("visitors".to_string(), visitors_machine);

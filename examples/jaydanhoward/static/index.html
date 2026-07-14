@@ -242,6 +242,20 @@
       border-radius: 0.375rem; padding: 0.4rem 0.9rem; cursor: pointer; font: inherit; font-size: 0.8rem;
     }
     #visitors-refresh:hover { border-color: var(--accent); color: var(--accent); }
+
+    /* ── security audit ────────────────────────────────────── */
+    #audit-run {
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 0.375rem; padding: 0.5rem 1rem; cursor: pointer; font: inherit;
+    }
+    #audit-run:hover { border-color: var(--accent); color: var(--accent); }
+    .audit-summary { display: flex; gap: 1.5rem; margin: 1rem 0; }
+    .audit-clean { color: #10b981; font-weight: 600; }
+    .audit-found { color: #ef4444; font-weight: 600; }
+    .audit-row { border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.75rem 1rem; margin-bottom: 0.6rem; background: var(--surface); }
+    .audit-id { font-family: ui-monospace, monospace; font-size: 0.75rem; color: var(--accent); }
+    .audit-pkg { font-family: ui-monospace, monospace; font-size: 0.8rem; font-weight: 600; }
+    .audit-title { font-size: 0.8rem; color: var(--text-light); }
   </style>
 </head>
 <body>
@@ -254,6 +268,7 @@
       <a href="#trace" data-spy="trace">Request Trace</a>
       <a href="#cluster" data-spy="cluster">Cluster</a>
       <a href="#visitors" data-spy="visitors">Visitors</a>
+      <a href="#security" data-spy="security">Security Audit</a>
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
@@ -403,6 +418,42 @@
         </div>
       </div>
     </div><!-- /fx-machine=visitors -->
+  </main>
+
+  <main id="security">
+    <h1>Security Audit</h1>
+    <p>
+      Real <code>cargo audit</code> — <code>src/security_audit.rs</code>
+      shells out to the exact tool used earlier this session to find and fix
+      RUSTSEC-2026-0204 in <code>crossbeam-epoch</code>, run against this
+      <code>foster</code> workspace's own <code>Cargo.lock</code> right now.
+      Self-referential: whatever shows up below is genuinely, currently true
+      of this repository, not sample data.
+    </p>
+    <div fx-machine="security_audit">
+      <button id="audit-run" fx-on="click->run_audit">
+        <span fx-show="idle">Run audit</span>
+        <span fx-show="loaded">Re-run audit</span>
+      </button>
+      <div fx-show="loaded">
+        <div class="audit-summary">
+          <span fx-if='{"field":"vulnerability_count","op":"eq","value":0}' class="audit-clean">
+            &#10003; no known vulnerabilities
+          </span>
+          <span fx-if='{"field":"vulnerability_count","op":"gt","value":0}' class="audit-found">
+            <span fx-text="vulnerability_count"></span> vulnerabilities found
+          </span>
+          <span>&#183; <span fx-text="dependency_count"></span> dependencies scanned</span>
+          <span>&#183; <span fx-text="warning_count"></span> warnings</span>
+        </div>
+        <div fx-for="vulnerabilities">
+          <div class="audit-row">
+            <div><span class="audit-id" fx-field="id"></span> &#183; <span class="audit-pkg" fx-field="package"></span></div>
+            <div class="audit-title" fx-field="title"></div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /fx-machine=security_audit -->
   </main>
 
   <main id="satellites">
