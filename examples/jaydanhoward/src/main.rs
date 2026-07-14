@@ -65,6 +65,46 @@ async fn main() {
         })
         .build();
 
+    // Pathfinding: same shape as "life" (Foster owns algorithm-select +
+    // run/reset state, static/pathfinding.js does the grid + step-by-step
+    // BFS/A* animation by hand). No external data question here — the real
+    // site's pathfinding is already fully self-contained (client-side grid,
+    // no server dependency), so this is a straightforward port rather than
+    // a "what data source" decision like the other sections.
+    let pathfinding = MachineBuilder::new(
+        "pathfinding",
+        "paused",
+        serde_json::json!({ "algorithm": "bfs", "reset_nonce": 0 }),
+    )
+    .state("running")
+    .pass("paused", "toggle_run", "running")
+    .pass("running", "toggle_run", "paused")
+    .on("paused", "select_bfs", "paused", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": "bfs", "reset_nonce": n + 1 }))
+    })
+    .on("running", "select_bfs", "running", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": "bfs", "reset_nonce": n + 1 }))
+    })
+    .on("paused", "select_astar", "paused", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": "astar", "reset_nonce": n + 1 }))
+    })
+    .on("running", "select_astar", "running", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": "astar", "reset_nonce": n + 1 }))
+    })
+    .on("paused", "reset", "paused", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": ctx["algorithm"], "reset_nonce": n + 1 }))
+    })
+    .on("running", "reset", "running", |ctx, _| {
+        let n = ctx["reset_nonce"].as_i64().unwrap_or(0);
+        Ok(serde_json::json!({ "algorithm": ctx["algorithm"], "reset_nonce": n + 1 }))
+    })
+    .build();
+
     // Satellite tracker: same pattern as "life" (Foster owns run/pause + the
     // per-ring visibility toggles, a hand-rolled canvas loop in
     // static/satellites.js does the actual per-frame orbital math and
@@ -201,6 +241,7 @@ async fn main() {
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
     machines.insert("life".to_string(), life);
+    machines.insert("pathfinding".to_string(), pathfinding);
     machines.insert("satellites".to_string(), satellites);
     machines.insert("security_audit".to_string(), security_audit);
     machines.insert("conjunction".to_string(), conjunction);

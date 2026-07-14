@@ -122,6 +122,15 @@
       border-radius: 0.5rem;
       background: var(--surface);
     }
+    #path-canvas {
+      display: block;
+      width: 100%;
+      max-width: 800px;
+      aspect-ratio: 800 / 480;
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      background: var(--surface);
+    }
     .life-controls { display: flex; gap: 0.75rem; margin: 1rem 0; }
     .life-controls button {
       background: var(--surface);
@@ -289,6 +298,7 @@
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
+      <a href="#path" data-spy="path">Pathfinding</a>
 
       <button class="icon-btn" fx-on="click->toggle_theme" aria-label="Toggle dark mode">
         <span fx-show="light">&#9789;</span>
@@ -604,6 +614,35 @@
     </div><!-- /fx-machine=life -->
   </main>
 
+  <main id="path">
+    <h1>Pathfinding</h1>
+    <p>
+      Same pattern as Game of Life, and no "what data source" question here
+      — the real site's pathfinding is already fully self-contained
+      (client-side grid, no server dependency), so this is a straightforward
+      port rather than a real-data upgrade. <code>static/pathfinding.js</code>
+      is a plain <code>requestAnimationFrame</code> loop running BFS or A*
+      step-by-step; Foster owns algorithm-select/run/reset, read off the DOM
+      the same way as every other canvas widget on this page —
+      <code>data-fx-state</code> plus two <code>fx-text</code> markers
+      (<code>algorithm</code>, <code>reset_nonce</code>).
+    </p>
+    <div fx-machine="pathfinding">
+      <canvas id="path-canvas" width="800" height="480"></canvas>
+      <div class="life-controls">
+        <button fx-on="click->toggle_run">
+          <span fx-show="paused">&#9654; Run</span>
+          <span fx-show="running">&#10074;&#10074; Pause</span>
+        </button>
+        <button fx-on="click->select_bfs">BFS</button>
+        <button fx-on="click->select_astar">A*</button>
+        <button fx-on="click->reset">&#8635; New maze</button>
+      </div>
+      <span id="pathfinding-algorithm" fx-text="algorithm" style="display:none">bfs</span>
+      <span id="pathfinding-reset-nonce" fx-text="reset_nonce" style="display:none">0</span>
+    </div><!-- /fx-machine=pathfinding -->
+  </main>
+
   <footer>
     Ported from <a href="https://jaydanhoward.com" target="_blank" rel="noreferrer">jaydanhoward.com</a>
   </footer>
@@ -617,6 +656,7 @@
 <script type="module">
   import init from '/pkg/foster_client.js';
   import { initLife } from '/life.js';
+  import { initPathfinding } from '/pathfinding.js';
   import { initSatellites } from '/satellites.js';
   import { initScreening } from '/screening.js';
   import { initLighthouse } from '/lighthouse.js';
@@ -624,6 +664,7 @@
   import { initScrollSpy } from '/scrollspy.js';
   init();
   initLife();
+  initPathfinding();
   initSatellites();
   initScreening();
   initLighthouse();
