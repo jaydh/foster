@@ -256,6 +256,22 @@
     .audit-id { font-family: ui-monospace, monospace; font-size: 0.75rem; color: var(--accent); }
     .audit-pkg { font-family: ui-monospace, monospace; font-size: 0.8rem; font-weight: 600; }
     .audit-title { font-size: 0.8rem; color: var(--text-light); }
+
+    /* ── lighthouse ────────────────────────────────────────── */
+    #lighthouse-start {
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 0.375rem; padding: 0.5rem 1rem; cursor: pointer; font: inherit;
+    }
+    #lighthouse-start:hover { border-color: var(--accent); color: var(--accent); }
+    #lighthouse-scores { display: flex; gap: 1rem; margin: 1rem 0; flex-wrap: wrap; }
+    .lh-score { border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.75rem 1.25rem; text-align: center; background: var(--surface); }
+    .lh-score-value { font-size: 1.5rem; font-weight: 700; }
+    .lh-score-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-light); }
+    .lh-good .lh-score-value { color: #10b981; }
+    .lh-mid .lh-score-value { color: #f59e0b; }
+    .lh-poor .lh-score-value { color: #ef4444; }
+    .lh-error { color: var(--text-light); font-family: ui-monospace, monospace; font-size: 0.8rem; }
+    #lighthouse-report-link { display: none; font-size: 0.85rem; }
   </style>
 </head>
 <body>
@@ -269,6 +285,7 @@
       <a href="#cluster" data-spy="cluster">Cluster</a>
       <a href="#visitors" data-spy="visitors">Visitors</a>
       <a href="#security" data-spy="security">Security Audit</a>
+      <a href="#lighthouse" data-spy="lighthouse">Lighthouse</a>
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
@@ -456,6 +473,29 @@
     </div><!-- /fx-machine=security_audit -->
   </main>
 
+  <main id="lighthouse">
+    <h1>Lighthouse</h1>
+    <p>
+      A real Lighthouse audit, run for real against this demo's own running
+      server (<code>src/lighthouse.rs</code> shells out to
+      <code>npx lighthouse</code> with headless Chrome, ~15-30s). Same
+      background-job-plus-independent-polling shape as the Conjunction
+      section: Foster only owns the button's idle/started label; the actual
+      run and its scores come from <code>static/lighthouse.js</code> polling
+      a hand-rolled <code>GET /api/lighthouse</code> route, unrelated to
+      Foster's own SSE for this machine.
+    </p>
+    <div fx-machine="lighthouse">
+      <button id="lighthouse-start" fx-on="click->start_lighthouse">
+        <span fx-show="idle">Run Lighthouse audit</span>
+        <span fx-show="started">Re-run audit</span>
+      </button>
+      <div>Status: <span id="lighthouse-status" class="screening-status">idle</span></div>
+      <div id="lighthouse-scores"></div>
+      <a id="lighthouse-report-link" href="#" target="_blank" rel="noreferrer">View full report &#8599;</a>
+    </div><!-- /fx-machine=lighthouse -->
+  </main>
+
   <main id="satellites">
     <h1>Satellites</h1>
     <p>
@@ -562,12 +602,14 @@
   import { initLife } from '/life.js';
   import { initSatellites } from '/satellites.js';
   import { initScreening } from '/screening.js';
+  import { initLighthouse } from '/lighthouse.js';
   import { initRequestTrace } from '/request_trace.js';
   import { initScrollSpy } from '/scrollspy.js';
   init();
   initLife();
   initSatellites();
   initScreening();
+  initLighthouse();
   initRequestTrace();
   initScrollSpy();
 </script>

@@ -4,3 +4,4 @@ node_modules/
 *.snap
 test-results/
 package-lock.json
+examples/jaydanhoward/static/lighthouse-report.*

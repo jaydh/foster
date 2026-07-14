@@ -1,4 +1,5 @@
 mod cluster;
+mod lighthouse;
 mod request_trace;
 mod screening;
 mod security_audit;
@@ -162,6 +163,16 @@ async fn main() {
         })
         .build();
 
+    // Lighthouse: same tiny-machine-plus-independent-background-job shape
+    // as conjunction/screening.rs, but auditing this demo's own running
+    // server for real (npx lighthouse, headless Chrome) rather than a
+    // canned 3s sleep.
+    let lighthouse_machine = MachineBuilder::new("lighthouse", "idle", serde_json::json!({}))
+        .state("started")
+        .pass("idle", "start_lighthouse", "started")
+        .pass("started", "start_lighthouse", "started")
+        .build();
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
@@ -171,6 +182,7 @@ async fn main() {
     machines.insert("conjunction".to_string(), conjunction);
     machines.insert("cluster".to_string(), cluster);
     machines.insert("visitors".to_string(), visitors_machine);
+    machines.insert("lighthouse".to_string(), lighthouse_machine);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
@@ -180,6 +192,11 @@ async fn main() {
         .route("/api/screening/start", post(screening::start_screening))
         .with_state(screening::initial_state());
 
+    let lighthouse_router = Router::new()
+        .route("/api/lighthouse", get(lighthouse::get_lighthouse))
+        .route("/api/lighthouse/start", post(lighthouse::start_lighthouse))
+        .with_state(lighthouse::initial_state());
+
     // Real per-request data (see request_trace.rs) — needs the client's real
     // socket address, which requires opting into ConnectInfo below.
     let trace_router: Router = Router::new()
@@ -187,6 +204,7 @@ async fn main() {
 
     let app = foster_server::router(machines)
         .merge(screening_router)
+        .merge(lighthouse_router)
         .merge(trace_router)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
         .fallback_service(ServeDir::new(static_dir))
