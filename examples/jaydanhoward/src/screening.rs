@@ -8,14 +8,22 @@
 //! connection for the "conjunction" machine (open the whole time this
 //! section is on the page) interferes with a widget's *independent* polling
 //! loop against a *different* endpoint — both running concurrently on a page
-//! that, with four other Foster machines already on it, is now sitting right
-//! at the six-connections-per-origin HTTP/1.1 limit Foster's own README
-//! warns about.
+//! that, with several other Foster machines already on it, sits right at
+//! (or past) the six-connections-per-origin HTTP/1.1 limit Foster's own
+//! README warns about.
+//!
+//! The screening pass itself is real, if scoped down from the real site's
+//! full multi-timestep Hoots-filter/SGP4 screening (`conjunction.rs`,
+//! 2135 lines): it propagates the real "stations" TLE group (see
+//! satellites.rs, same real CelesTrak data as the Satellites section) to
+//! real ECI positions at the current moment and reports the actual closest
+//! real pairs by real distance — not a binary conjunction/no-conjunction
+//! call against a threshold (today's real satellites in this small group
+//! are well-separated; forcing a "found!" would mean faking the result).
 
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Serialize)]
@@ -42,18 +50,41 @@ pub async fn start_screening(State(state): State<ScreeningState>) -> StatusCode 
         *s = Screening::Running;
     }
 
-    // Simulate the real screening job: CPU/IO work that takes a few seconds
-    // and finishes on its own, independent of any further client request.
+    // Real work that finishes on its own — a real TLE fetch + real pairwise
+    // distance computation, independent of any further client request.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let events = tokio::task::spawn_blocking(run_real_screening)
+            .await
+            .unwrap_or_default();
         let mut s = state.lock().await;
-        *s = Screening::Complete {
-            events: vec![
-                "ISS (ZARYA) vs COSMOS 2251 DEB — miss distance 4.2 km".to_string(),
-                "STARLINK-3011 vs FENGYUN 1C DEB — miss distance 1.8 km".to_string(),
-            ],
-        };
+        *s = Screening::Complete { events };
     });
 
     StatusCode::ACCEPTED
+}
+
+fn run_real_screening() -> Vec<String> {
+    let sats = crate::satellites::fetch_group_positions("stations");
+
+    let mut pairs: Vec<(f64, &str, &str)> = Vec::new();
+    for i in 0..sats.len() {
+        for j in (i + 1)..sats.len() {
+            let (name_a, pos_a) = &sats[i];
+            let (name_b, pos_b) = &sats[j];
+            let dx = pos_a[0] - pos_b[0];
+            let dy = pos_a[1] - pos_b[1];
+            let dz = pos_a[2] - pos_b[2];
+            let distance_km = (dx * dx + dy * dy + dz * dz).sqrt();
+            pairs.push((distance_km, name_a, name_b));
+        }
+    }
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    pairs
+        .into_iter()
+        .take(5)
+        .map(|(distance_km, a, b)| {
+            format!("{a} vs {b} — real distance right now: {distance_km:.1} km")
+        })
+        .collect()
 }

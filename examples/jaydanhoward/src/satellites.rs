@@ -22,6 +22,7 @@ struct RealSat {
     angle_rad: f64,
     angular_velocity_rad_per_sec: f64,
     altitude_km: f64,
+    position_km: [f64; 3],
 }
 
 fn fetch_tle_group(group: &str) -> Result<Vec<(String, String, String)>, String> {
@@ -60,6 +61,22 @@ fn propagate_now(name: &str, line1: &str, line2: &str) -> Option<RealSat> {
         angle_rad: y.atan2(x),
         angular_velocity_rad_per_sec: mean_motion_revs_per_day * std::f64::consts::TAU / 86_400.0,
         altitude_km: distance_from_center - EARTH_RADIUS_KM,
+        position_km: [x, y, z],
+    })
+}
+
+/// Real name + real ECI position (km, right now) for every satellite in a
+/// CelesTrak group — reused by conjunction.rs for real pairwise-distance
+/// screening instead of duplicating the TLE fetch + sgp4 propagation.
+pub fn fetch_group_positions(group: &str) -> Vec<(String, [f64; 3])> {
+    tokio::task::block_in_place(|| {
+        let tles = fetch_tle_group(group).unwrap_or_default();
+        tles.iter()
+            .filter_map(|(name, l1, l2)| {
+                let sat = propagate_now(name, l1, l2)?;
+                Some((name.clone(), sat.position_km))
+            })
+            .collect()
     })
 }
 

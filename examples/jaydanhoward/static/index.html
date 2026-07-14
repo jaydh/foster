@@ -547,18 +547,24 @@
   <main id="conjunction">
     <h1>Conjunction Screening</h1>
     <p>
-      This is the analog of the real site's conjunction screener: a
-      background job that finishes on its own, polled by a widget with
-      nothing to do with Foster. <code>static/screening.js</code> runs its
-      own <code>setInterval</code> against a hand-rolled axum route
-      (<code>GET /api/screening</code>, <code>src/screening.rs</code>) —
-      not a Foster machine at all. The button carries both an
-      <code>fx-on</code> (Foster's own tiny "idle"/"started" machine, just
-      for the button label) and a plain click listener that kicks off the
-      real background job. By this point in the page there are already four
-      other machines' worth of SSE connections open — this section's own
-      Foster machine makes five, sitting right at the six-per-origin
-      HTTP/1.1 limit the framework's README calls out.
+      Real screening, scoped down from the real site's full
+      multi-timestep Hoots-filter/SGP4 screening: <code>src/screening.rs</code>
+      reuses the same real "stations" TLE data as the Satellites section
+      (<code>satellites::fetch_group_positions</code>), propagates every
+      real satellite in that group to its real position right now, and
+      reports the actual closest real pairs by real distance — not a
+      binary conjunction/no-conjunction call, since today's real satellites
+      in this small group are well-separated and forcing a "found!" would
+      mean faking the result. This is a background job that finishes on its
+      own, polled by a widget with nothing to do with Foster
+      (<code>static/screening.js</code>'s own <code>setInterval</code>
+      against <code>GET /api/screening</code>) — Foster only owns the
+      button's idle/started label via a tiny machine, and the button
+      carries both an <code>fx-on</code> and a plain click listener side by
+      side. By this point in the page there are several other machines'
+      worth of SSE connections open, at or past the six-per-origin
+      HTTP/1.1 limit the framework's README calls out (this demo runs
+      through a local Caddy HTTP/2 proxy to stay within it).
     </p>
     <div fx-machine="conjunction" class="screening-box">
       <button id="screening-start" fx-on="click->start_screening">
