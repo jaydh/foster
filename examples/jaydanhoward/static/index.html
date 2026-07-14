@@ -227,6 +227,21 @@
     }
     #cluster-refresh:hover { border-color: var(--accent); color: var(--accent); }
     .cluster-error { color: var(--text-light); font-size: 0.85rem; font-family: ui-monospace, monospace; }
+
+    /* ── visitors ──────────────────────────────────────────── */
+    .visitor-stats { display: flex; gap: 1.5rem; margin: 1rem 0; flex-wrap: wrap; }
+    .visitor-stat { border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.75rem 1.25rem; background: var(--surface); text-align: center; }
+    .visitor-stat-value { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+    .visitor-stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-light); }
+    .visit-row { display: flex; gap: 0.75rem; font-size: 0.8rem; font-family: ui-monospace, monospace; padding: 0.3rem 0; border-bottom: 1px solid var(--border); }
+    .visit-row:last-child { border-bottom: none; }
+    .visit-path { width: 8rem; flex-shrink: 0; }
+    .visit-when { color: var(--text-light); margin-left: auto; }
+    #visitors-refresh {
+      background: var(--surface); color: var(--text); border: 1px solid var(--border);
+      border-radius: 0.375rem; padding: 0.4rem 0.9rem; cursor: pointer; font: inherit; font-size: 0.8rem;
+    }
+    #visitors-refresh:hover { border-color: var(--accent); color: var(--accent); }
   </style>
 </head>
 <body>
@@ -238,6 +253,7 @@
       <a href="#about" data-spy="about">About</a>
       <a href="#trace" data-spy="trace">Request Trace</a>
       <a href="#cluster" data-spy="cluster">Cluster</a>
+      <a href="#visitors" data-spy="visitors">Visitors</a>
       <a href="#satellites" data-spy="satellites">Satellites</a>
       <a href="#conjunction" data-spy="conjunction">Conjunctions</a>
       <a href="#life" data-spy="life">Game of Life</a>
@@ -343,6 +359,50 @@
         </div>
       </div>
     </div><!-- /fx-machine=cluster -->
+  </main>
+
+  <main id="visitors">
+    <h1>Visitors</h1>
+    <p>
+      Real Postgres — <code>src/visitors.rs</code> connects to a real (local,
+      throwaway) Postgres via <code>sqlx::PgPool::connect</code> plus
+      embedded migrations, same schema and connection setup as the real
+      site's <code>db.rs</code>. Every non-static request to this demo is
+      logged by a global axum middleware layer, completely independent of
+      Foster; every row below (including this very page load) is a real
+      accumulated visit, not sample data. One adaptation from production:
+      the real site skips logging private IPs since it's only ever hit
+      publicly — this demo is only ever hit from localhost, so it always
+      logs the row and just skips the geo lookup for private IPs (which
+      can't be geolocated anyway).
+    </p>
+    <div fx-machine="visitors">
+      <button id="visitors-refresh" fx-on="click->refresh">&#8635; Refresh</button>
+      <div class="visitor-stats">
+        <div class="visitor-stat">
+          <div class="visitor-stat-value" fx-text="total_visits">0</div>
+          <div class="visitor-stat-label">total visits</div>
+        </div>
+        <div class="visitor-stat">
+          <div class="visitor-stat-value" fx-text="unique_ips">0</div>
+          <div class="visitor-stat-label">unique IPs</div>
+        </div>
+        <div class="visitor-stat">
+          <div class="visitor-stat-value" fx-text="unique_countries">0</div>
+          <div class="visitor-stat-label">countries</div>
+        </div>
+      </div>
+      <div class="cluster-box" style="max-width: 32rem;">
+        <h3>Recent visits</h3>
+        <div fx-for="recent_visits">
+          <div class="visit-row">
+            <span class="visit-path" fx-field="path"></span>
+            <span fx-field="location"></span>
+            <span class="visit-when" fx-field="minutes_ago"></span>
+          </div>
+        </div>
+      </div>
+    </div><!-- /fx-machine=visitors -->
   </main>
 
   <main id="satellites">

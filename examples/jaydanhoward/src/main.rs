@@ -1,6 +1,7 @@
 mod cluster;
 mod request_trace;
 mod screening;
+mod visitors;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -122,6 +123,30 @@ async fn main() {
         })
         .build();
 
+    // Real visitor logging against a real (local, throwaway) Postgres — see
+    // visitors.rs. Every non-static request gets logged by a global axum
+    // middleware layer (below), independent of Foster entirely; the
+    // "visitors" machine here just displays the accumulated real rows,
+    // same refresh-reducer pattern as "cluster".
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:foster@localhost:5433/jaydanhoward".to_string());
+    let pg_pool = visitors::create_pool(&database_url)
+        .await
+        .expect("Failed to connect to Postgres — is the local dev Postgres running? See migrations/0001_create_visitors.sql");
+
+    let visitors_machine = {
+        let pool_for_reducer = pg_pool.clone();
+        MachineBuilder::new(
+            "visitors",
+            "loaded",
+            visitors::fetch_visitor_stats(&pg_pool),
+        )
+        .on("loaded", "refresh", "loaded", move |_ctx, _payload| {
+            Ok(visitors::fetch_visitor_stats(&pool_for_reducer))
+        })
+        .build()
+    };
+
     let mut machines = HashMap::new();
     machines.insert("theme".to_string(), theme);
     machines.insert("nav".to_string(), nav);
@@ -129,6 +154,7 @@ async fn main() {
     machines.insert("satellites".to_string(), satellites);
     machines.insert("conjunction".to_string(), conjunction);
     machines.insert("cluster".to_string(), cluster);
+    machines.insert("visitors".to_string(), visitors_machine);
 
     let pkg_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pkg");
     let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
@@ -147,7 +173,11 @@ async fn main() {
         .merge(screening_router)
         .merge(trace_router)
         .nest_service("/pkg", ServeDir::new(pkg_dir))
-        .fallback_service(ServeDir::new(static_dir));
+        .fallback_service(ServeDir::new(static_dir))
+        .layer(axum::middleware::from_fn_with_state(
+            pg_pool,
+            visitors::visitor_logger,
+        ));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3009").await.unwrap();
     println!("Foster jaydanhoward → http://localhost:3009");

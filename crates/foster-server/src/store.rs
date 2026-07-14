@@ -142,13 +142,48 @@ impl StateStore for InMemoryStore {
         f: impl FnOnce(Option<Snapshot>) -> Result<Snapshot, String> + Send,
     ) -> Result<Snapshot, String> {
         let key = (session.to_string(), machine.to_string());
-        let next = {
-            let mut map = self.inner.lock().unwrap();
-            let current = map.get(&key).cloned();
-            let next = f(current)?;
-            map.insert(key.clone(), next.clone());
-            next
+
+        // Read the current snapshot, then release the lock *before* calling `f`.
+        //
+        // The previous version held `self.inner`'s std::sync::Mutex across the
+        // entire call to `f` — fine as long as every reducer was a pure,
+        // instant JSON transform, which was true of every machine in this
+        // workspace until reducers started doing real I/O via
+        // `tokio::task::block_in_place` (see examples/jaydanhoward's
+        // cluster/visitors machines). One global `std::sync::Mutex` blocks
+        // *every* session/machine pair, not just this one — so a single slow
+        // reducer stalls every other machine's `/state` and `/transition` on
+        // the whole server. Worse: `block_in_place` needs a free tokio worker
+        // thread to drive the async I/O it's waiting on; if enough other
+        // requests pile up blocked on this same std Mutex, the worker pool
+        // can exhaust entirely and the reducer's own future never gets
+        // polled — a permanent deadlock, not just a slowdown. Reproduced
+        // live: a "refresh" button whose reducer queries Postgres/kube hung
+        // forever with 7 machines' worth of concurrent SSE connections open.
+        //
+        // Releasing the lock during `f` fixes the deadlock; re-checking the
+        // version on write (matching `store()`'s optimistic-lock contract)
+        // keeps the "no other writer can interleave" guarantee — a
+        // concurrent write during a slow reducer is now a detected conflict
+        // instead of a silent clobber.
+        let current = {
+            let map = self.inner.lock().unwrap();
+            map.get(&key).cloned()
         };
+        let before_version = current.as_ref().map(|s| s.version);
+        let next = f(current)?;
+
+        {
+            let mut map = self.inner.lock().unwrap();
+            let actual_version = map.get(&key).map(|s| s.version);
+            if actual_version != before_version {
+                return Err(format!(
+                    "concurrent write to ({session}, {machine}) during reducer: expected version {before_version:?}, found {actual_version:?}"
+                ));
+            }
+            map.insert(key.clone(), next.clone());
+        }
+
         let mut h = self.hist.lock().unwrap();
         let buf = h.entry(key).or_default();
         buf.push_back(next.clone());
@@ -575,5 +610,52 @@ mod tests {
         assert_eq!(history.len(), 3); // seed + two applies
         assert_eq!(history[0].version, 1);
         assert_eq!(history[2].version, 3);
+    }
+
+    // Regression test for a real deadlock found while building a reducer that
+    // does actual I/O (kube/Postgres queries via `block_in_place`, in
+    // examples/jaydanhoward's cluster/visitors machines): `apply()` used to
+    // hold `self.inner`'s std::sync::Mutex across the *entire* call to `f`,
+    // and that mutex is global across every session/machine pair, not
+    // scoped to the one being applied. A slow reducer therefore stalled
+    // every other machine's `load`/`store`/`apply` server-wide, and with
+    // enough concurrent requests piled up on that one lock, the tokio
+    // worker pool could exhaust entirely — a permanent hang, reproduced
+    // live with 7 machines' worth of concurrent SSE connections open.
+    #[tokio::test]
+    async fn slow_reducer_does_not_block_unrelated_operations() {
+        let store = Arc::new(InMemoryStore::default());
+        store.store("s", "slow", &snap(1)).await.unwrap();
+        store.store("s", "other", &snap(1)).await.unwrap();
+
+        let s1 = Arc::clone(&store);
+        let slow_apply = tokio::spawn(async move {
+            s1.apply("s", "slow", |current| {
+                // Simulates a reducer blocking on real I/O (the actual bug
+                // used `block_in_place` + a real kube/Postgres call; a plain
+                // OS-thread sleep reproduces the same "holds the lock for a
+                // while" shape without needing real network/DB access).
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let v = current.map(|s| s.version).unwrap_or(0);
+                Ok(snap(v + 1))
+            })
+            .await
+        });
+
+        // Give the slow apply a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let start = std::time::Instant::now();
+        let other = store.load("s", "other").await;
+        let elapsed = start.elapsed();
+
+        assert!(other.is_some());
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "load() on an unrelated key blocked behind a slow reducer for {elapsed:?} — \
+             the global lock is being held across `f`, the deadlock this test guards against"
+        );
+
+        slow_apply.await.unwrap().unwrap();
     }
 }
