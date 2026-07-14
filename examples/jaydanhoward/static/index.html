@@ -499,13 +499,18 @@
   <main id="satellites">
     <h1>Satellites</h1>
     <p>
-      Heavier version of the same test: dozens of points animating every
-      frame, not a coarse simulation step. <code>static/satellites.js</code>
-      does the orbital math and drawing by hand; Foster owns run/pause and
-      the three ring-visibility toggles below via a fourth independent
-      machine (<code>satellites</code>), and the loop reads all four straight
-      off the DOM — <code>data-fx-state</code> plus three <code>fx-if</code>
-      marker elements, one per ring.
+      Real TLE data from CelesTrak (a plain public GET, confirmed reachable
+      from here — the "CI runner gets 403'd" issue in git history is
+      CI-IP-specific) plus real orbital mechanics via the same
+      <code>sgp4</code> crate the real site uses (<code>src/satellites.rs</code>).
+      Each satellite's real angle-right-now and real angular velocity (from
+      its TLE's mean motion) are computed once at startup/refresh;
+      <code>static/satellites.js</code> reads them off <code>fx-for</code>'s
+      own <code>data-fx-item</code> attribute — the DOM as the integration
+      boundary again, just for structured list data instead of a single
+      value. Real angular velocities are far too slow to watch directly (a
+      GEO satellite's real period is ~24h), so playback runs at 300&times;
+      real speed, same idea as the real site's own speed slider.
     </p>
     <div fx-machine="satellites">
       <canvas id="sat-canvas" width="480" height="480"></canvas>
@@ -515,21 +520,27 @@
           <span fx-show="paused">&#9654; Run</span>
         </button>
         <button fx-on="click->toggle_leo">
-          <span fx-if="show_leo">LEO &#10003;</span>
+          <span fx-if="show_leo">LEO (<span fx-text="leo_count"></span>) &#10003;</span>
           <span fx-if='{"field":"show_leo","op":"eq","value":false}'>LEO &#10007;</span>
         </button>
         <button fx-on="click->toggle_meo">
-          <span fx-if="show_meo">MEO &#10003;</span>
+          <span fx-if="show_meo">MEO (<span fx-text="meo_count"></span>) &#10003;</span>
           <span fx-if='{"field":"show_meo","op":"eq","value":false}'>MEO &#10007;</span>
         </button>
         <button fx-on="click->toggle_geo">
-          <span fx-if="show_geo">GEO &#10003;</span>
+          <span fx-if="show_geo">GEO (<span fx-text="geo_count"></span>) &#10003;</span>
           <span fx-if='{"field":"show_geo","op":"eq","value":false}'>GEO &#10007;</span>
         </button>
+        <button fx-on="click->refresh_tles">&#8635; Refresh TLEs</button>
       </div>
       <span id="flag-leo" fx-if="show_leo" style="display:none;width:0;height:0;overflow:hidden"></span>
       <span id="flag-meo" fx-if="show_meo" style="display:none;width:0;height:0;overflow:hidden"></span>
       <span id="flag-geo" fx-if="show_geo" style="display:none;width:0;height:0;overflow:hidden"></span>
+      <div style="display:none">
+        <div fx-for="leo"><span></span></div>
+        <div fx-for="meo"><span></span></div>
+        <div fx-for="geo"><span></span></div>
+      </div>
     </div><!-- /fx-machine=satellites -->
   </main>
 

@@ -1,6 +1,7 @@
 mod cluster;
 mod lighthouse;
 mod request_trace;
+mod satellites;
 mod screening;
 mod security_audit;
 mod visitors;
@@ -79,21 +80,44 @@ async fn main() {
         }
     }
 
-    let satellites = MachineBuilder::new(
-        "satellites",
-        "running",
-        serde_json::json!({ "show_leo": true, "show_meo": true, "show_geo": true }),
-    )
-    .state("paused")
-    .pass("running", "toggle_run", "paused")
-    .pass("paused", "toggle_run", "running")
-    .on("running", "toggle_leo", "running", toggle_bool("show_leo"))
-    .on("paused", "toggle_leo", "paused", toggle_bool("show_leo"))
-    .on("running", "toggle_meo", "running", toggle_bool("show_meo"))
-    .on("paused", "toggle_meo", "paused", toggle_bool("show_meo"))
-    .on("running", "toggle_geo", "running", toggle_bool("show_geo"))
-    .on("paused", "toggle_geo", "paused", toggle_bool("show_geo"))
-    .build();
+    // Real TLE data from CelesTrak + real orbital mechanics via sgp4 (see
+    // satellites.rs), fetched once at startup — deliberately not a live
+    // per-frame propagation loop (see satellites.rs doc comment for why).
+    // Each satellite's real angle-right-now and real angular velocity
+    // (from the TLE's mean motion) sit in context; static/satellites.js
+    // reads them via fx-for's data-fx-item attribute and extrapolates the
+    // animation client-side from there.
+    let initial_sat_data = satellites::fetch_real_satellites();
+    let mut satellites_ctx = initial_sat_data.clone();
+    satellites_ctx["show_leo"] = serde_json::json!(true);
+    satellites_ctx["show_meo"] = serde_json::json!(true);
+    satellites_ctx["show_geo"] = serde_json::json!(true);
+
+    let satellites = MachineBuilder::new("satellites", "running", satellites_ctx)
+        .state("paused")
+        .pass("running", "toggle_run", "paused")
+        .pass("paused", "toggle_run", "running")
+        .on("running", "toggle_leo", "running", toggle_bool("show_leo"))
+        .on("paused", "toggle_leo", "paused", toggle_bool("show_leo"))
+        .on("running", "toggle_meo", "running", toggle_bool("show_meo"))
+        .on("paused", "toggle_meo", "paused", toggle_bool("show_meo"))
+        .on("running", "toggle_geo", "running", toggle_bool("show_geo"))
+        .on("paused", "toggle_geo", "paused", toggle_bool("show_geo"))
+        .on("running", "refresh_tles", "running", |ctx, _| {
+            let mut fresh = satellites::fetch_real_satellites();
+            fresh["show_leo"] = ctx["show_leo"].clone();
+            fresh["show_meo"] = ctx["show_meo"].clone();
+            fresh["show_geo"] = ctx["show_geo"].clone();
+            Ok(fresh)
+        })
+        .on("paused", "refresh_tles", "paused", |ctx, _| {
+            let mut fresh = satellites::fetch_real_satellites();
+            fresh["show_leo"] = ctx["show_leo"].clone();
+            fresh["show_meo"] = ctx["show_meo"].clone();
+            fresh["show_geo"] = ctx["show_geo"].clone();
+            Ok(fresh)
+        })
+        .build();
 
     // Conjunction-screening analog. Foster's role here is deliberately tiny —
     // just remembering that the button has been clicked at least once, so the
