@@ -305,6 +305,8 @@ All attributes processed client-side by the WASM runtime.
 | `fx-optimistic` | `fx-optimistic="done"` | Instantly render expected state before server confirms (on `fx-on` buttons) |
 | `fx-widget` | `fx-widget="/widgets/life/life_widget.js"` | Lazy-load an ES module (e.g. a wasm-pack `--target web` crate) within 200px of the viewport: `await default()`, then `mount(el)`; inside an `[fx-machine]`, `update(el, state, ctxJson)` gets every snapshot |
 | `fx-on="visible->…"` | `fx-on="visible->load"` | Fire once, the first time the element is ≥10% on screen |
+| `fx-on="enter->…"` | `fx-on="enter->about"` | Fire every time the element crosses the reading line (30–40% down the viewport) — scroll-spy |
+| `fx-on="…->machine:event"` | `fx-on="click->theme:toggle"` | Send the event to another machine on the page (by its `fx-machine` value, e.g. `counter#1:inc`); template validation checks it against that machine |
 | `fx-on="click@outside->…"` | `fx-on="click@outside->close"` | Fire on a click anywhere outside the element (close a dropdown) |
 
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
@@ -395,6 +397,7 @@ No pending items — all planned features are implemented. See "Already implemen
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
 - Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
 - `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
+- `fx-on="enter->…"` (repeating reading-line trigger) and cross-machine `fx-on="…->machine:event"` — `crates/foster-{core,client}/src/`.
 - `fx-widget` — lazy-loaded app modules (WebGL etc.) with `mount`/`update` hooks; `import()` via a wasm-bindgen `inline_js` snippet — `crates/foster-client/src/lib.rs`.
 - `.step()` list-navigation transitions (`LocalReduce::Step`, `step_list`) — `crates/foster-core/src/machine.rs`.
 - Shared machines + `Foster::feed` / `Foster::request_event` — `crates/foster-{core,server}/src/`.

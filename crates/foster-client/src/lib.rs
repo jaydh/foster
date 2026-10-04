@@ -835,12 +835,54 @@ fn apply_fx_fields(root: &Element, item: &Value) {
 
 // ── event delegation ──────────────────────────────────────────────────────────
 
+// ── machine registry (for cross-machine events) ───────────────────────────────
+
+/// Where events for one machine instance on the page go.
+#[derive(Clone)]
+struct Target {
+    root: Element,
+    machine_id: String,
+    session_id: String,
+    cache_key: String,
+}
+
+thread_local! {
+    /// Instances by their `fx-machine` attribute value (`"theme"`, `"counter#1"`).
+    static TARGETS: RefCell<HashMap<String, Target>> = RefCell::new(HashMap::new());
+}
+
+fn register_target(raw_attr: &str, t: Target) {
+    TARGETS.with(|m| { m.borrow_mut().insert(raw_attr.to_string(), t); });
+}
+
+/// Fire `machine_event` from a trigger on `fx_on_el` (owned by `own`).
+/// `other:event` — or `other#1:event` for an instance — goes to that machine
+/// instead, so a control can sit inside a different machine's subtree.
+fn fire_spec(document: &Document, own: &Target, fx_on_el: &Element, machine_event: String) {
+    match machine_event.split_once(':') {
+        Some((attr, event)) => {
+            let Some(t) = TARGETS.with(|m| m.borrow().get(attr).cloned()) else {
+                web_sys::console::error_1(&format!("foster: no [fx-machine=\"{attr}\"] for {machine_event}").into());
+                return;
+            };
+            fire(document, &t.root, fx_on_el, &t.machine_id, &t.session_id, &t.cache_key, event.to_string());
+        }
+        None => fire(document, &own.root, fx_on_el, &own.machine_id, &own.session_id, &own.cache_key, machine_event),
+    }
+}
+
 /// Wire up everything that fires events on `root`'s machine: delegated DOM
 /// events (`fx-on="click->x"`), `fx-on="visible->x"` and `fx-on="click@outside->x"`.
 fn attach_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
-    attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone(), cache_key.clone());
-    attach_visible_triggers(document.clone(), root.clone(), machine_id.clone(), session_id.clone(), cache_key.clone());
-    attach_outside_triggers(document, root, machine_id, session_id, cache_key);
+    let own = Target { root, machine_id, session_id, cache_key };
+    if let Some(attr) = own.root.get_attribute("fx-machine") {
+        register_target(&attr, own.clone());
+    }
+    attach_delegating_listener(document.clone(), own.clone());
+    attach_visible_triggers(document.clone(), own.clone(), "visible", None, true);
+    // Reading-line band (30–40% down the viewport): scroll-spy style.
+    attach_visible_triggers(document.clone(), own.clone(), "enter", Some("-30% 0px -60% 0px"), false);
+    attach_outside_triggers(document, own);
 }
 
 /// Parse `fx-on="dom_event->machine_event"`.
@@ -899,7 +941,8 @@ fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &st
     });
 }
 
-fn attach_delegating_listener(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
+fn attach_delegating_listener(document: Document, own: Target) {
+    let root = own.root.clone();
     let root_for_listener = root.clone();
     let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
         let root = &root_for_listener;
@@ -919,7 +962,7 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
         let Some((dom_event, machine_event)) = parse_fx_on(&fx_on_el) else { return };
         if event.type_() != dom_event { return; }
 
-        fire(&document, root, &fx_on_el, &machine_id, &session_id, &cache_key, machine_event);
+        fire_spec(&document, &own, &fx_on_el, machine_event);
     });
 
     // Register for click, change (select/input blur), and input (live text) so
@@ -930,13 +973,15 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
     cb.forget();
 }
 
-/// `fx-on="visible->event"` — fire once, the first time the element is at
-/// least 10% on screen. For deferring work until it's needed (load a heavy
-/// embed, start an animation) without hand-written IntersectionObserver JS.
-fn attach_visible_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
-    let els: Vec<Element> = self_and_descendants(&root, "[fx-on]")
+/// Viewport triggers:
+/// - `fx-on="visible->event"` — fires once, the first time the element is at
+///   least 10% on screen (load a heavy embed, start an animation);
+/// - `fx-on="enter->event"` — fires every time the element enters the
+///   reading line (30–40% down the viewport), e.g. scroll-spy.
+fn attach_visible_triggers(document: Document, own: Target, trigger: &'static str, root_margin: Option<&str>, once: bool) {
+    let els: Vec<Element> = self_and_descendants(&own.root, "[fx-on]")
         .into_iter()
-        .filter(|el| matches!(parse_fx_on(el), Some((d, _)) if d == "visible"))
+        .filter(|el| matches!(parse_fx_on(el), Some((d, _)) if d == trigger))
         .collect();
     if els.is_empty() { return; }
 
@@ -946,15 +991,20 @@ fn attach_visible_triggers(document: Document, root: Element, machine_id: String
                 let entry: web_sys::IntersectionObserverEntry = entry.unchecked_into();
                 if !entry.is_intersecting() { continue; }
                 let el = entry.target();
-                observer.unobserve(&el);
+                if once {
+                    observer.unobserve(&el);
+                }
                 if let Some((_, machine_event)) = parse_fx_on(&el) {
-                    fire(&document, &root, &el, &machine_id, &session_id, &cache_key, machine_event);
+                    fire_spec(&document, &own, &el, machine_event);
                 }
             }
         },
     );
     let opts = web_sys::IntersectionObserverInit::new();
-    opts.set_threshold(&JsValue::from_f64(0.1));
+    match root_margin {
+        Some(m) => opts.set_root_margin(m),
+        None => opts.set_threshold(&JsValue::from_f64(0.1)),
+    }
     let observer = web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &opts).unwrap();
     for el in &els { observer.observe(el); }
     cb.forget();
@@ -963,8 +1013,8 @@ fn attach_visible_triggers(document: Document, root: Element, machine_id: String
 /// `fx-on="click@outside->event"` — fire when a `click` lands anywhere outside
 /// the element (closing a dropdown/popover). Listens on the document, since by
 /// definition the click isn't inside `root`.
-fn attach_outside_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
-    let specs: Vec<(Element, String, String)> = self_and_descendants(&root, "[fx-on]")
+fn attach_outside_triggers(document: Document, own: Target) {
+    let specs: Vec<(Element, String, String)> = self_and_descendants(&own.root, "[fx-on]")
         .into_iter()
         .filter_map(|el| {
             let (dom, machine_event) = parse_fx_on(&el)?;
@@ -980,7 +1030,7 @@ fn attach_outside_triggers(document: Document, root: Element, machine_id: String
         let Ok(target_node): Result<web_sys::Node, _> = target.dyn_into() else { return };
         for (el, dom_event, machine_event) in &specs {
             if event.type_() == *dom_event && !el.contains(Some(&target_node)) {
-                fire(&doc_for_listener, &root, el, &machine_id, &session_id, &cache_key, machine_event.clone());
+                fire_spec(&doc_for_listener, &own, el, machine_event.clone());
             }
         }
     });

@@ -273,12 +273,29 @@ impl Machine {
             for val in extract_attr_values(subtree, "fx-on") {
                 if let Some(event) = val.splitn(2, "->").nth(1) {
                     let event = event.trim();
+                    // `->other:event` targets another machine; checked there (below).
+                    if event.contains(':') {
+                        continue;
+                    }
                     if !event.is_empty() && !valid_events.contains(event) {
                         errors.push(format!(
                             "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
                             self.id
                         ));
                     }
+                }
+            }
+        }
+
+        // Cross-machine events anywhere on the page aimed at this machine.
+        let prefix = format!("{}:", self.id);
+        for val in extract_attr_values(html, "fx-on") {
+            if let Some(event) = val.splitn(2, "->").nth(1).and_then(|e| e.trim().strip_prefix(&prefix)) {
+                if !valid_events.contains(event) {
+                    errors.push(format!(
+                        "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
+                        self.id
+                    ));
                 }
             }
         }
@@ -1364,5 +1381,17 @@ mod tests {
         let (_, lctx) = local.send("viewing", json!({"photos": [{"url": "a"}, {"url": "b"}], "index": 1}), "next", json!(null)).unwrap();
         assert_eq!(s.context, lctx);
         assert_eq!(lctx["url"], "a");
+    }
+
+    #[test]
+    fn cross_machine_events_validated_against_target() {
+        let page = r#"<html fx-machine="theme"><div fx-machine="spy"><button fx-on="click->theme:toggle">t</button><main fx-on="enter->about"></main></div></html>"#;
+        let theme = MachineBuilder::new("theme", "light", json!({})).pass("light", "toggle", "dark").build();
+        let spy = MachineBuilder::new("spy", "about", json!({})).pass("about", "about", "about").build();
+        assert!(theme.validate_in(page).is_ok());
+        assert!(spy.validate_in(page).is_ok(), "spy doesn't own theme:toggle");
+        let bad = page.replace("theme:toggle", "theme:nope");
+        let errs = theme.validate_in(&bad).unwrap_err();
+        assert!(errs[0].contains("'nope'"), "{errs:?}");
     }
 }
