@@ -131,6 +131,8 @@ pub struct Machine {
     pub local: bool,
     /// Local machine whose state survives reloads via `localStorage`.
     pub persist: bool,
+    /// One server-side instance for every visitor (the session is ignored). See `MachineBuilder::shared`.
+    pub shared: bool,
 }
 
 impl Machine {
@@ -442,6 +444,7 @@ pub struct MachineBuilder {
     template: Option<String>,
     local: bool,
     persist: bool,
+    shared: bool,
 }
 
 impl MachineBuilder {
@@ -462,6 +465,7 @@ impl MachineBuilder {
             template: None,
             local: false,
             persist: false,
+            shared: false,
         }
     }
 
@@ -508,6 +512,15 @@ impl MachineBuilder {
     pub fn persist(mut self) -> Self {
         self.local = true;
         self.persist = true;
+        self
+    }
+
+    /// One server-side instance shared by every visitor: the server ignores the
+    /// session for this machine, so a transition (or a `foster_server` feed
+    /// update) is pushed to everyone watching. For data that really is global
+    /// — a live metrics panel, a background job's status.
+    pub fn shared(mut self) -> Self {
+        self.shared = true;
         self
     }
 
@@ -592,6 +605,11 @@ impl MachineBuilder {
     /// For a `.local()` machine with a Rust-reducer edge (`.on()` / `.typed_on()`)
     /// or a `.schema()` — neither can run in the browser.
     pub fn build(mut self) -> Arc<Machine> {
+        assert!(
+            !(self.local && self.shared),
+            "machine '{}': .local() and .shared() are mutually exclusive",
+            self.id,
+        );
         if self.local {
             for (from, events) in &self.states {
                 for (event, def) in events {
@@ -625,6 +643,7 @@ impl MachineBuilder {
             template: self.template,
             local: self.local,
             persist: self.persist,
+            shared: self.shared,
         })
     }
 }
@@ -1265,5 +1284,11 @@ mod tests {
     #[should_panic(expected = ".schema() isn't supported")]
     fn local_build_rejects_schemas() {
         lightbox().schema("open", json!({"type": "object"})).local().build();
+    }
+
+    #[test]
+    #[should_panic(expected = "mutually exclusive")]
+    fn local_and_shared_rejected() {
+        lightbox().local().shared().build();
     }
 }

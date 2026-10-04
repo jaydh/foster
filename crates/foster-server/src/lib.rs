@@ -5,19 +5,27 @@ pub use store::{RedisStore, RedisPubSub};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{ConnectInfo, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use axum::extract::DefaultBodyLimit;
-use foster_core::{Machine, MachineInstance, Snapshot};
-use futures_util::StreamExt;
+use foster_core::{merge_shallow, Machine, MachineInstance, Snapshot};
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+use futures_util::{FutureExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::watch;
+
+/// Session key every `.shared()` machine is stored and broadcast under.
+const SHARED_SESSION: &str = "__shared__";
 
 // ── state ─────────────────────────────────────────────────────────────────────
 
@@ -31,6 +39,165 @@ where
     store: S,
     pubsub: P,
     test_mode: bool,
+    /// `.shared()` machine id → number of open `/events` streams, so feeds can
+    /// pause while nobody is watching.
+    watchers: Arc<HashMap<String, watch::Sender<usize>>>,
+    request_events: Arc<HashMap<String, RequestEvent>>,
+}
+
+impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
+    /// The store/pubsub session for `machine`: [`SHARED_SESSION`] for `.shared()`
+    /// machines (one instance for everyone), the caller's session otherwise.
+    fn session<'a>(&self, machine: &str, requested: &'a str) -> &'a str {
+        if self.watchers.contains_key(machine) { SHARED_SESSION } else { requested }
+    }
+
+    /// Fire `event` on `(session, machine_id)` atomically and broadcast the result.
+    async fn fire(&self, session: &str, machine_id: &str, event: &str, payload: Value) -> Result<Snapshot, String> {
+        let machine = self
+            .machines
+            .get(machine_id)
+            .cloned()
+            .ok_or_else(|| format!("machine '{machine_id}' not found"))?;
+        let event_owned = event.to_string();
+        let snap = self
+            .store
+            .apply(session, machine_id, move |current| {
+                let mut inst = MachineInstance::new(machine);
+                if let Some(snap) = current {
+                    inst.restore(snap).map_err(|e| e.to_string())?;
+                }
+                inst.send(&event_owned, payload).map_err(|e| e.to_string())
+            })
+            .await?;
+        self.pubsub.publish(session, machine_id, snap.clone()).await;
+        Ok(snap)
+    }
+}
+
+// ── request events & feeds ────────────────────────────────────────────────────
+
+/// What a request-event handler gets to look at: the HTTP request behind a
+/// `GET /state` or `POST /transition` (headers + peer address, when the app is
+/// served with `into_make_service_with_connect_info::<SocketAddr>()`).
+#[derive(Clone, Debug)]
+pub struct RequestInfo {
+    pub headers: HeaderMap,
+    pub remote_addr: Option<SocketAddr>,
+}
+
+type RequestFn = Arc<dyn Fn(RequestInfo) -> BoxFuture<'static, Value> + Send + Sync>;
+
+#[derive(Clone)]
+struct RequestEvent {
+    event: String,
+    handler: RequestFn,
+}
+
+struct Feed {
+    machine: String,
+    event: String,
+    stream: BoxStream<'static, Value>,
+}
+
+/// Builder for the Foster router when you need more than [`router`]: server-side
+/// [feeds](Foster::feed) and [request events](Foster::request_event).
+///
+/// ```ignore
+/// let app = foster_server::Foster::new(machines)
+///     .feed("cluster", "tick", cluster_snapshots)        // Stream<Item = Value>
+///     .request_event("trace", "trace", |req| async move { trace_of(req).await })
+///     .router();
+/// ```
+pub struct Foster {
+    machines: HashMap<String, Arc<Machine>>,
+    feeds: Vec<Feed>,
+    request_events: HashMap<String, RequestEvent>,
+}
+
+impl Foster {
+    pub fn new(machines: HashMap<String, Arc<Machine>>) -> Self {
+        Self { machines, feeds: Vec::new(), request_events: HashMap::new() }
+    }
+
+    /// Drive a `.shared()` machine from server-side data: each item `stream`
+    /// yields is sent to the machine as `event` with the item as payload (so it
+    /// goes through the machine's reducer and schema like any transition), then
+    /// pushed to every viewer.
+    ///
+    /// The stream is only polled while at least one client has the machine's
+    /// `/events` stream open — a polling stream (`IntervalStream` + `then`)
+    /// does no work while nobody is looking.
+    ///
+    /// # Panics
+    /// When `router()` is built: if `machine` isn't `.shared()` or never handles
+    /// `event`. Requires a Tokio runtime (the feed runs as a spawned task).
+    pub fn feed<St>(mut self, machine: &str, event: &str, stream: St) -> Self
+    where
+        St: Stream<Item = Value> + Send + 'static,
+    {
+        self.feeds.push(Feed { machine: machine.into(), event: event.into(), stream: stream.boxed() });
+        self
+    }
+
+    /// Feed request-derived data into a (per-session) machine. `handler`'s
+    /// result is shallow-merged into the payload of `event`, and:
+    /// - every `GET /state` for `machine` fires `event` first, so each page load
+    ///   renders fresh request data;
+    /// - a client-sent `event` (e.g. a refresh button) gets it too.
+    pub fn request_event<F, Fut>(mut self, machine: &str, event: &str, handler: F) -> Self
+    where
+        F: Fn(RequestInfo) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Value> + Send + 'static,
+    {
+        let handler: RequestFn = Arc::new(move |req| handler(req).boxed());
+        self.request_events.insert(machine.into(), RequestEvent { event: event.into(), handler });
+        self
+    }
+
+    /// Router with in-memory store and pubsub.
+    pub fn router(self) -> Router {
+        self.router_with(InMemoryStore::default(), InMemoryPubSub::default())
+    }
+
+    /// Router with explicit backends — see [`router_with`].
+    pub fn router_with<S, P>(self, store: S, pubsub: P) -> Router
+    where
+        S: StateStore + Clone + 'static,
+        P: PubSub + Clone + 'static,
+    {
+        build_router(self, store, pubsub)
+    }
+}
+
+/// Run one feed: wait for a watcher, pull the next item, fire it; repeat.
+fn spawn_feed<S, P>(app: AppState<S, P>, feed: Feed)
+where
+    S: StateStore + Clone + 'static,
+    P: PubSub + Clone + 'static,
+{
+    let mut watchers = app.watchers[&feed.machine].subscribe();
+    let Feed { machine, event, mut stream } = feed;
+    tokio::spawn(async move {
+        loop {
+            if watchers.wait_for(|n| *n > 0).await.is_err() {
+                return;
+            }
+            let Some(payload) = stream.next().await else { return };
+            if let Err(e) = app.fire(SHARED_SESSION, &machine, &event, payload).await {
+                eprintln!("foster: feed '{machine}' -[{event}]-> failed: {e}");
+            }
+        }
+    });
+}
+
+/// Decrements a shared machine's watcher count when an `/events` stream closes.
+struct WatchGuard(watch::Sender<usize>);
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
 }
 
 // ── router ────────────────────────────────────────────────────────────────────
@@ -41,7 +208,7 @@ where
 /// [`StateStore`] and [`PubSub`] implementations so all replicas share state and
 /// broadcast transitions across processes.
 pub fn router(machines: HashMap<String, Arc<Machine>>) -> Router {
-    router_with(machines, InMemoryStore::default(), InMemoryPubSub::default())
+    Foster::new(machines).router()
 }
 
 /// Build the Foster API router with explicit store and pubsub backends.
@@ -78,6 +245,15 @@ where
     S: StateStore + Clone + 'static,
     P: PubSub + Clone + 'static,
 {
+    Foster::new(machines).router_with(store, pubsub)
+}
+
+fn build_router<S, P>(foster: Foster, store: S, pubsub: P) -> Router
+where
+    S: StateStore + Clone + 'static,
+    P: PubSub + Clone + 'static,
+{
+    let Foster { machines, feeds, request_events } = foster;
     // Collect template HTML and machine metadata before machines are moved into AppState.
     // Only one machine needs `.template(...)` set — the whole page is shared, and each
     // machine below validates only its own `[fx-machine="{id}"]` subtree(s) within it.
@@ -133,12 +309,42 @@ where
         ))
     } else { None };
 
+    for feed in &feeds {
+        let m = machines.get(&feed.machine).unwrap_or_else(|| {
+            panic!("feed: machine '{}' not found (or it's .local())", feed.machine)
+        });
+        assert!(m.shared, "feed: machine '{}' must be .shared()", feed.machine);
+        assert!(
+            m.transitions().iter().any(|(_, ev, _)| *ev == feed.event),
+            "feed: machine '{}' has no '{}' transition", feed.machine, feed.event,
+        );
+    }
+    for (id, re) in &request_events {
+        let m = machines.get(id).unwrap_or_else(|| panic!("request_event: machine '{id}' not found"));
+        assert!(
+            m.transitions().iter().any(|(_, ev, _)| *ev == re.event),
+            "request_event: machine '{id}' has no '{}' transition", re.event,
+        );
+    }
+
+    let watchers = machines
+        .iter()
+        .filter(|(_, m)| m.shared)
+        .map(|(id, _)| (id.clone(), watch::channel(0usize).0))
+        .collect();
+
     let app = AppState {
         machines: Arc::new(machines),
         store,
         pubsub,
         test_mode,
+        watchers: Arc::new(watchers),
+        request_events: Arc::new(request_events),
     };
+
+    for feed in feeds {
+        spawn_feed(app.clone(), feed);
+    }
 
     let mut router = Router::new()
         .route("/state", get(get_state::<S, P>))
@@ -230,6 +436,8 @@ struct TransitionRequest {
 async fn get_state<S, P>(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState<S, P>>,
+    headers: HeaderMap,
+    connect: Option<ConnectInfo<SocketAddr>>,
 ) -> Response
 where
     S: StateStore + Clone,
@@ -238,7 +446,18 @@ where
     let Some(machine) = app.machines.get(&q.machine).cloned() else {
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine));
     };
-    let snap = match app.store.load(q.session_id(), &q.machine).await {
+    let session = app.session(&q.machine, q.session_id());
+
+    // Request events refresh on every load — see `Foster::request_event`.
+    if let Some(re) = app.request_events.get(&q.machine).cloned() {
+        let payload = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0) }).await;
+        return match app.fire(session, &q.machine, &re.event, payload).await {
+            Ok(snap) => msgpack(&snap),
+            Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
+        };
+    }
+
+    let snap = match app.store.load(session, &q.machine).await {
         Some(s) => s,
         None => MachineInstance::new(machine).snapshot(),
     };
@@ -247,6 +466,8 @@ where
 
 async fn post_transition<S, P>(
     State(app): State<AppState<S, P>>,
+    headers: HeaderMap,
+    connect: Option<ConnectInfo<SocketAddr>>,
     body: Bytes,
 ) -> Response
 where
@@ -258,29 +479,21 @@ where
         Err(e) => return msgpack_err(StatusCode::BAD_REQUEST, e.to_string()),
     };
 
-    let session_id = if req.session.is_empty() { "default".to_string() } else { req.session };
-    let Some(machine) = app.machines.get(&req.machine).cloned() else {
+    let requested = if req.session.is_empty() { "default" } else { req.session.as_str() };
+    if !app.machines.contains_key(&req.machine) {
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", req.machine));
-    };
+    }
+    let session = app.session(&req.machine, requested).to_string();
 
-    let result = app.store.apply(&session_id, &req.machine, move |current| {
-        let mut inst = match current {
-            Some(snap) => {
-                let mut i = MachineInstance::new(machine);
-                i.restore(snap).map_err(|e| e.to_string())?;
-                i
-            }
-            None => MachineInstance::new(machine),
-        };
-        inst.send(&req.event, req.payload).map_err(|e| e.to_string())
-    }).await;
+    let mut payload = req.payload;
+    if let Some(re) = app.request_events.get(&req.machine).filter(|re| re.event == req.event).cloned() {
+        let extra = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0) }).await;
+        payload = merge_shallow(payload, extra);
+    }
 
-    match result {
+    match app.fire(&session, &req.machine, &req.event, payload).await {
+        Ok(snap) => msgpack(&snap),
         Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
-        Ok(snap) => {
-            app.pubsub.publish(&session_id, &req.machine, snap.clone()).await;
-            msgpack(&snap)
-        }
     }
 }
 
@@ -295,46 +508,90 @@ struct ContextPatch {
     patch: json_patch::Patch,
 }
 
-/// Server-Sent Events stream — one channel per (session_id, machine_id).
+/// `GET /events` query: either one `machine` (+ `session`), or `subs` — a
+/// comma-separated list of `machine@session` pairs multiplexed onto one
+/// stream. Browsers cap HTTP/1.1 at 6 connections per host, so one SSE stream
+/// per machine starves every other request once a page has a handful of
+/// machines; the client sends all of its subscriptions here instead.
+#[derive(Deserialize)]
+struct EventsQuery {
+    machine: Option<String>,
+    #[serde(default)]
+    session: String,
+    subs: Option<String>,
+}
+
+/// Server-Sent Events stream for one or more `(machine, session)` pairs.
 ///
-/// The first event on each connection is a named `snapshot` (full state).
-/// Subsequent events are named `patch` (RFC 6902 JSON Patch of just the context),
-/// which reduces wire payload for large context objects (e.g. kanban task lists).
+/// Per subscription, the first event is a named `snapshot` (full state) and
+/// later ones are `patch` (RFC 6902 JSON Patch of just the context), which
+/// keeps large contexts cheap. Every event's JSON carries `"sub"` — the
+/// `machine@session` it belongs to, as requested — so a multiplexed client can
+/// route it.
 async fn get_events<S, P>(
-    Query(q): Query<MachineQuery>,
+    Query(q): Query<EventsQuery>,
     State(app): State<AppState<S, P>>,
-) -> impl IntoResponse
+) -> Response
 where
     S: StateStore + Clone,
     P: PubSub + Clone,
 {
-    let stream = app.pubsub.subscribe(q.session_id(), &q.machine);
-    let mut prev: Option<Snapshot> = None;
-    let sse_stream = stream.map(move |snap| {
-        let event = match prev.take() {
-            None => Event::default()
-                .event("snapshot")
-                .json_data(&snap)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+    let requested: Vec<(String, String)> = match (&q.subs, &q.machine) {
+        (Some(subs), _) => subs
+            .split(',')
+            .filter_map(|sub| {
+                let (m, sid) = sub.split_once('@')?;
+                Some((m.to_string(), if sid.is_empty() { "default".into() } else { sid.to_string() }))
+            })
+            .collect(),
+        (None, Some(m)) => {
+            let sid = if q.session.is_empty() { "default".to_string() } else { q.session.clone() };
+            vec![(m.clone(), sid)]
+        }
+        (None, None) => return (StatusCode::BAD_REQUEST, "machine or subs required").into_response(),
+    };
+
+    let mut guards = Vec::new();
+    let mut streams = Vec::new();
+    for (machine, sid) in requested {
+        if !app.machines.contains_key(&machine) {
+            continue;
+        }
+        let sub = format!("{machine}@{sid}");
+        let session = app.session(&machine, &sid);
+        // Count this stream as a watcher of a shared machine (wakes its
+        // feed) for as long as it's open: the guards drop with the stream.
+        if let Some(tx) = app.watchers.get(&machine) {
+            tx.send_modify(|n| *n += 1);
+            guards.push(WatchGuard(tx.clone()));
+        }
+        streams.push(app.pubsub.subscribe(session, &machine).map(move |snap| (sub.clone(), snap)).boxed());
+    }
+
+    let mut prev: HashMap<String, Snapshot> = HashMap::new();
+    let sse_stream = futures_util::stream::select_all(streams).map(move |(sub, snap)| {
+        let _keep_alive = &guards;
+        let (name, mut data) = match prev.get(&sub) {
+            None => ("snapshot", serde_json::to_value(&snap).unwrap_or_default()),
             Some(p) => {
-                let patch = json_patch::diff(&p.context, &snap.context);
                 let msg = ContextPatch {
                     machine_id: snap.machine_id.clone(),
                     state: snap.state.clone(),
                     version: snap.version,
                     last_event: snap.last_event.clone(),
-                    patch,
+                    patch: json_patch::diff(&p.context, &snap.context),
                 };
-                Event::default()
-                    .event("patch")
-                    .json_data(&msg)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+                ("patch", serde_json::to_value(&msg).unwrap_or_default())
             }
         };
-        prev = Some(snap);
-        event
+        data["sub"] = Value::String(sub.clone());
+        prev.insert(sub, snap);
+        Event::default()
+            .event(name)
+            .json_data(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     });
-    Sse::new(sse_stream).keep_alive(KeepAlive::default())
+    Sse::new(sse_stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// Debug: return the snapshot history ring buffer for a `(session, machine)` pair.
@@ -351,7 +608,7 @@ where
     if !app.test_mode {
         return (StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable").into_response();
     }
-    let history = app.store.history(q.session_id(), &q.machine).await;
+    let history = app.store.history(app.session(&q.machine, q.session_id()), &q.machine).await;
     Json(history).into_response()
 }
 
@@ -388,7 +645,7 @@ where
         return Err((StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
     }
 
-    let session_id = q.session_id().to_string();
+    let session_id = app.session(&q.machine, q.session_id()).to_string();
 
     let Some(machine) = app.machines.get(&q.machine).cloned() else {
         return Err((StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine)));
@@ -1098,8 +1355,8 @@ where
         return Err((StatusCode::FORBIDDEN, "test endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
     }
 
-    let session_id = q.session_id().to_string();
     let machine_id = snap.machine_id.clone();
+    let session_id = app.session(&machine_id, q.session_id()).to_string();
 
     let Some(machine) = app.machines.get(&machine_id).cloned() else {
         return Err((StatusCode::NOT_FOUND, format!("machine '{machine_id}' not found")));
@@ -1244,6 +1501,133 @@ mod tests {
         let status = resp.status();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    // ── shared machines, feeds, request events ─────────────────────────────────
+
+    fn live() -> MachineBuilder {
+        MachineBuilder::new("live", "waiting", json!({}))
+            .merge("waiting", "tick", "live")
+            .merge("live", "tick", "live")
+    }
+
+    async fn state_of(app: &Router, uri: &str) -> Snapshot {
+        let resp = app.clone().oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    async fn transition(app: &Router, machine: &str, event: &str, session: &str) -> Snapshot {
+        let body = rmp_serde::to_vec_named(&json!({"machine": machine, "event": event, "payload": null, "session": session})).unwrap();
+        let resp = app.clone()
+            .oneshot(Request::builder().method("POST").uri("/transition").body(Body::from(body)).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_machine_is_one_instance_for_all_sessions() {
+        let app = router(HashMap::from([("live".to_string(), live().shared().build())]));
+        transition(&app, "live", "tick", "alice").await;
+        assert_eq!(state_of(&app, "/state?machine=live&session=bob").await.state, "live");
+    }
+
+    #[tokio::test]
+    async fn feed_runs_only_while_watched() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) });
+        let app = Foster::new(HashMap::from([("live".to_string(), live().shared().build())]))
+            .feed("live", "tick", stream)
+            .router();
+
+        tx.send(json!({"n": 1})).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Nobody watching: the feed hasn't pulled the item.
+        assert_eq!(state_of(&app, "/state?machine=live").await.state, "waiting");
+
+        // Open an /events stream (held by `_sse`) — the feed wakes up.
+        let _sse = app.clone()
+            .oneshot(Request::builder().uri("/events?machine=live&session=x").body(Body::empty()).unwrap())
+            .await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let snap = state_of(&app, "/state?machine=live&session=anyone").await;
+        assert_eq!((snap.state.as_str(), snap.context["n"].as_i64()), ("live", Some(1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be .shared()")]
+    fn feed_requires_shared_machine() {
+        let _ = Foster::new(HashMap::from([("live".to_string(), live().build())]))
+            .feed("live", "tick", futures_util::stream::empty())
+            .router();
+    }
+
+    #[test]
+    #[should_panic(expected = "has no 'nope' transition")]
+    fn feed_requires_known_event() {
+        let _ = Foster::new(HashMap::from([("live".to_string(), live().shared().build())]))
+            .feed("live", "nope", futures_util::stream::empty())
+            .router();
+    }
+
+    #[tokio::test]
+    async fn events_multiplexes_subscriptions() {
+        let machines = HashMap::from([
+            ("counter".to_string(), two_state_machine()),
+            ("live".to_string(), live().shared().build()),
+        ]);
+        let app = router(machines);
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/events?subs=counter@s1,live@s1,nope@s1").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+
+        transition(&app, "live", "tick", "someone-else").await; // shared: reaches s1 too
+        transition(&app, "counter", "increment", "s1").await;
+
+        let mut text = String::new();
+        while !(text.contains(r#""sub":"live@s1""#) && text.contains(r#""sub":"counter@s1""#)) {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+                .await.expect("event within 2s").unwrap().unwrap();
+            if let Some(data) = frame.data_ref() { text.push_str(&String::from_utf8_lossy(data)); }
+        }
+        assert!(text.contains("event: snapshot"));
+    }
+
+    fn traced() -> Router {
+        let m = MachineBuilder::new("trace", "pending", json!({}))
+            .merge("pending", "trace", "traced")
+            .merge("traced", "trace", "traced")
+            .build();
+        Foster::new(HashMap::from([("trace".to_string(), m)]))
+            .request_event("trace", "trace", |req: RequestInfo| async move {
+                let ua = req.headers.get("user-agent").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                json!({ "ua": ua })
+            })
+            .router()
+    }
+
+    #[tokio::test]
+    async fn request_event_fires_on_every_state_load() {
+        let app = traced();
+        let req = || Request::builder().uri("/state?machine=trace&session=s").header("user-agent", "probe/1").body(Body::empty()).unwrap();
+        let first: Snapshot = rmp_serde::from_slice(&app.clone().oneshot(req()).await.unwrap().into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!((first.state.as_str(), first.context["ua"].as_str()), ("traced", Some("probe/1")));
+        let second: Snapshot = rmp_serde::from_slice(&app.clone().oneshot(req()).await.unwrap().into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert!(second.version > first.version, "fresh trace on each load");
+    }
+
+    #[tokio::test]
+    async fn request_event_payload_merged_into_client_event() {
+        let app = traced();
+        let body = rmp_serde::to_vec_named(&json!({"machine": "trace", "event": "trace", "payload": {"keep": 1}, "session": "s"})).unwrap();
+        let resp = app.clone()
+            .oneshot(Request::builder().method("POST").uri("/transition").header("user-agent", "btn/2").body(Body::from(body)).unwrap())
+            .await.unwrap();
+        let snap: Snapshot = rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(snap.context, json!({"keep": 1, "ua": "btn/2"}));
     }
 
     #[tokio::test]

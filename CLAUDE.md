@@ -112,6 +112,29 @@ MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
 | `.typed_on(from, event, to, reducer)` | Reducer works with a typed struct — no `json!` unwrapping |
 | `.merge(from, event, to)` | Shallow-merge the event payload's top-level keys into context |
 
+### Shared machines, feeds, request events
+
+`.shared()` — one server-side instance for every visitor (the session is
+ignored), for genuinely global data. Server code drives it with a feed, and
+per-visitor request data comes in through request events, both via the
+`foster_server::Foster` builder:
+
+```rust
+let app = foster_server::Foster::new(machines)
+    // each item → event "tick" (payload = item) on the shared "cluster" machine
+    .feed("cluster", "tick", interval_stream.then(|_| fetch_view()))
+    // every GET /state (and client "trace" event) gets handler output merged into the payload
+    .request_event("request_trace", "trace", |req: RequestInfo| async move { view(&req.headers) })
+    .router();
+```
+
+- Feed items go through the machine's reducer/schema like any transition.
+- A feed's stream is only polled while someone has the machine's `/events`
+  open — a polling stream does no work with no viewers. Panics at build if the
+  machine isn't `.shared()` or never handles the event.
+- `RequestInfo { headers, remote_addr }` (`remote_addr` needs
+  `into_make_service_with_connect_info::<SocketAddr>()`).
+
 ### Local (client-only) machines
 
 `.local()` runs a machine in the browser instead of on the server — for
@@ -225,7 +248,8 @@ Inlined — no external dependencies, compiles to WASM.
 |--------|------|--------|---------|
 | GET | `/state?machine=<id>&session=<sid>` | MessagePack | Current snapshot |
 | POST | `/transition` | MessagePack in/out | Fire event, get new snapshot |
-| GET | `/events?machine=<id>&session=<sid>` | SSE (JSON) | Push stream |
+| GET | `/events?machine=<id>&session=<sid>` | SSE (JSON) | Push stream for one machine |
+| GET | `/events?subs=<id>@<sid>,<id>@<sid>` | SSE (JSON) | Multiplexed push stream (what the client uses); each event's JSON has `"sub"` |
 | POST | `/test/state?session=<sid>` | JSON in/out | Inject snapshot (debug only) |
 | GET | `/debug/history?machine=<id>&session=<sid>` | JSON | History ring buffer — up to 50 snapshots, oldest first (debug only) |
 | POST | `/debug/rewind?machine=<id>&session=<sid>&version=N` | JSON | Restore a historical snapshot and broadcast via SSE (debug only) |
@@ -369,6 +393,8 @@ No pending items — all planned features are implemented. See "Already implemen
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
 - Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
 - `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
+- Shared machines + `Foster::feed` / `Foster::request_event` — `crates/foster-{core,server}/src/`.
+- Multiplexed SSE: `/events?subs=…`; the client opens one stream per page instead of one per machine (HTTP/1.1 caps browsers at 6 connections per host) — `crates/foster-{server,client}/src/lib.rs`.
 - `fx-bind-attr` `item:` source (per `fx-for` item) and `style.<prop>` targets — `crates/foster-client/src/lib.rs`.
 - Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
 - `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.

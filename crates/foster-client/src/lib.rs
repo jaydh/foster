@@ -192,6 +192,7 @@ async fn bootstrap() {
     let session_id = resolve_session_id(&window);
     let local_defs = read_local_defs(&document);
 
+    let mut subs: Vec<Sub> = Vec::new();
     let roots = document.query_selector_all("[fx-machine]").unwrap();
     for i in 0..roots.length() {
         let root: Element = roots.item(i).unwrap().dyn_into().unwrap();
@@ -226,25 +227,29 @@ async fn bootstrap() {
         let _ = root.set_attribute("data-fx-session", &effective_session);
 
         save_for_templates(&root);
-
-        // Subscribe to SSE and attach the click listener *before* fetching
-        // the initial snapshot.  This closes the race window where a Playwright
-        // test-inject fires its SSE broadcast before the client is listening,
-        // causing the inject to be silently lost.
-        attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
         attach_triggers(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
         #[cfg(debug_assertions)]
         mount_overlay(&document, &root, &machine_id, &effective_session);
 
-        match fetch_snapshot(&machine_id, &effective_session).await {
+        subs.push(Sub { key: format!("{machine_id}@{effective_session}"), root, machine_id, session_id: effective_session, cache_key });
+    }
+
+    // One SSE stream for every server machine on the page, opened *before*
+    // fetching the initial snapshots. This closes the race window where a
+    // Playwright test-inject fires its SSE broadcast before the client is
+    // listening, causing the inject to be silently lost.
+    attach_sse(document.clone(), &subs);
+
+    for sub in &subs {
+        match fetch_snapshot(&sub.machine_id, &sub.session_id).await {
             Ok(snap) => {
                 // Seed the context cache so the first SSE "patch" event has a valid base.
-                store_context(&cache_key, snap.context.clone());
+                store_context(&sub.cache_key, snap.context.clone());
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
-                apply_snapshot_if_newer(&document, &root, &snap);
-                update_debug(&document, &root, &snap);
+                apply_snapshot_if_newer(&document, &sub.root, &snap);
+                update_debug(&document, &sub.root, &snap);
             }
             Err(e) => web_sys::console::error_1(&e),
         }
@@ -883,76 +888,61 @@ fn attach_outside_triggers(document: Document, root: Element, machine_id: String
 // When the server broadcasts a new snapshot (e.g., after POST /test/state from Playwright),
 // the client applies it immediately — no page.reload() needed.
 
-fn attach_sse_listener(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
-    let url = format!("/events?machine={machine_id}&session={session_id}");
+/// A server machine instance on the page, as subscribed on the shared SSE stream.
+#[derive(Clone)]
+struct Sub {
+    /// `machine@session` — echoed back by the server on each event as `"sub"`.
+    key: String,
+    root: Element,
+    machine_id: String,
+    session_id: String,
+    cache_key: String,
+}
+
+/// Open one `EventSource` for all `subs` (`GET /events?subs=a@s1,b@s2`) and
+/// route each `snapshot` / `patch` event to its machine root by `"sub"`.
+/// One stream per machine would hit the browser's 6-connections-per-host cap
+/// on HTTP/1.1 and starve every other request on the page.
+fn attach_sse(document: Document, subs: &[Sub]) {
+    if subs.is_empty() { return; }
+    let query: Vec<&str> = subs.iter().map(|s| s.key.as_str()).collect();
+    let url = format!("/events?subs={}", query.join(","));
     let Ok(es) = EventSource::new(&url) else { return };
+    let routes: std::rc::Rc<HashMap<String, Sub>> =
+        std::rc::Rc::new(subs.iter().map(|s| (s.key.clone(), s.clone())).collect());
 
-    // "snapshot" — full state; first event on each SSE connection (or reconnect).
-    {
-        let document  = document.clone();
-        let root      = root.clone();
-        let cache_key = cache_key.clone();
-        let mid       = machine_id.clone();
-        let sid       = session_id.clone();
+    for name in ["snapshot", "patch"] {
+        let document = document.clone();
+        let routes = routes.clone();
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            let data = match e.data().as_string() { Some(s) => s, None => return };
-            let snap: Snapshot = match serde_json::from_str(&data) { Ok(s) => s, Err(_) => return };
-            store_context(&cache_key, snap.context.clone());
-            if let Some(prev) = apply_snapshot_if_newer(&document, &root, &snap) {
-                let root2 = root.clone();
-                let doc2  = document.clone();
-                let mid2  = mid.clone();
-                let sid2  = sid.clone();
-                let new_state = snap.state.clone();
-                spawn_local(async move {
-                    for ev in collect_enter_events(&root2, &prev, &new_state) {
-                        if let Ok(s2) = send_transition(&mid2, &ev, serde_json::json!({}), &sid2).await {
-                            apply_snapshot(&doc2, &root2, &s2);
-                            update_debug(&doc2, &root2, &s2);
-                        }
-                    }
-                });
-            }
-        });
-        es.add_event_listener_with_callback("snapshot", cb.as_ref().unchecked_ref()).unwrap();
-        cb.forget();
-    }
-
-    // "patch" — RFC 6902 JSON Patch of the context field only.
-    {
-        let cache_key = cache_key.clone();
-        let mid       = machine_id.clone();
-        let sid       = session_id.clone();
-        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            let data = match e.data().as_string() { Some(s) => s, None => return };
-            let pe: ContextPatch = match serde_json::from_str(&data) { Ok(p) => p, Err(_) => return };
-            let mut ctx = load_context(&cache_key);
-            if json_patch::patch(&mut ctx, &pe.patch.0).is_err() { return; }
-            store_context(&cache_key, ctx.clone());
-            let snap = Snapshot {
-                machine_id: pe.machine_id,
-                state: pe.state,
-                version: pe.version,
-                last_event: pe.last_event,
-                context: ctx,
+            let Some(data) = e.data().as_string() else { return };
+            let Ok(v) = serde_json::from_str::<Value>(&data) else { return };
+            let Some(sub) = v.get("sub").and_then(|s| s.as_str()).and_then(|k| routes.get(k)) else { return };
+            let snap = if name == "snapshot" {
+                let Ok(snap) = serde_json::from_value::<Snapshot>(v) else { return };
+                store_context(&sub.cache_key, snap.context.clone());
+                snap
+            } else {
+                let Ok(pe) = serde_json::from_value::<ContextPatch>(v) else { return };
+                let mut ctx = load_context(&sub.cache_key);
+                if json_patch::patch(&mut ctx, &pe.patch.0).is_err() { return; }
+                store_context(&sub.cache_key, ctx.clone());
+                Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx }
             };
-            if let Some(prev) = apply_snapshot_if_newer(&document, &root, &snap) {
-                let root2 = root.clone();
-                let doc2  = document.clone();
-                let mid2  = mid.clone();
-                let sid2  = sid.clone();
+            if let Some(prev) = apply_snapshot_if_newer(&document, &sub.root, &snap) {
+                let (root, doc, mid, sid) = (sub.root.clone(), document.clone(), sub.machine_id.clone(), sub.session_id.clone());
                 let new_state = snap.state.clone();
                 spawn_local(async move {
-                    for ev in collect_enter_events(&root2, &prev, &new_state) {
-                        if let Ok(s2) = send_transition(&mid2, &ev, serde_json::json!({}), &sid2).await {
-                            apply_snapshot(&doc2, &root2, &s2);
-                            update_debug(&doc2, &root2, &s2);
+                    for ev in collect_enter_events(&root, &prev, &new_state) {
+                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid).await {
+                            apply_snapshot(&doc, &root, &s2);
+                            update_debug(&doc, &root, &s2);
                         }
                     }
                 });
             }
         });
-        es.add_event_listener_with_callback("patch", cb.as_ref().unchecked_ref()).unwrap();
+        es.add_event_listener_with_callback(name, cb.as_ref().unchecked_ref()).unwrap();
         cb.forget();
     }
 
