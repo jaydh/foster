@@ -31,6 +31,9 @@ features = [
     "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlTextAreaElement",
+    "IntersectionObserver",
+    "IntersectionObserverEntry",
+    "IntersectionObserverInit",
     "DomTokenList",
     "EventSource",
     "Location",
@@ -44,3 +47,11 @@ features = [
     "Storage",
     "Window",
 ]
+
+# The client is DOM glue shipped to every visitor — download size matters
+# more than raw speed. Size-optimized; workspace profiles don't apply here
+# since foster-client is excluded from the workspace.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

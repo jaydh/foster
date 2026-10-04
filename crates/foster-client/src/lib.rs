@@ -1,4 +1,4 @@
-use foster_core::Snapshot;
+use foster_core::{LocalMachineDef, MachineError, Snapshot};
 use serde::Deserialize;
 use serde_json::Value;
 use std::cell::RefCell;
@@ -32,6 +32,140 @@ fn load_context(cache_key: &str) -> Value {
     })
 }
 
+// ── local machines ────────────────────────────────────────────────────────────
+//
+// `.local()` machines (see `MachineBuilder::local`) run here instead of on the
+// server. The server embeds their definitions as JSON in
+// `<script type="application/json" id="fx-local-machines">`; each local
+// `[fx-machine]` root gets an instance in `LOCAL`, keyed by the same cache key
+// as server machines, and `dispatch` routes its events here instead of to
+// `POST /transition`. No `/state` fetch, no SSE.
+
+struct LocalInstance {
+    def: LocalMachineDef,
+    state: String,
+    context: Value,
+    version: u64,
+    /// `localStorage` key, for `.persist()` machines.
+    storage_key: Option<String>,
+}
+
+thread_local! {
+    static LOCAL: RefCell<HashMap<String, LocalInstance>> = RefCell::new(HashMap::new());
+}
+
+fn read_local_defs(document: &Document) -> HashMap<String, LocalMachineDef> {
+    let Some(el) = document.get_element_by_id("fx-local-machines") else { return HashMap::new() };
+    let json = el.text_content().unwrap_or_default();
+    let defs = serde_json::from_str::<Vec<LocalMachineDef>>(&json).ok();
+    match defs {
+        Some(defs) => defs.into_iter().map(|d| (d.id.clone(), d)).collect(),
+        None => {
+            web_sys::console::error_1(&"foster: bad #fx-local-machines".into());
+            HashMap::new()
+        }
+    }
+}
+
+/// Create the instance for a local root and return its initial snapshot.
+///
+/// Initial state, first match wins:
+///   1. persisted in `localStorage` (`.persist()` machines), if still a valid state
+///   2. `data-fx-state` already on the root, if valid — lets an inline `<head>`
+///      script pick the first-paint state (e.g. dark mode from
+///      `prefers-color-scheme`) before WASM loads, without a flash
+///   3. the machine's initial state
+fn init_local(root: &Element, raw_attr: &str, def: LocalMachineDef, cache_key: &str) -> Snapshot {
+    let storage_key = def.persist.then(|| format!("foster_local:{raw_attr}"));
+    let persisted = storage_key.as_deref().and_then(|k| {
+        let storage = web_sys::window()?.local_storage().ok()??;
+        let raw = storage.get_item(k).ok()??;
+        let saved = serde_json::from_str::<Value>(&raw).ok()?;
+        let state = saved.get("state")?.as_str().filter(|s| def.has_state(s))?.to_string();
+        Some((state, saved.get("context").cloned().unwrap_or(Value::Null)))
+    });
+    let (state, context) = match persisted {
+        Some(p) => p,
+        None => {
+            let state = root
+                .get_attribute("data-fx-state")
+                .filter(|s| def.has_state(s))
+                .unwrap_or_else(|| def.initial_state.clone());
+            (state, def.initial_context.clone())
+        }
+    };
+    let snap = Snapshot {
+        machine_id: def.id.clone(),
+        state: state.clone(),
+        context: context.clone(),
+        version: 0,
+        last_event: None,
+    };
+    LOCAL.with(|l| {
+        l.borrow_mut().insert(
+            cache_key.to_string(),
+            LocalInstance { def, state, context, version: 0, storage_key },
+        )
+    });
+    snap
+}
+
+fn is_local(cache_key: &str) -> bool {
+    LOCAL.with(|l| l.borrow().contains_key(cache_key))
+}
+
+/// Run one event against a local instance. `Ok(None)` when the event has no
+/// edge from the current state: for per-visitor UI events ("close" on an
+/// already-closed menu, a second "visible") that's routine, not an error.
+fn local_send(cache_key: &str, event: &str, payload: Value) -> Result<Option<Snapshot>, JsValue> {
+    LOCAL.with(|l| {
+        let mut map = l.borrow_mut();
+        let inst = map
+            .get_mut(cache_key)
+            .ok_or_else(|| JsValue::from_str("foster: no local instance"))?;
+        let (state, context) =
+            match inst.def.send(&inst.state, inst.context.clone(), event, payload) {
+                Ok(next) => next,
+                Err(MachineError::InvalidTransition { .. }) => return Ok(None),
+                Err(e) => return Err(JsValue::from_str(&e.to_string())),
+            };
+        inst.state = state;
+        inst.context = context;
+        inst.version += 1;
+        if let Some(key) = &inst.storage_key {
+            let saved = serde_json::json!({ "state": inst.state, "context": inst.context });
+            if let (Ok(raw), Some(Ok(Some(storage)))) =
+                (serde_json::to_string(&saved), web_sys::window().map(|w| w.local_storage()))
+            {
+                let _ = storage.set_item(key, &raw);
+            }
+        }
+        Ok(Some(Snapshot {
+            machine_id: inst.def.id.clone(),
+            state: inst.state.clone(),
+            context: inst.context.clone(),
+            version: inst.version,
+            last_event: Some(event.to_string()),
+        }))
+    })
+}
+
+/// Send `event` to the machine behind `cache_key`: locally for `.local()`
+/// machines, `POST /transition` otherwise. `Ok(None)` = ignored (local only).
+async fn dispatch(
+    machine_id: &str,
+    event: &str,
+    payload: Value,
+    session_id: &str,
+    cache_key: &str,
+) -> Result<Option<Snapshot>, JsValue> {
+    if is_local(cache_key) {
+        local_send(cache_key, event, payload)
+    } else {
+        send_transition(machine_id, event, payload, session_id).await.map(Some)
+    }
+}
+
 /// Deserialized form of the server's `ContextPatch` SSE event.
 #[derive(Deserialize)]
 struct ContextPatch {
@@ -56,6 +190,7 @@ async fn bootstrap() {
     let document = window.document().expect("no document");
 
     let session_id = resolve_session_id(&window);
+    let local_defs = read_local_defs(&document);
 
     let roots = document.query_selector_all("[fx-machine]").unwrap();
     for i in 0..roots.length() {
@@ -66,6 +201,18 @@ async fn bootstrap() {
         // The fragment is appended to the session ID so each instance on
         // the page talks to a distinct server-side (session, machine) pair.
         let (machine_id, fragment) = split_instance(&raw_attr);
+
+        if let Some(def) = local_defs.get(&machine_id).cloned() {
+            // Local machine: no session, no network. Per-instance key so
+            // `theme#a` / `theme#b` stay independent.
+            let cache_key = format!("{machine_id}:local:{raw_attr}");
+            save_for_templates(&root);
+            let snap = init_local(&root, &raw_attr, def, &cache_key);
+            apply_snapshot(&document, &root, &snap);
+            attach_triggers(document.clone(), root.clone(), machine_id, String::new(), cache_key);
+            continue;
+        }
+
         let effective_session = if fragment.is_empty() {
             session_id.clone()
         } else {
@@ -85,7 +232,7 @@ async fn bootstrap() {
         // test-inject fires its SSE broadcast before the client is listening,
         // causing the inject to be silently lost.
         attach_sse_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
-        attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
+        attach_triggers(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
         #[cfg(debug_assertions)]
         mount_overlay(&document, &root, &machine_id, &effective_session);
@@ -536,6 +683,70 @@ fn apply_fx_fields(root: &Element, item: &Value) {
 
 // ── event delegation ──────────────────────────────────────────────────────────
 
+/// Wire up everything that fires events on `root`'s machine: delegated DOM
+/// events (`fx-on="click->x"`), `fx-on="visible->x"` and `fx-on="click@outside->x"`.
+fn attach_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
+    attach_delegating_listener(document.clone(), root.clone(), machine_id.clone(), session_id.clone(), cache_key.clone());
+    attach_visible_triggers(document.clone(), root.clone(), machine_id.clone(), session_id.clone(), cache_key.clone());
+    attach_outside_triggers(document, root, machine_id, session_id, cache_key);
+}
+
+/// Parse `fx-on="dom_event->machine_event"`.
+fn parse_fx_on(el: &Element) -> Option<(String, String)> {
+    let fx_on = el.get_attribute("fx-on")?;
+    let (dom, machine) = fx_on.split_once("->")?;
+    Some((dom.trim().to_string(), machine.trim().to_string()))
+}
+
+/// Fire `machine_event` (from `fx_on_el`'s trigger) and apply the result,
+/// including `fx-optimistic` and up to three levels of `fx-enter` chaining.
+fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &str, session_id: &str, cache_key: &str, machine_event: String) {
+    let payload          = build_payload(fx_on_el, root);
+    let optimistic_state = fx_on_el.get_attribute("fx-optimistic");
+    let mid              = machine_id.to_string();
+    let sid              = session_id.to_string();
+    let ck               = cache_key.to_string();
+    let root_clone       = root.clone();
+    let doc_clone        = document.clone();
+
+    spawn_local(async move {
+        // fx-optimistic: paint expected state immediately before the round-trip.
+        // Pointless for local machines, which answer synchronously.
+        if let Some(ref opt) = optimistic_state.filter(|_| !is_local(&ck)) {
+            let fake = Snapshot {
+                machine_id: mid.clone(),
+                state:      opt.clone(),
+                version:    0,          // real response will overwrite
+                last_event: None,
+                context:    load_context(&ck),
+            };
+            apply_snapshot(&doc_clone, &root_clone, &fake);
+        }
+
+        match dispatch(&mid, &machine_event, payload, &sid, &ck).await {
+            Ok(Some(snap)) => {
+                let prev = apply_snapshot(&doc_clone, &root_clone, &snap);
+                update_debug(&doc_clone, &root_clone, &snap);
+                // fx-enter: fire follow-up events triggered by state entry.
+                for ev in collect_enter_events(&root_clone, &prev, &snap.state) {
+                    if let Ok(Some(s2)) = dispatch(&mid, &ev, serde_json::json!({}), &sid, &ck).await {
+                        let prev2 = apply_snapshot(&doc_clone, &root_clone, &s2);
+                        update_debug(&doc_clone, &root_clone, &s2);
+                        for ev2 in collect_enter_events(&root_clone, &prev2, &s2.state) {
+                            if let Ok(Some(s3)) = dispatch(&mid, &ev2, serde_json::json!({}), &sid, &ck).await {
+                                apply_snapshot(&doc_clone, &root_clone, &s3);
+                                update_debug(&doc_clone, &root_clone, &s3);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => web_sys::console::error_1(&e),
+        }
+    });
+}
+
 fn attach_delegating_listener(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
     let root_for_listener = root.clone();
     let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
@@ -553,60 +764,76 @@ fn attach_delegating_listener(document: Document, root: Element, machine_id: Str
             _ => return,
         }
 
-        let fx_on = fx_on_el.get_attribute("fx-on").unwrap_or_default();
-        let mut parts = fx_on.splitn(2, "->").map(|s| s.trim().to_string());
-        let (Some(dom_event), Some(machine_event)) = (parts.next(), parts.next()) else { return };
-
+        let Some((dom_event, machine_event)) = parse_fx_on(&fx_on_el) else { return };
         if event.type_() != dom_event { return; }
 
-        let payload         = build_payload(&fx_on_el, root);
-        let optimistic_state = fx_on_el.get_attribute("fx-optimistic");
-        let mid             = machine_id.clone();
-        let sid             = session_id.clone();
-        let ck              = cache_key.clone();
-        let root_clone      = root.clone();
-        let doc_clone       = document.clone();
-
-        spawn_local(async move {
-            // fx-optimistic: paint expected state immediately before the round-trip.
-            if let Some(ref opt) = optimistic_state {
-                let fake = Snapshot {
-                    machine_id: mid.clone(),
-                    state:      opt.clone(),
-                    version:    0,          // real response will overwrite
-                    last_event: None,
-                    context:    load_context(&ck),
-                };
-                apply_snapshot(&doc_clone, &root_clone, &fake);
-            }
-
-            match send_transition(&mid, &machine_event, payload, &sid).await {
-                Ok(snap) => {
-                    let prev = apply_snapshot(&doc_clone, &root_clone, &snap);
-                    update_debug(&doc_clone, &root_clone, &snap);
-                    // fx-enter: fire follow-up events triggered by state entry.
-                    for ev in collect_enter_events(&root_clone, &prev, &snap.state) {
-                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid).await {
-                            let prev2 = apply_snapshot(&doc_clone, &root_clone, &s2);
-                            update_debug(&doc_clone, &root_clone, &s2);
-                            for ev2 in collect_enter_events(&root_clone, &prev2, &s2.state) {
-                                if let Ok(s3) = send_transition(&mid, &ev2, serde_json::json!({}), &sid).await {
-                                    apply_snapshot(&doc_clone, &root_clone, &s3);
-                                    update_debug(&doc_clone, &root_clone, &s3);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => web_sys::console::error_1(&e),
-            }
-        });
+        fire(&document, root, &fx_on_el, &machine_id, &session_id, &cache_key, machine_event);
     });
 
     // Register for click, change (select/input blur), and input (live text) so
     // fx-on="change->..." and fx-on="input->..." work alongside fx-on="click->...".
     for ev_type in &["click", "change", "input"] {
         root.add_event_listener_with_callback(ev_type, cb.as_ref().unchecked_ref()).unwrap();
+    }
+    cb.forget();
+}
+
+/// `fx-on="visible->event"` — fire once, the first time the element is at
+/// least 10% on screen. For deferring work until it's needed (load a heavy
+/// embed, start an animation) without hand-written IntersectionObserver JS.
+fn attach_visible_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
+    let els: Vec<Element> = self_and_descendants(&root, "[fx-on]")
+        .into_iter()
+        .filter(|el| matches!(parse_fx_on(el), Some((d, _)) if d == "visible"))
+        .collect();
+    if els.is_empty() { return; }
+
+    let cb = Closure::<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>::new(
+        move |entries: js_sys::Array, observer: web_sys::IntersectionObserver| {
+            for entry in entries.iter() {
+                let entry: web_sys::IntersectionObserverEntry = entry.unchecked_into();
+                if !entry.is_intersecting() { continue; }
+                let el = entry.target();
+                observer.unobserve(&el);
+                if let Some((_, machine_event)) = parse_fx_on(&el) {
+                    fire(&document, &root, &el, &machine_id, &session_id, &cache_key, machine_event);
+                }
+            }
+        },
+    );
+    let opts = web_sys::IntersectionObserverInit::new();
+    opts.set_threshold(&JsValue::from_f64(0.1));
+    let observer = web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &opts).unwrap();
+    for el in &els { observer.observe(el); }
+    cb.forget();
+}
+
+/// `fx-on="click@outside->event"` — fire when a `click` lands anywhere outside
+/// the element (closing a dropdown/popover). Listens on the document, since by
+/// definition the click isn't inside `root`.
+fn attach_outside_triggers(document: Document, root: Element, machine_id: String, session_id: String, cache_key: String) {
+    let specs: Vec<(Element, String, String)> = self_and_descendants(&root, "[fx-on]")
+        .into_iter()
+        .filter_map(|el| {
+            let (dom, machine_event) = parse_fx_on(&el)?;
+            let dom_event = dom.strip_suffix("@outside")?.to_string();
+            Some((el, dom_event, machine_event))
+        })
+        .collect();
+    if specs.is_empty() { return; }
+
+    let doc_for_listener = document.clone();
+    let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        let Some(target) = event.target() else { return };
+        let Ok(target_node): Result<web_sys::Node, _> = target.dyn_into() else { return };
+        for (el, dom_event, machine_event) in &specs {
+            if event.type_() == *dom_event && !el.contains(Some(&target_node)) {
+                fire(&doc_for_listener, &root, el, &machine_id, &session_id, &cache_key, machine_event.clone());
+            }
+        }
+    });
+    for ev_type in &["click"] {
+        document.add_event_listener_with_callback(ev_type, cb.as_ref().unchecked_ref()).unwrap();
     }
     cb.forget();
 }

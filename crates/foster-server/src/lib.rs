@@ -99,6 +99,21 @@ where
         }
     }
 
+    // `.local()` machines run in the browser: embed their definitions in the
+    // page for the WASM client, and keep them out of the HTTP/SSE routes so a
+    // per-visitor machine can't be driven (or read) through the server.
+    // `type="application/json"` is never executed, so no CSP exemption is needed;
+    // `</` is escaped so a context string can't close the tag early.
+    let local_defs: Vec<_> = machines.values().filter_map(|m| m.local_def()).collect();
+    let local_script = (!local_defs.is_empty()).then(|| {
+        let json = serde_json::to_string(&local_defs)
+            .expect("LocalMachineDef serializes")
+            .replace("</", "<\\/");
+        format!("<script type=\"application/json\" id=\"fx-local-machines\">{json}</script>")
+    });
+    let machines: HashMap<String, Arc<Machine>> =
+        machines.into_iter().filter(|(_, m)| !m.local).collect();
+
     let test_mode = cfg!(debug_assertions)
         || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);
 
@@ -140,9 +155,15 @@ where
 
     // Serve template at GET /, injecting the dev overlay in debug builds.
     if let Some(html) = index_html {
-        let served = match overlay_script {
-            Some(script) => html.replace("</body>", &format!("{script}</body>")),
-            None => html,
+        let injected: String = [local_script, overlay_script].into_iter().flatten().collect();
+        let served = if injected.is_empty() {
+            html
+        } else {
+            // Last `</body>`: the real one, not one inside an inline script/string.
+            match html.rfind("</body>") {
+                Some(i) => format!("{}{injected}{}", &html[..i], &html[i..]),
+                None => html + &injected,
+            }
         };
         router = router.route("/", get(move || async move { Html(served) }));
     }
@@ -1202,6 +1223,64 @@ mod tests {
         assert_eq!(snap.state, "idle");
         assert_eq!(snap.version, 0);
         assert_eq!(snap.context["count"], 0);
+    }
+
+    fn with_local_theme() -> HashMap<String, Arc<Machine>> {
+        let theme = MachineBuilder::new("theme", "light", json!({"note": "</script>"}))
+            .pass("light", "toggle", "dark")
+            .pass("dark", "toggle", "light")
+            .persist()
+            .template(
+                r#"<html><body><div fx-machine="theme"><button fx-on="click->toggle">t</button></div></body></html>"#,
+            )
+            .build();
+        let mut m = test_machines();
+        m.insert("theme".to_string(), theme);
+        m
+    }
+
+    async fn get(app: Router, uri: &str) -> (StatusCode, String) {
+        let resp = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn local_machine_is_embedded_in_page() {
+        let (status, html) = get(router(with_local_theme()), "/").await;
+        assert_eq!(status, StatusCode::OK);
+        let start = html.find(r#"<script type="application/json" id="fx-local-machines">"#)
+            .expect("local machine script injected");
+        assert!(start < html.rfind("</body>").unwrap());
+        let body = &html[start..];
+        let json = &body[body.find('>').unwrap() + 1..body.find("</script>").unwrap()];
+        // The context's "</script>" is escaped, so the tag isn't closed early…
+        assert!(!json.contains("</"));
+        // …and it still parses back to the original value.
+        let defs: Vec<foster_core::LocalMachineDef> = serde_json::from_str(json).unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].id, "theme");
+        assert!(defs[0].persist);
+        assert_eq!(defs[0].initial_context["note"], "</script>");
+    }
+
+    #[tokio::test]
+    async fn local_machine_has_no_server_routes() {
+        let (status, _) = get(router(with_local_theme()), "/state?machine=theme").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // Server machines on the same page are unaffected.
+        let (status, _) = get(router(with_local_theme()), "/state?machine=counter").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_local_script_without_local_machines() {
+        let m = MachineBuilder::new("counter", "idle", json!({}))
+            .template("<html><body></body></html>")
+            .build();
+        let (_, html) = get(router(HashMap::from([("counter".to_string(), m)])), "/").await;
+        assert!(!html.contains("fx-local-machines"));
     }
 
     #[tokio::test]

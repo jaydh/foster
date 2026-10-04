@@ -1,6 +1,6 @@
 use crate::snapshot::Snapshot;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +29,89 @@ pub struct TransitionDef {
     /// Reducer: `(old_context, event_payload) → new_context`.
     /// `None` passes context through unchanged.
     pub reduce: Option<ReducerFn>,
+    /// Declarative form of `reduce`, when there is one (`.pass()` / `.merge()`).
+    /// `None` for arbitrary Rust reducers, which can only run on the server —
+    /// so a `.local()` machine must have `Some` on every edge.
+    pub local: Option<LocalReduce>,
+}
+
+/// A reducer simple enough to describe as data, so the generic WASM client can
+/// run it for `.local()` machines without any app-specific Rust.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalReduce {
+    /// Context unchanged.
+    Pass,
+    /// Shallow-merge the event payload's top-level keys into the context.
+    Merge,
+}
+
+impl LocalReduce {
+    pub fn apply(self, ctx: Value, payload: Value) -> Value {
+        match self {
+            LocalReduce::Pass => ctx,
+            LocalReduce::Merge => merge_shallow(ctx, payload),
+        }
+    }
+}
+
+/// `ctx` with `payload`'s top-level keys written over it. A non-object payload
+/// (including `null`, what the client sends for an event with no payload)
+/// leaves `ctx` unchanged; a non-object `ctx` is replaced by an empty object.
+pub fn merge_shallow(ctx: Value, payload: Value) -> Value {
+    let Value::Object(add) = payload else { return ctx };
+    let mut base = match ctx {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    base.extend(add);
+    Value::Object(base)
+}
+
+/// Wire form of a `.local()` machine, embedded in the served page as JSON so
+/// the WASM client can run it entirely in the browser.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalMachineDef {
+    pub id: String,
+    pub initial_state: String,
+    pub initial_context: Value,
+    /// Save state + context to `localStorage` and restore it on the next load.
+    pub persist: bool,
+    /// state → event → edge
+    pub transitions: HashMap<String, HashMap<String, LocalTransition>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalTransition {
+    pub target: String,
+    pub reduce: LocalReduce,
+}
+
+impl LocalMachineDef {
+    /// Whether `state` is a state of this machine (has an entry, even with no outgoing edges).
+    pub fn has_state(&self, state: &str) -> bool {
+        self.transitions.contains_key(state)
+    }
+
+    /// Same semantics as `MachineInstance::send` for one edge, minus versioning
+    /// (the caller owns that). Returns `(next_state, next_context)`.
+    pub fn send(
+        &self,
+        state: &str,
+        ctx: Value,
+        event: &str,
+        payload: Value,
+    ) -> Result<(String, Value), MachineError> {
+        let edges = self
+            .transitions
+            .get(state)
+            .ok_or_else(|| MachineError::UnknownState(state.to_string()))?;
+        let edge = edges.get(event).ok_or_else(|| MachineError::InvalidTransition {
+            state: state.to_string(),
+            event: event.to_string(),
+        })?;
+        Ok((edge.target.clone(), edge.reduce.apply(ctx, payload)))
+    }
 }
 
 /// The static, shared definition of a machine.  Construct via `MachineBuilder`.
@@ -44,9 +127,41 @@ pub struct Machine {
     /// Optional HTML template.  When present, `foster_server::router` serves it at `GET /`
     /// and validates all `fx-show` / `fx-on` attributes at startup.
     pub template: Option<String>,
+    /// Runs in the browser (per visitor) instead of on the server. See `MachineBuilder::local`.
+    pub local: bool,
+    /// Local machine whose state survives reloads via `localStorage`.
+    pub persist: bool,
 }
 
 impl Machine {
+    /// The client-side definition of a `.local()` machine; `None` for server machines.
+    pub fn local_def(&self) -> Option<LocalMachineDef> {
+        if !self.local {
+            return None;
+        }
+        let transitions = self
+            .states
+            .iter()
+            .map(|(from, events)| {
+                let edges = events
+                    .iter()
+                    .map(|(event, def)| {
+                        let reduce = def.local.expect("checked in MachineBuilder::build");
+                        (event.clone(), LocalTransition { target: def.target.clone(), reduce })
+                    })
+                    .collect();
+                (from.clone(), edges)
+            })
+            .collect();
+        Some(LocalMachineDef {
+            id: self.id.clone(),
+            initial_state: self.initial_state.clone(),
+            initial_context: self.initial_context.clone(),
+            persist: self.persist,
+            transitions,
+        })
+    }
+
     /// All valid state names in definition order.
     pub fn state_names(&self) -> Vec<&str> {
         self.states.keys().map(|s| s.as_str()).collect()
@@ -325,6 +440,8 @@ pub struct MachineBuilder {
     states: HashMap<String, HashMap<String, TransitionDef>>,
     state_schemas: HashMap<String, Value>,
     template: Option<String>,
+    local: bool,
+    persist: bool,
 }
 
 impl MachineBuilder {
@@ -343,6 +460,8 @@ impl MachineBuilder {
             states,
             state_schemas: HashMap::new(),
             template: None,
+            local: false,
+            persist: false,
         }
     }
 
@@ -368,6 +487,47 @@ impl MachineBuilder {
         self
     }
 
+    /// Run this machine in the browser instead of on the server.
+    ///
+    /// For per-visitor UI state (a theme toggle, an open dropdown, a lightbox):
+    /// a server machine is shared by everyone on the same session, and every
+    /// event costs a round trip. A local machine never touches the network —
+    /// `foster_server::router` embeds its definition in the served page and
+    /// serves no `/state` / `/transition` / `/events` for it.
+    ///
+    /// Only declarative transitions can run client-side, so every edge must be
+    /// `.pass()` or `.merge()`, and `.schema()` isn't supported; `build()`
+    /// panics otherwise.
+    pub fn local(mut self) -> Self {
+        self.local = true;
+        self
+    }
+
+    /// `.local()`, plus state and context saved to `localStorage` and restored
+    /// on the next page load.
+    pub fn persist(mut self) -> Self {
+        self.local = true;
+        self.persist = true;
+        self
+    }
+
+    /// Register a transition that shallow-merges the event payload into the context
+    /// (see [`merge_shallow`]). Works for server and `.local()` machines alike.
+    pub fn merge(
+        mut self,
+        from: impl Into<String>,
+        event: impl Into<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        let def = TransitionDef {
+            target: to.into(),
+            reduce: Some(Arc::new(|ctx, payload| Ok(merge_shallow(ctx, payload)))),
+            local: Some(LocalReduce::Merge),
+        };
+        self.states.entry(from.into()).or_default().insert(event.into(), def);
+        self
+    }
+
     /// Register a transition with a reducer.
     ///
     /// Accepts named `fn` pointers and non-capturing closures.
@@ -384,7 +544,7 @@ impl MachineBuilder {
         self.states
             .entry(from)
             .or_default()
-            .insert(event, TransitionDef { target: to.into(), reduce: Some(Arc::new(reduce)) });
+            .insert(event, TransitionDef { target: to.into(), reduce: Some(Arc::new(reduce)), local: None });
         self
     }
 
@@ -400,7 +560,7 @@ impl MachineBuilder {
         self.states
             .entry(from)
             .or_default()
-            .insert(event, TransitionDef { target: to.into(), reduce: None });
+            .insert(event, TransitionDef { target: to.into(), reduce: None, local: Some(LocalReduce::Pass) });
         self
     }
 
@@ -428,7 +588,34 @@ impl MachineBuilder {
         })
     }
 
-    pub fn build(self) -> Arc<Machine> {
+    /// # Panics
+    /// For a `.local()` machine with a Rust-reducer edge (`.on()` / `.typed_on()`)
+    /// or a `.schema()` — neither can run in the browser.
+    pub fn build(mut self) -> Arc<Machine> {
+        if self.local {
+            for (from, events) in &self.states {
+                for (event, def) in events {
+                    assert!(
+                        def.local.is_some(),
+                        "local machine '{}': transition '{from}' -[{event}]-> '{}' has a Rust \
+                         reducer, which can't run in the browser — use .pass() or .merge()",
+                        self.id, def.target,
+                    );
+                }
+            }
+            assert!(
+                self.state_schemas.is_empty(),
+                "local machine '{}': .schema() isn't supported on local machines",
+                self.id,
+            );
+            // Targets with no outgoing edges must still exist as states, so the
+            // client can validate a persisted/server-rendered state against them.
+            let targets: Vec<String> =
+                self.states.values().flat_map(|e| e.values().map(|d| d.target.clone())).collect();
+            for t in targets {
+                self.states.entry(t).or_default();
+            }
+        }
         Arc::new(Machine {
             id: self.id,
             initial_state: self.initial_state,
@@ -436,6 +623,8 @@ impl MachineBuilder {
             states: self.states,
             state_schemas: self.state_schemas,
             template: self.template,
+            local: self.local,
+            persist: self.persist,
         })
     }
 }
@@ -1003,5 +1192,78 @@ mod tests {
         assert_eq!(m.snapshot().version, 2);
         m.send("break_it", json!(null)).unwrap();
         assert_eq!(m.snapshot().version, 3);
+    }
+
+    // ── local machines ────────────────────────────────────────────────────────
+
+    fn lightbox() -> MachineBuilder {
+        MachineBuilder::new("lightbox", "closed", json!({}))
+            .merge("closed", "open", "open")
+            .pass("open", "close", "closed")
+    }
+
+    #[test]
+    fn merge_shallow_overwrites_top_level_keys_only() {
+        let out = merge_shallow(json!({"a": 1, "n": {"x": 1}}), json!({"a": 2, "n": {"y": 2}}));
+        assert_eq!(out, json!({"a": 2, "n": {"y": 2}}));
+        assert_eq!(merge_shallow(json!({"a": 1}), json!(null)), json!({"a": 1}));
+        assert_eq!(merge_shallow(json!(null), json!({"a": 1})), json!({"a": 1}));
+    }
+
+    #[test]
+    fn merge_transition_works_on_server_machines() {
+        let mut m = MachineInstance::new(lightbox().build());
+        let snap = m.send("open", json!({"idx": 3})).unwrap();
+        assert_eq!((snap.state.as_str(), snap.context), ("open", json!({"idx": 3})));
+    }
+
+    #[test]
+    fn local_def_none_for_server_machines() {
+        assert!(lightbox().build().local_def().is_none());
+    }
+
+    #[test]
+    fn local_def_matches_server_semantics() {
+        let def = lightbox().persist().build().local_def().unwrap();
+        assert!(def.persist);
+        assert!(def.has_state("closed") && def.has_state("open"));
+        let (st, ctx) = def.send("closed", json!({}), "open", json!({"idx": 3})).unwrap();
+        assert_eq!((st.as_str(), &ctx), ("open", &json!({"idx": 3})));
+        let (st, ctx) = def.send("open", ctx, "close", json!({"ignored": 1})).unwrap();
+        assert_eq!((st.as_str(), ctx), ("closed", json!({"idx": 3})));
+        assert!(matches!(
+            def.send("closed", json!({}), "close", json!(null)),
+            Err(MachineError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn local_def_round_trips_through_json() {
+        let def = lightbox().local().build().local_def().unwrap();
+        let back: LocalMachineDef = serde_json::from_str(&serde_json::to_string(&def).unwrap()).unwrap();
+        assert_eq!(back.transitions["open"]["close"].reduce, LocalReduce::Pass);
+        assert_eq!(back.transitions["closed"]["open"].reduce, LocalReduce::Merge);
+    }
+
+    #[test]
+    fn local_build_registers_terminal_targets_as_states() {
+        let def = MachineBuilder::new("m", "a", json!({})).pass("a", "go", "b").local().build()
+            .local_def().unwrap();
+        assert!(def.has_state("b"));
+    }
+
+    #[test]
+    #[should_panic(expected = "has a Rust reducer")]
+    fn local_build_rejects_rust_reducers() {
+        MachineBuilder::new("m", "a", json!({}))
+            .on("a", "go", "a", |c, _| Ok(c))
+            .local()
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = ".schema() isn't supported")]
+    fn local_build_rejects_schemas() {
+        lightbox().schema("open", json!({"type": "object"})).local().build();
     }
 }

@@ -110,6 +110,34 @@ MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
 | `.on(from, event, to, reducer)` | Reducer transforms `Value` context directly |
 | `.pass(from, event, to)` | Context passes through unchanged |
 | `.typed_on(from, event, to, reducer)` | Reducer works with a typed struct — no `json!` unwrapping |
+| `.merge(from, event, to)` | Shallow-merge the event payload's top-level keys into context |
+
+### Local (client-only) machines
+
+`.local()` runs a machine in the browser instead of on the server — for
+per-visitor UI state (theme, an open dropdown, a lightbox) where a shared
+server instance is wrong and a round trip is wasted. `.persist()` = `.local()`
+plus state/context saved to `localStorage["foster_local:<fx-machine attr>"]`.
+
+```rust
+MachineBuilder::new("theme", "light", json!({}))
+    .pass("light", "toggle", "dark")
+    .pass("dark", "toggle", "light")
+    .persist()
+    .build()
+```
+
+- Only `.pass()` / `.merge()` edges and no `.schema()` — the generic client
+  can't run Rust reducers; `build()` panics otherwise.
+- `foster_server::router` embeds the definitions in the served template as
+  `<script type="application/json" id="fx-local-machines">` and serves no
+  `/state` / `/transition` / `/events` for them (404).
+- Initial state: persisted value → `data-fx-state` already on the root (lets an
+  inline `<head>` script choose first-paint state, e.g. from
+  `prefers-color-scheme`) → the machine's initial state.
+- An event with no edge from the current state is silently ignored (server
+  machines log an error) — "close" on a closed menu is routine.
+- Same markup as server machines; `fx-machine` can go on `<html>` itself.
 
 `.typed_on` avoids `json!` reconstruction for complex context:
 
@@ -250,6 +278,8 @@ All attributes processed client-side by the WASM runtime.
 | `fx-animate` | `fx-animate="error:shake:400"` | Add CSS class for N ms when entering a state |
 | `fx-enter` | `fx-enter="open:load_data"` | Fire machine event when entering listed states; `*` fires on any transition |
 | `fx-optimistic` | `fx-optimistic="done"` | Instantly render expected state before server confirms (on `fx-on` buttons) |
+| `fx-on="visible->…"` | `fx-on="visible->load"` | Fire once, the first time the element is ≥10% on screen |
+| `fx-on="click@outside->…"` | `fx-on="click@outside->close"` | Fire on a click anywhere outside the element (close a dropdown) |
 
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
@@ -335,6 +365,9 @@ No pending items — all planned features are implemented. See "Already implemen
 - `GET /debug/benchmark` — BFS walk of machine graph in-memory; reports full-snapshot vs JSON Patch bytes per transition and overall ratio — `crates/foster-server/src/lib.rs`.
 - `fx-enter` — fire machine event on state entry: `fx-enter="state:event"` space-separated specs; `*` fires on any transition. Max 3 levels of chaining to prevent loops — `crates/foster-client/src/lib.rs`.
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
+- Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
+- `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
+- Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
 - `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
 - `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.
 - `form` example: multi-step conference registration (5 states, 11 transitions) showcasing `fx-if` validation + `fx-optimistic`. Validate self-transitions always succeed and set error fields; advance transitions return `MachineError` when step not valid — port 3007.

@@ -3,7 +3,10 @@ pub mod snapshot;
 
 pub use foster_macros::html;
 pub use foster_macros::machine_graph;
-pub use machine::{Machine, MachineBuilder, MachineError, MachineInstance, TransitionDef};
+pub use machine::{
+    merge_shallow, LocalMachineDef, LocalReduce, LocalTransition, Machine, MachineBuilder,
+    MachineError, MachineInstance, TransitionDef,
+};
 pub use snapshot::Snapshot;
 
 /// Wrap body HTML in a standard page shell (DOCTYPE, head, CSS, script).
