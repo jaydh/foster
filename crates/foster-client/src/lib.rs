@@ -201,6 +201,11 @@ fn call_update(module: &JsValue, el: &Element, state: &str, ctx_json: &str) {
 
 /// Record `snap` as `root`'s latest and pass it to the widgets it owns.
 fn notify_widgets(root: &Element, snap: &Snapshot) {
+    // Serializing the context on every snapshot is wasted work for the
+    // (common) machines that contain no widgets.
+    if !matches!(root.query_selector("[fx-widget]"), Ok(Some(_))) && !root.has_attribute("fx-widget") {
+        return;
+    }
     let ctx_json = snap.context.to_string();
     LAST_SNAPSHOT.with(|l| {
         let mut l = l.borrow_mut();
@@ -778,6 +783,16 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
             continue;
         };
 
+        // Skip the rebuild when the (filtered) list is unchanged since the
+        // last render — most snapshots change other keys, and tearing down
+        // and re-creating every row is the dominant client cost on pages with
+        // live-updating machines.
+        let rendered = list_fingerprint(&array);
+        if container.get_attribute("data-fx-rendered").as_deref() == Some(rendered.as_str()) {
+            continue;
+        }
+        let _ = container.set_attribute("data-fx-rendered", &rendered);
+
         container.set_inner_html("");
 
         for item in &array {
@@ -795,6 +810,16 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
             container.append_child(&item_el).unwrap();
         }
     }
+}
+
+/// Short fingerprint of a rendered list, for skipping no-op `fx-for` rebuilds.
+fn list_fingerprint(items: &[Value]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for item in items {
+        item.to_string().hash(&mut h);
+    }
+    format!("{}:{:x}", items.len(), h.finish())
 }
 
 fn save_for_templates(root: &Element) {
