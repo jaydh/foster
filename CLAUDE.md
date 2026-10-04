@@ -284,6 +284,8 @@ All attributes processed client-side by the WASM runtime.
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
 - `attr=state:name` — set `attr=""` when in that state (use for `disabled`, `hidden`, `aria-current`)
+- `attr=item:field` — inside an `fx-for` item: set from that item's field (`<img fx-bind-attr="src=item:thumb_url alt=item:name">`)
+- Target `style.<prop>` sets an inline style property instead of an attribute: `fx-bind-attr="style.left=item:x style.top=item:y"`
 
 **`fx-if` format:**
 - `fx-if="field"` — show when `context[field]` is truthy (non-null, non-false, non-zero, non-empty)
@@ -367,6 +369,7 @@ No pending items — all planned features are implemented. See "Already implemen
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
 - Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
 - `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
+- `fx-bind-attr` `item:` source (per `fx-for` item) and `style.<prop>` targets — `crates/foster-client/src/lib.rs`.
 - Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
 - `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
 - `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.

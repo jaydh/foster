@@ -497,29 +497,58 @@ fn apply_fx_class(root: &Element, state: &str) {
 
 /// `fx-bind-attr="href=ctx:url title=ctx:name disabled=state:loading"`
 ///
-/// Space-separated pairs of `attr=source:value`:
-///   `attr=ctx:key`        — set `attr` from `context[key]`
+/// Space-separated pairs of `target=source:value`:
+///   `attr=ctx:key`         — set `attr` from `context[key]`, remove it if absent
 ///   `attr=state:statename` — set `attr=""` when in that state, remove otherwise
+///   `attr=item:field`      — inside an `fx-for` item: set from the item's field
+///                            (applied per item by `apply_fx_fields`, skipped here)
+///
+/// A target of `style.<property>` sets an inline style property instead of an
+/// attribute: `style.left=item:x` positions each item from its own data.
 fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
     let els = self_and_descendants(root, "[fx-bind-attr]");
     for el in els {
         let attr_val = el.get_attribute("fx-bind-attr").unwrap_or_default();
         for pair in attr_val.split_whitespace() {
             let mut parts = pair.splitn(2, '=');
-            let (Some(attr), Some(source)) = (parts.next(), parts.next()) else { continue };
+            let (Some(target), Some(source)) = (parts.next(), parts.next()) else { continue };
             if let Some(key) = source.strip_prefix("ctx:") {
-                match ctx.get(key) {
-                    Some(val) => { let _ = el.set_attribute(attr, &val_to_string(val)); }
-                    None      => { let _ = el.remove_attribute(attr); }
-                }
+                set_bound(&el, target, ctx.get(key));
             } else if let Some(target_state) = source.strip_prefix("state:") {
-                if state == target_state {
-                    let _ = el.set_attribute(attr, "");
-                } else {
-                    let _ = el.remove_attribute(attr);
-                }
+                let on = Value::String(String::new());
+                set_bound(&el, target, (state == target_state).then_some(&on));
             }
         }
+    }
+}
+
+/// Apply the `item:` pairs of `el`'s `fx-bind-attr` from one `fx-for` item.
+fn bind_item_attrs(el: &Element, item: &Value) {
+    let attr_val = el.get_attribute("fx-bind-attr").unwrap_or_default();
+    for pair in attr_val.split_whitespace() {
+        let mut parts = pair.splitn(2, '=');
+        let (Some(target), Some(source)) = (parts.next(), parts.next()) else { continue };
+        if let Some(field) = source.strip_prefix("item:") {
+            set_bound(el, target, item.get(field));
+        }
+    }
+}
+
+/// Set (`Some`) or clear (`None`) a bound attribute, or a style property for a
+/// `style.<property>` target.
+fn set_bound(el: &Element, target: &str, val: Option<&Value>) {
+    if let Some(prop) = target.strip_prefix("style.") {
+        if let Some(style) = el.dyn_ref::<HtmlElement>().map(|h| h.style()) {
+            let _ = match val {
+                Some(v) => style.set_property(prop, &val_to_string(v)),
+                None => style.remove_property(prop).map(|_| ()),
+            };
+        }
+    } else {
+        let _ = match val {
+            Some(v) => el.set_attribute(target, &val_to_string(v)),
+            None => el.remove_attribute(target),
+        };
     }
 }
 
@@ -669,6 +698,16 @@ fn apply_fx_fields(root: &Element, item: &Value) {
     if let Some(key) = root.get_attribute("fx-field") {
         if let Some(val) = item.get(&key) {
             root.set_text_content(Some(&val_to_string(val)));
+        }
+    }
+    if root.has_attribute("fx-bind-attr") {
+        bind_item_attrs(root, item);
+    }
+    if let Ok(list) = root.query_selector_all("[fx-bind-attr]") {
+        for i in 0..list.length() {
+            if let Some(Ok(el)) = list.item(i).map(|n| n.dyn_into::<Element>()) {
+                bind_item_attrs(&el, item);
+            }
         }
     }
     let els = root.query_selector_all("[fx-field]").unwrap();
