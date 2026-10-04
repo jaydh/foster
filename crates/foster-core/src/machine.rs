@@ -37,22 +37,43 @@ pub struct TransitionDef {
 
 /// A reducer simple enough to describe as data, so the generic WASM client can
 /// run it for `.local()` machines without any app-specific Rust.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalReduce {
     /// Context unchanged.
     Pass,
     /// Shallow-merge the event payload's top-level keys into the context.
     Merge,
+    /// List navigation — see [`step_list`].
+    Step { list: String, index: String, by: i64 },
 }
 
 impl LocalReduce {
-    pub fn apply(self, ctx: Value, payload: Value) -> Value {
+    pub fn apply(&self, ctx: Value, payload: Value) -> Value {
         match self {
             LocalReduce::Pass => ctx,
             LocalReduce::Merge => merge_shallow(ctx, payload),
+            LocalReduce::Step { list, index, by } => step_list(ctx, list, index, *by),
         }
     }
+}
+
+/// Move `ctx[index]` by `by` through the array `ctx[list]`, wrapping at both
+/// ends, then shallow-merge the selected item's fields into the context — so
+/// markup binds the current item as plain `ctx:` keys (a lightbox's
+/// `src=ctx:url`, a wizard's `fx-text="title"`). A missing/non-numeric index
+/// counts as 0; an empty or missing list leaves the context unchanged.
+pub fn step_list(ctx: Value, list: &str, index: &str, by: i64) -> Value {
+    let len = ctx.get(list).and_then(Value::as_array).map_or(0, Vec::len) as i64;
+    if len == 0 {
+        return ctx;
+    }
+    let current = ctx.get(index).and_then(Value::as_i64).unwrap_or(0);
+    let next = (current + by).rem_euclid(len);
+    let item = ctx[list][next as usize].clone();
+    let mut out = merge_shallow(ctx, item);
+    out[index] = Value::from(next);
+    out
 }
 
 /// `ctx` with `payload`'s top-level keys written over it. A non-object payload
@@ -148,7 +169,7 @@ impl Machine {
                 let edges = events
                     .iter()
                     .map(|(event, def)| {
-                        let reduce = def.local.expect("checked in MachineBuilder::build");
+                        let reduce = def.local.clone().expect("checked in MachineBuilder::build");
                         (event.clone(), LocalTransition { target: def.target.clone(), reduce })
                     })
                     .collect();
@@ -536,6 +557,35 @@ impl MachineBuilder {
             target: to.into(),
             reduce: Some(Arc::new(|ctx, payload| Ok(merge_shallow(ctx, payload)))),
             local: Some(LocalReduce::Merge),
+        };
+        self.states.entry(from.into()).or_default().insert(event.into(), def);
+        self
+    }
+
+    /// Register a list-navigation transition (see [`step_list`]): moves
+    /// `ctx[index]` by `by` through `ctx[list]` (wrapping) and merges the
+    /// selected item into the context. Works for server and `.local()`
+    /// machines alike — e.g. a lightbox's prev/next:
+    ///
+    /// ```ignore
+    /// .step("viewing", "next", "viewing", "photos", "index", 1)
+    /// .step("viewing", "prev", "viewing", "photos", "index", -1)
+    /// ```
+    pub fn step(
+        mut self,
+        from: impl Into<String>,
+        event: impl Into<String>,
+        to: impl Into<String>,
+        list: impl Into<String>,
+        index: impl Into<String>,
+        by: i64,
+    ) -> Self {
+        let reduce = LocalReduce::Step { list: list.into(), index: index.into(), by };
+        let for_server = reduce.clone();
+        let def = TransitionDef {
+            target: to.into(),
+            reduce: Some(Arc::new(move |ctx, payload| Ok(for_server.apply(ctx, payload)))),
+            local: Some(reduce),
         };
         self.states.entry(from.into()).or_default().insert(event.into(), def);
         self
@@ -1290,5 +1340,29 @@ mod tests {
     #[should_panic(expected = "mutually exclusive")]
     fn local_and_shared_rejected() {
         lightbox().local().shared().build();
+    }
+
+    #[test]
+    fn step_list_wraps_and_merges_item() {
+        let ctx = json!({"photos": [{"url": "a"}, {"url": "b"}, {"url": "c"}], "index": 0});
+        let next = step_list(ctx.clone(), "photos", "index", 1);
+        assert_eq!((next["index"].as_i64(), next["url"].as_str()), (Some(1), Some("b")));
+        let wrapped = step_list(ctx.clone(), "photos", "index", -1);
+        assert_eq!((wrapped["index"].as_i64(), wrapped["url"].as_str()), (Some(2), Some("c")));
+        assert_eq!(step_list(json!({"photos": []}), "photos", "index", 1), json!({"photos": []}));
+    }
+
+    #[test]
+    fn step_runs_the_same_on_server_and_local() {
+        let b = MachineBuilder::new("lb", "viewing", json!({"photos": [{"url": "a"}, {"url": "b"}], "index": 1}))
+            .step("viewing", "next", "viewing", "photos", "index", 1);
+        let mut server = MachineInstance::new(b.build());
+        let s = server.send("next", json!(null)).unwrap();
+        let local = MachineBuilder::new("lb", "viewing", json!({"photos": [{"url": "a"}, {"url": "b"}], "index": 1}))
+            .step("viewing", "next", "viewing", "photos", "index", 1)
+            .local().build().local_def().unwrap();
+        let (_, lctx) = local.send("viewing", json!({"photos": [{"url": "a"}, {"url": "b"}], "index": 1}), "next", json!(null)).unwrap();
+        assert_eq!(s.context, lctx);
+        assert_eq!(lctx["url"], "a");
     }
 }

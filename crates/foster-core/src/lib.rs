@@ -4,7 +4,7 @@ pub mod snapshot;
 pub use foster_macros::html;
 pub use foster_macros::machine_graph;
 pub use machine::{
-    merge_shallow, LocalMachineDef, LocalReduce, LocalTransition, Machine, MachineBuilder,
+    merge_shallow, step_list, LocalMachineDef, LocalReduce, LocalTransition, Machine, MachineBuilder,
     MachineError, MachineInstance, TransitionDef,
 };
 pub use snapshot::Snapshot;

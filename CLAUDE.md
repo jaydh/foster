@@ -111,6 +111,7 @@ MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
 | `.pass(from, event, to)` | Context passes through unchanged |
 | `.typed_on(from, event, to, reducer)` | Reducer works with a typed struct — no `json!` unwrapping |
 | `.merge(from, event, to)` | Shallow-merge the event payload's top-level keys into context |
+| `.step(from, event, to, list, index, by)` | List navigation: move `ctx[index]` by `by` through `ctx[list]` (wrapping) and merge the selected item into context — prev/next for lightboxes, carousels, wizards |
 
 ### Shared machines, feeds, request events
 
@@ -150,7 +151,7 @@ MachineBuilder::new("theme", "light", json!({}))
     .build()
 ```
 
-- Only `.pass()` / `.merge()` edges and no `.schema()` — the generic client
+- Only `.pass()` / `.merge()` / `.step()` edges and no `.schema()` — the generic client
   can't run Rust reducers; `build()` panics otherwise.
 - `foster_server::router` embeds the definitions in the served template as
   `<script type="application/json" id="fx-local-machines">` and serves no
@@ -393,6 +394,7 @@ No pending items — all planned features are implemented. See "Already implemen
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
 - Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
 - `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
+- `.step()` list-navigation transitions (`LocalReduce::Step`, `step_list`) — `crates/foster-core/src/machine.rs`.
 - Shared machines + `Foster::feed` / `Foster::request_event` — `crates/foster-{core,server}/src/`.
 - Multiplexed SSE: `/events?subs=…`; the client opens one stream per page instead of one per machine (HTTP/1.1 caps browsers at 6 connections per host) — `crates/foster-{server,client}/src/lib.rs`.
 - `fx-bind-attr` `item:` source (per `fx-for` item) and `style.<prop>` targets — `crates/foster-client/src/lib.rs`.
