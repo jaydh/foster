@@ -166,6 +166,111 @@ async fn dispatch(
     }
 }
 
+// ── widgets ───────────────────────────────────────────────────────────────────
+//
+// `<canvas fx-widget="/widgets/life/life_widget.js">` — app-specific code
+// (typically a Rust crate built with `wasm-pack --target web`) for things
+// markup can't express, like a WebGL simulation. When the element first comes
+// within 200px of the viewport the client `import()`s the module, awaits its
+// default export (wasm-bindgen's `init`), then calls `mount(el)`. If the
+// element is inside an `[fx-machine]`, the module's optional
+// `update(el, state, ctxJson)` is called with that machine's current snapshot
+// and again on every later one — so a widget can follow Foster state
+// (running/paused, settings) without its own transport.
+
+#[wasm_bindgen(inline_js = "export function fx_import(url) { return import(url); }")]
+extern "C" {
+    fn fx_import(url: &str) -> js_sys::Promise;
+}
+
+thread_local! {
+    /// Mounted widgets: element + its module namespace.
+    static WIDGETS: RefCell<Vec<(Element, JsValue)>> = RefCell::new(Vec::new());
+    /// Last applied (state, context JSON) per machine root, for widgets that
+    /// mount after their machine's first snapshot.
+    static LAST_SNAPSHOT: RefCell<Vec<(Element, String, String)>> = RefCell::new(Vec::new());
+}
+
+fn call_update(module: &JsValue, el: &Element, state: &str, ctx_json: &str) {
+    let Ok(f) = js_sys::Reflect::get(module, &"update".into()) else { return };
+    let Some(f) = f.dyn_ref::<js_sys::Function>() else { return };
+    if let Err(e) = f.call3(&JsValue::NULL, el, &state.into(), &ctx_json.into()) {
+        web_sys::console::error_1(&e);
+    }
+}
+
+/// Record `snap` as `root`'s latest and pass it to the widgets it owns.
+fn notify_widgets(root: &Element, snap: &Snapshot) {
+    let ctx_json = snap.context.to_string();
+    LAST_SNAPSHOT.with(|l| {
+        let mut l = l.borrow_mut();
+        l.retain(|(r, _, _)| r != root);
+        l.push((root.clone(), snap.state.clone(), ctx_json.clone()));
+    });
+    let owned: Vec<(Element, JsValue)> = WIDGETS.with(|w| {
+        w.borrow().iter().filter(|(el, _)| owning_machine_root(el).as_ref() == Some(root)).cloned().collect()
+    });
+    for (el, module) in owned {
+        call_update(&module, &el, &snap.state, &ctx_json);
+    }
+}
+
+async fn load_widget(el: Element) {
+    let Some(url) = el.get_attribute("fx-widget") else { return };
+    let result: Result<JsValue, JsValue> = async {
+        let module = JsFuture::from(fx_import(&url)).await?;
+        if let Some(init) = js_sys::Reflect::get(&module, &"default".into())?.dyn_ref::<js_sys::Function>() {
+            let ret = init.call0(&JsValue::NULL)?;
+            if let Ok(p) = ret.dyn_into::<js_sys::Promise>() {
+                JsFuture::from(p).await?;
+            }
+        }
+        let mount = js_sys::Reflect::get(&module, &"mount".into())?;
+        let mount = mount.dyn_ref::<js_sys::Function>().ok_or_else(|| JsValue::from_str("widget has no mount()"))?;
+        mount.call1(&JsValue::NULL, &el)?;
+        Ok(module)
+    }
+    .await;
+    match result {
+        Ok(module) => {
+            WIDGETS.with(|w| w.borrow_mut().push((el.clone(), module.clone())));
+            if let Some(root) = owning_machine_root(&el) {
+                let last = LAST_SNAPSHOT.with(|l| l.borrow().iter().find(|(r, _, _)| *r == root).cloned());
+                if let Some((_, state, ctx)) = last {
+                    call_update(&module, &el, &state, &ctx);
+                }
+            }
+        }
+        Err(e) => web_sys::console::error_2(&format!("foster: widget {url} failed:").into(), &e),
+    }
+}
+
+/// Lazy-load every `[fx-widget]` on the page as it nears the viewport.
+fn attach_widgets(document: &Document) {
+    let Ok(list) = document.query_selector_all("[fx-widget]") else { return };
+    if list.length() == 0 { return; }
+    let cb = Closure::<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>::new(
+        move |entries: js_sys::Array, observer: web_sys::IntersectionObserver| {
+            for entry in entries.iter() {
+                let entry: web_sys::IntersectionObserverEntry = entry.unchecked_into();
+                if !entry.is_intersecting() { continue; }
+                let el = entry.target();
+                observer.unobserve(&el);
+                spawn_local(load_widget(el));
+            }
+        },
+    );
+    let opts = web_sys::IntersectionObserverInit::new();
+    opts.set_root_margin("200px");
+    let observer = web_sys::IntersectionObserver::new_with_options(cb.as_ref().unchecked_ref(), &opts).unwrap();
+    for i in 0..list.length() {
+        if let Some(Ok(el)) = list.item(i).map(|n| n.dyn_into::<Element>()) {
+            observer.observe(&el);
+        }
+    }
+    cb.forget();
+}
+
 /// Deserialized form of the server's `ContextPatch` SSE event.
 #[derive(Deserialize)]
 struct ContextPatch {
@@ -234,6 +339,8 @@ async fn bootstrap() {
 
         subs.push(Sub { key: format!("{machine_id}@{effective_session}"), root, machine_id, session_id: effective_session, cache_key });
     }
+
+    attach_widgets(&document);
 
     // One SSE stream for every server machine on the page, opened *before*
     // fetching the initial snapshots. This closes the race window where a
@@ -340,6 +447,7 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> Strin
     apply_fx_animate(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
     apply_fx_for(document, root, &snap.context);
+    notify_widgets(root, snap);
     prev
 }
 
