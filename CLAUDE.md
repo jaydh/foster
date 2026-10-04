@@ -185,7 +185,7 @@ builder.typed_on("viewing", "start_edit", "editing", begin_edit)
 - `MachineInstance` — mutable runtime state: current state + context `Value` + monotonic version
 - `Snapshot` — unit of everything: wire format, test injection, state diffing
 
-**Invariant: state transitions are the only way state changes.** The server owns instances; the client is a render layer.
+**Invariant: state transitions are the only way state changes.** The server owns server and `.shared()` instances (feeds deliver data as events, through the same reducers); `.local()` instances run in the client, which is otherwise a render layer.
 
 ### Inline templates — `html!` + `page()`
 
@@ -271,8 +271,10 @@ curl -X POST 'http://localhost:3000/test/state?session=my-test' \
 ## Session isolation
 
 Every machine instance is keyed by `(session_id, machine_id)`, created lazily on first access.
+`.shared()` machines ignore the session (one instance for everyone); `.local()` machines
+have no server instance and no `data-fx-session`.
 The WASM client generates a 128-bit random UUID if none is in the URL and stamps it as
-`data-fx-session` on `[fx-machine]`:
+`data-fx-session` on server-machine `[fx-machine]` roots:
 
 ```typescript
 const sid = await root.getAttribute('data-fx-session');
