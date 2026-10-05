@@ -26,6 +26,10 @@ fn store_context(cache_key: &str, ctx: Value) {
     CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(cache_key.to_string(), ctx); });
 }
 
+fn has_context(cache_key: &str) -> bool {
+    CONTEXT_CACHE.with(|c| c.borrow().contains_key(cache_key))
+}
+
 fn load_context(cache_key: &str) -> Value {
     CONTEXT_CACHE.with(|c| {
         c.borrow().get(cache_key).cloned().unwrap_or_else(|| Value::Object(Default::default()))
@@ -362,8 +366,14 @@ async fn bootstrap() {
     for sub in &subs {
         match fetch_snapshot(&sub.machine_id, &sub.session_id).await {
             Ok(snap) => {
-                // Seed the context cache so the first SSE "patch" event has a valid base.
-                store_context(&sub.cache_key, snap.context.clone());
+                // Seed the context cache so the first SSE "patch" event has a
+                // valid base — unless the stream already delivered its own
+                // "snapshot": with several replicas, /state may come from a
+                // different one than the stream, and patches only apply onto
+                // the stream's own base.
+                if !has_context(&sub.cache_key) {
+                    store_context(&sub.cache_key, snap.context.clone());
+                }
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
                 apply_snapshot_if_newer(&document, &sub.root, &snap);

@@ -60,6 +60,7 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
             .cloned()
             .ok_or_else(|| format!("machine '{machine_id}' not found"))?;
         let event_owned = event.to_string();
+        let shared = self.watchers.contains_key(machine_id);
         let snap = self
             .store
             .apply(session, machine_id, move |current| {
@@ -67,12 +68,30 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
                 if let Some(snap) = current {
                     inst.restore(snap).map_err(|e| e.to_string())?;
                 }
-                inst.send(&event_owned, payload).map_err(|e| e.to_string())
+                let mut snap = inst.send(&event_owned, payload).map_err(|e| e.to_string())?;
+                // Shared machines can live on several replicas at once (each
+                // with its own in-memory store, each driven by its own feed),
+                // and a page may read /state from one replica and stream
+                // /events from another. Per-replica counters diverge (one
+                // replica at v17000, another at v4000), and the client drops
+                // every "older" update. Wall-clock versions keep replicas
+                // comparable while staying monotonic per replica.
+                if shared {
+                    snap.version = snap.version.max(unix_millis());
+                }
+                Ok(snap)
             })
             .await?;
         self.pubsub.publish(session, machine_id, snap.clone()).await;
         Ok(snap)
     }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ── request events & feeds ────────────────────────────────────────────────────
@@ -1553,6 +1572,24 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let snap = state_of(&app, "/state?machine=live&session=anyone").await;
         assert_eq!((snap.state.as_str(), snap.context["n"].as_i64()), ("live", Some(1)));
+    }
+
+    #[tokio::test]
+    async fn shared_versions_are_comparable_across_replicas() {
+        // Two independent routers stand in for two replicas: one has seen
+        // many more updates than the other, yet its versions must not leave
+        // the other's (newer) updates looking stale.
+        let busy = router(HashMap::from([("live".to_string(), live().shared().build())]));
+        for _ in 0..50 {
+            transition(&busy, "live", "tick", "a").await;
+        }
+        let busy_v = state_of(&busy, "/state?machine=live").await.version;
+        // Each update adds at most 2 on top of the clock, so a burst can run a
+        // few ms ahead of wall time; a real feed ticks far slower than that.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let quiet = router(HashMap::from([("live".to_string(), live().shared().build())]));
+        let quiet_v = transition(&quiet, "live", "tick", "b").await.version;
+        assert!(quiet_v > busy_v, "later update on another replica ({quiet_v}) must beat {busy_v}");
     }
 
     #[test]

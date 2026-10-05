@@ -130,6 +130,10 @@ let app = foster_server::Foster::new(machines)
 ```
 
 - Feed items go through the machine's reducer/schema like any transition.
+- Shared machines use wall-clock (unix-ms) versions so snapshots from different
+  replicas stay comparable — with in-memory stores, a page can read `/state` from one
+  replica and stream `/events` from another. (Per-session machines don't get this;
+  multi-replica deployments of those need session affinity or the Redis backend.)
 - A feed's stream is only polled while someone has the machine's `/events`
   open — a polling stream does no work with no viewers. Panics at build if the
   machine isn't `.shared()` or never handles the event.
