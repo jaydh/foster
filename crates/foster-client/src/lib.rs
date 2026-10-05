@@ -305,6 +305,12 @@ async fn bootstrap() {
     let mut subs: Vec<Sub> = Vec::new();
     let roots = document.query_selector_all("[fx-machine]").unwrap();
     for i in 0..roots.length() {
+        // Set up one machine per task: doing every root's wiring and first
+        // render in a single synchronous pass made one long main-thread task
+        // on pages with many machines.
+        if i > 0 {
+            yield_to_event_loop().await;
+        }
         let root: Element = roots.item(i).unwrap().dyn_into().unwrap();
         let raw_attr = root.get_attribute("fx-machine").unwrap();
 
@@ -366,6 +372,16 @@ async fn bootstrap() {
             Err(e) => web_sys::console::error_1(&e),
         }
     }
+}
+
+/// Let the browser run other tasks (input, rendering) before continuing.
+async fn yield_to_event_loop() {
+    let p = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+    });
+    let _ = JsFuture::from(p).await;
 }
 
 // ── instance addressing ───────────────────────────────────────────────────────
@@ -795,20 +811,26 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
 
         container.set_inner_html("");
 
+        // Parse the template once and clone it per item (parsing HTML per row
+        // dominated long lists), and attach all rows in one DOM operation.
+        let scratch = document.create_element("div").unwrap();
+        scratch.set_inner_html(&template_html);
+        let Some(template_el) = scratch.first_element_child() else { continue };
+        let rows = document.create_document_fragment();
+
         for item in &array {
-            let scratch = document.create_element("div").unwrap();
-            scratch.set_inner_html(&template_html);
-            let Some(item_el) = scratch.first_element_child() else { continue };
+            let Ok(item_el) = template_el.clone_node_with_deep(true).map(|n| n.unchecked_into::<Element>()) else { continue };
 
             item_el.set_attribute("data-fx-item", &item.to_string()).unwrap();
 
-            if let Ok(el) = item_el.clone().dyn_into::<HtmlElement>() {
+            if let Some(el) = item_el.dyn_ref::<HtmlElement>() {
                 let _ = el.style().remove_property("display");
             }
 
             apply_fx_fields(&item_el, item);
-            container.append_child(&item_el).unwrap();
+            rows.append_child(&item_el).unwrap();
         }
+        container.append_child(&rows).unwrap();
     }
 }
 

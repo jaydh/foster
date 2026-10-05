@@ -23,6 +23,7 @@ features = [
     "console",
     "CssStyleDeclaration",
     "Document",
+    "DocumentFragment",
     "Element",
     "Event",
     "Headers",
