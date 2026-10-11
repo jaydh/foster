@@ -43,6 +43,8 @@ where
     /// pause while nobody is watching.
     watchers: Arc<HashMap<String, watch::Sender<usize>>>,
     request_events: Arc<HashMap<String, RequestEvent>>,
+    /// machine id → event → handler run after that transition — see [`Foster::effect`].
+    effects: Arc<HashMap<String, HashMap<String, EffectFn>>>,
 }
 
 impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
@@ -52,13 +54,16 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
         if self.watchers.contains_key(machine) { SHARED_SESSION } else { requested }
     }
 
-    /// Fire `event` on `(session, machine_id)` atomically and broadcast the result.
+    /// Fire `event` on `(session, machine_id)` atomically, broadcast the result,
+    /// and start the event's [effect](Foster::effect), if any.
     async fn fire(&self, session: &str, machine_id: &str, event: &str, payload: Value) -> Result<Snapshot, String> {
         let machine = self
             .machines
             .get(machine_id)
             .cloned()
             .ok_or_else(|| format!("machine '{machine_id}' not found"))?;
+        let effect = self.effects.get(machine_id).and_then(|m| m.get(event)).cloned();
+        let effect_payload = effect.is_some().then(|| payload.clone());
         let event_owned = event.to_string();
         let shared = self.watchers.contains_key(machine_id);
         let snap = self
@@ -83,7 +88,32 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
             })
             .await?;
         self.pubsub.publish(session, machine_id, snap.clone()).await;
+        if let (Some(effect), Some(payload)) = (effect, effect_payload) {
+            tokio::spawn(effect(Effect {
+                session: session.to_string(),
+                machine: machine_id.to_string(),
+                event: event.to_string(),
+                payload,
+                snapshot: snap.clone(),
+                fire: self.fire_fn(),
+            }));
+        }
         Ok(snap)
+    }
+
+    /// [`fire`](Self::fire), type-erased for [`Effect::send`]. The target
+    /// machine's session is resolved here, so an effect can reach a
+    /// `.shared()` machine as well as its own session's machines.
+    fn fire_fn(&self) -> FireFn {
+        let app = self.clone();
+        Arc::new(move |session, machine, event, payload| {
+            let app = app.clone();
+            async move {
+                let session = app.session(&machine, &session).to_string();
+                app.fire(&session, &machine, &event, payload).await
+            }
+            .boxed()
+        })
     }
 }
 
@@ -119,6 +149,43 @@ struct Feed {
     stream: BoxStream<'static, Value>,
 }
 
+type EffectFn = Arc<dyn Fn(Effect) -> BoxFuture<'static, ()> + Send + Sync>;
+type FireFn =
+    Arc<dyn Fn(String, String, String, Value) -> BoxFuture<'static, Result<Snapshot, String>> + Send + Sync>;
+
+/// What an [effect](Foster::effect) handler gets: the transition that triggered
+/// it, and a way to send follow-up events into the same session.
+#[derive(Clone)]
+pub struct Effect {
+    /// The session the triggering event came from (the client's random session
+    /// ID; `__shared__` for `.shared()` machines). Useful as a key for
+    /// per-session server resources, such as a job a later event cancels — not
+    /// an identity: it's client-generated.
+    pub session: String,
+    pub machine: String,
+    pub event: String,
+    /// The triggering event's payload (after any request-event merge).
+    pub payload: Value,
+    /// The machine's snapshot right after the triggering transition.
+    pub snapshot: Snapshot,
+    fire: FireFn,
+}
+
+impl Effect {
+    /// Send `event` to the same machine instance — a result, a progress
+    /// update, an error. It goes through the reducer like any transition and is
+    /// pushed to the session's open pages; it can trigger its own effect.
+    pub async fn send(&self, event: &str, payload: Value) -> Result<Snapshot, String> {
+        (self.fire)(self.session.clone(), self.machine.clone(), event.to_string(), payload).await
+    }
+
+    /// Send `event` to another machine in the same session (or to a
+    /// `.shared()` machine).
+    pub async fn send_to(&self, machine: &str, event: &str, payload: Value) -> Result<Snapshot, String> {
+        (self.fire)(self.session.clone(), machine.to_string(), event.to_string(), payload).await
+    }
+}
+
 /// Builder for the Foster router when you need more than [`router`]: server-side
 /// [feeds](Foster::feed) and [request events](Foster::request_event).
 ///
@@ -132,11 +199,47 @@ pub struct Foster {
     machines: HashMap<String, Arc<Machine>>,
     feeds: Vec<Feed>,
     request_events: HashMap<String, RequestEvent>,
+    effects: HashMap<String, HashMap<String, EffectFn>>,
 }
 
 impl Foster {
     pub fn new(machines: HashMap<String, Arc<Machine>>) -> Self {
-        Self { machines, feeds: Vec::new(), request_events: HashMap::new() }
+        Self { machines, feeds: Vec::new(), request_events: HashMap::new(), effects: HashMap::new() }
+    }
+
+    /// Run async server-side work after `machine` takes `event`: a database
+    /// query, a filesystem operation, a long job reporting progress. `handler`
+    /// is spawned once the transition is committed and broadcast, and reports
+    /// back by sending events into the same session with [`Effect::send`] —
+    /// so the reducers stay pure and the result reaches every open page over
+    /// SSE.
+    ///
+    /// ```ignore
+    /// // "open" moves the machine to "loading"; the effect fills it in.
+    /// .effect("dir", "open", |fx: Effect| async move {
+    ///     let listing = list_dir(fx.payload["path"].as_str().unwrap_or("/")).await;
+    ///     let _ = match listing {
+    ///         Ok(entries) => fx.send("loaded", json!({ "entries": entries })).await,
+    ///         Err(e) => fx.send("failed", json!({ "error": e.to_string() })).await,
+    ///     };
+    /// })
+    /// ```
+    ///
+    /// Fires for every successful `event` on the machine: client transitions,
+    /// feed items, and events sent by other effects. One handler per
+    /// `(machine, event)`; a later call replaces an earlier one.
+    ///
+    /// # Panics
+    /// When `router()` is built: if `machine` is unknown or `.local()`, or never
+    /// handles `event`. Requires a Tokio runtime.
+    pub fn effect<F, Fut>(mut self, machine: &str, event: &str, handler: F) -> Self
+    where
+        F: Fn(Effect) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler: EffectFn = Arc::new(move |fx| handler(fx).boxed());
+        self.effects.entry(machine.into()).or_default().insert(event.into(), handler);
+        self
     }
 
     /// Drive a `.shared()` machine from server-side data: each item `stream`
@@ -272,7 +375,7 @@ where
     S: StateStore + Clone + 'static,
     P: PubSub + Clone + 'static,
 {
-    let Foster { machines, feeds, request_events } = foster;
+    let Foster { machines, feeds, request_events, effects } = foster;
     // Collect template HTML and machine metadata before machines are moved into AppState.
     // Only one machine needs `.template(...)` set — the whole page is shared, and each
     // machine below validates only its own `[fx-machine="{id}"]` subtree(s) within it.
@@ -338,6 +441,15 @@ where
             "feed: machine '{}' has no '{}' transition", feed.machine, feed.event,
         );
     }
+    for (id, events) in &effects {
+        let m = machines.get(id).unwrap_or_else(|| panic!("effect: machine '{id}' not found (or it's .local())"));
+        for event in events.keys() {
+            assert!(
+                m.transitions().iter().any(|(_, ev, _)| ev == event),
+                "effect: machine '{id}' has no '{event}' transition",
+            );
+        }
+    }
     for (id, re) in &request_events {
         let m = machines.get(id).unwrap_or_else(|| panic!("request_event: machine '{id}' not found"));
         assert!(
@@ -359,6 +471,7 @@ where
         test_mode,
         watchers: Arc::new(watchers),
         request_events: Arc::new(request_events),
+        effects: Arc::new(effects),
     };
 
     for feed in feeds {
@@ -1665,6 +1778,82 @@ mod tests {
             .await.unwrap();
         let snap: Snapshot = rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(snap.context, json!({"keep": 1, "ua": "btn/2"}));
+    }
+
+    // ── effects ────────────────────────────────────────────────────────────────
+
+    fn dir() -> MachineBuilder {
+        MachineBuilder::new("dir", "idle", json!({}))
+            .merge("idle", "open", "loading")
+            .merge("loading", "loaded", "ready")
+    }
+
+    async fn send(app: &Router, machine: &str, event: &str, session: &str, payload: Value) -> Snapshot {
+        let body = rmp_serde::to_vec_named(&json!({"machine": machine, "event": event, "payload": payload, "session": session})).unwrap();
+        let resp = app.clone()
+            .oneshot(Request::builder().method("POST").uri("/transition").body(Body::from(body)).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    /// Polls `/state` until `machine` reaches `state` (effects run on a spawned task).
+    async fn eventually(app: &Router, machine: &str, session: &str, state: &str) -> Snapshot {
+        let uri = format!("/state?machine={machine}&session={session}");
+        for _ in 0..200 {
+            let snap = state_of(app, &uri).await;
+            if snap.state == state { return snap; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("{machine}@{session} never reached '{state}'");
+    }
+
+    #[tokio::test]
+    async fn effect_sends_result_into_triggering_session() {
+        let app = Foster::new(HashMap::from([("dir".to_string(), dir().build())]))
+            .effect("dir", "open", |fx: Effect| async move {
+                assert_eq!(fx.snapshot.state, "loading");
+                let path = fx.payload["path"].as_str().unwrap_or("").to_string();
+                fx.send("loaded", json!({ "entries": [format!("{path}/a.txt")] })).await.unwrap();
+            })
+            .router();
+        let snap = send(&app, "dir", "open", "alice", json!({ "path": "/docs" })).await;
+        assert_eq!(snap.state, "loading", "the response is the triggering transition");
+        let done = eventually(&app, "dir", "alice", "ready").await;
+        assert_eq!(done.context["entries"], json!(["/docs/a.txt"]));
+        // Other sessions are untouched.
+        assert_eq!(state_of(&app, "/state?machine=dir&session=bob").await.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn effect_can_reach_shared_machine() {
+        let app = Foster::new(HashMap::from([
+            ("dir".to_string(), dir().build()),
+            ("live".to_string(), live().shared().build()),
+        ]))
+        .effect("dir", "open", |fx: Effect| async move {
+            fx.send_to("live", "tick", json!({ "opened_by": fx.session })).await.unwrap();
+        })
+        .router();
+        send(&app, "dir", "open", "alice", json!({})).await;
+        let live = eventually(&app, "live", "anyone", "live").await;
+        assert_eq!(live.context["opened_by"], "alice");
+    }
+
+    #[test]
+    #[should_panic(expected = "effect: machine 'dir' has no 'nope' transition")]
+    fn effect_requires_known_event() {
+        let _ = Foster::new(HashMap::from([("dir".to_string(), dir().build())]))
+            .effect("dir", "nope", |_fx: Effect| async {})
+            .router();
+    }
+
+    #[test]
+    #[should_panic(expected = "effect: machine 'ghost' not found")]
+    fn effect_requires_known_machine() {
+        let _ = Foster::new(HashMap::from([("dir".to_string(), dir().build())]))
+            .effect("ghost", "open", |_fx: Effect| async {})
+            .router();
     }
 
     #[tokio::test]
