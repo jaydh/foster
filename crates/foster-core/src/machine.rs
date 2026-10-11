@@ -271,13 +271,13 @@ impl Machine {
             }
 
             for val in extract_attr_values(subtree, "fx-on") {
-                if let Some(event) = val.splitn(2, "->").nth(1) {
-                    let event = event.trim();
+                for binding in crate::parse_fx_on(&val) {
+                    let event = binding.event.as_str();
                     // `->other:event` targets another machine; checked there (below).
                     if event.contains(':') {
                         continue;
                     }
-                    if !event.is_empty() && !valid_events.contains(event) {
+                    if !valid_events.contains(event) {
                         errors.push(format!(
                             "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",
                             self.id
@@ -290,7 +290,8 @@ impl Machine {
         // Cross-machine events anywhere on the page aimed at this machine.
         let prefix = format!("{}:", self.id);
         for val in extract_attr_values(html, "fx-on") {
-            if let Some(event) = val.splitn(2, "->").nth(1).and_then(|e| e.trim().strip_prefix(&prefix)) {
+            for binding in crate::parse_fx_on(&val) {
+                let Some(event) = binding.event.strip_prefix(&prefix) else { continue };
                 if !valid_events.contains(event) {
                     errors.push(format!(
                         "fx-on=\"{val}\": event '{event}' not defined in machine '{}'",

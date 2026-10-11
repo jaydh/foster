@@ -1,3 +1,4 @@
+pub mod fx_on;
 pub mod machine;
 pub mod snapshot;
 
@@ -7,6 +8,7 @@ pub use machine::{
     merge_shallow, step_list, LocalMachineDef, LocalReduce, LocalTransition, Machine, MachineBuilder,
     MachineError, MachineInstance, TransitionDef,
 };
+pub use fx_on::{parse_fx_on, FxOn};
 pub use snapshot::Snapshot;
 
 /// Wrap body HTML in a standard page shell (DOCTYPE, head, CSS, script).

@@ -140,6 +140,34 @@ let app = foster_server::Foster::new(machines)
 - `RequestInfo { headers, remote_addr }` (`remote_addr` needs
   `into_make_service_with_connect_info::<SocketAddr>()`).
 
+### Effects — async server work after a transition
+
+Reducers are pure and synchronous. For I/O (a query, a filesystem call, a long
+job with progress), register an effect: it's spawned after the transition is
+committed and broadcast, and reports back by sending events into the **same
+session** — which go through reducers and reach the session's pages over SSE.
+
+```rust
+Foster::new(machines)
+    // "open" moves "dir" to "loading"; the effect fills it in.
+    .effect("dir", "open", |fx: Effect| async move {
+        match list_dir(fx.payload["path"].as_str().unwrap_or("/")).await {
+            Ok(entries) => { let _ = fx.send("loaded", json!({ "entries": entries })).await; }
+            Err(e) => { let _ = fx.send("failed", json!({ "error": e.to_string() })).await; }
+        }
+    })
+    .router();
+```
+
+- `Effect { session, machine, event, payload, snapshot }` + `fx.send(event, payload)`
+  (same machine) / `fx.send_to(machine, event, payload)` (another machine in the
+  session, or a `.shared()` one).
+- Fires for every successful `(machine, event)`: client transitions, feed items,
+  and events sent by other effects (chains are allowed — avoid cycles).
+- One handler per `(machine, event)`. Panics at build for unknown machines or events.
+- `fx.session` is the client's random session ID — a key for per-session server
+  resources (a job a later event cancels), not an identity.
+
 ### Local (client-only) machines
 
 `.local()` runs a machine in the browser instead of on the server — for
@@ -295,12 +323,14 @@ All attributes processed client-side by the WASM runtime.
 | `fx-show` | `fx-show="idle,loading"` | Visible only in listed states |
 | `fx-text` | `fx-text="count"` | Set text from `context[key]` |
 | `fx-disable` | `fx-disable="loading"` | Add `disabled` in listed states |
-| `fx-on` | `fx-on="click->increment"` | Fire machine event on DOM event |
+| `fx-on` | `fx-on="click->increment"` | Fire machine event on DOM event (`click`, `input`, `change`, `keydown`); several space-separated bindings allowed |
+| `fx-on="keydown.Key->…"` | `fx-on="keydown.Enter->save keydown.Escape->cancel"` | Keyboard binding limited to one `KeyboardEvent.key` (`Space` for `" "`). The nearest ancestor with a binding *for this event* handles it, so an input's key bindings don't swallow its row's clicks |
+| `fx-copy` | `fx-copy="item:url"` / `fx-copy="ctx:share_url"` | On click, copy that `fx-for` item field / context value to the clipboard (pair with `fx-on="click->copied"` for feedback) |
 | `fx-state-label` | `fx-state-label` | Display current state name |
 | `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]` |
 | `fx-where` | `fx-where='{"column":"todo"}'` | Filter `fx-for` items by key/value |
 | `fx-field` | `fx-field="title"` | Set text from item field inside `fx-for` |
-| `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload |
+| `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload; when several inputs collect one key, a visible one wins over hidden ones |
 | `fx-value` | `fx-value="draft_title"` | Pre-populate input from context |
 | `fx-payload` | `fx-payload='{"col":"done"}'` | Static JSON merged into transition payload |
 | `fx-class` | `fx-class="calm:is-active"` | Add CSS class when in named state |
@@ -409,6 +439,9 @@ No pending items — all planned features are implemented. See "Already implemen
 - Shared machines + `Foster::feed` / `Foster::request_event` — `crates/foster-{core,server}/src/`.
 - Multiplexed SSE: `/events?subs=…`; the client opens one stream per page instead of one per machine (HTTP/1.1 caps browsers at 6 connections per host) — `crates/foster-{server,client}/src/lib.rs`.
 - `fx-bind-attr` `item:` source (per `fx-for` item) and `style.<prop>` targets — `crates/foster-client/src/lib.rs`.
+- Effects: `Foster::effect(machine, event, handler)` — async server work after a transition, reporting back via `Effect::send` into the same session — `crates/foster-server/src/lib.rs`.
+- `fx-on` grammar in `foster-core` (`parse_fx_on` / `FxOn`, shared by validation and client): several bindings per element, `keydown.Key` filters — `crates/foster-core/src/fx_on.rs`. Hand-written spec: `examples/kanban/tests/keys.spec.ts`.
+- `fx-copy` clipboard attribute — `crates/foster-client/src/lib.rs`.
 - Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
 - `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
 - `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.

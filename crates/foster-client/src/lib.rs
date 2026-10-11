@@ -2,7 +2,7 @@ use foster_core::{LocalMachineDef, MachineError, Snapshot};
 use serde::Deserialize;
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
@@ -942,11 +942,14 @@ fn attach_triggers(document: Document, root: Element, machine_id: String, sessio
     attach_outside_triggers(document, own);
 }
 
-/// Parse `fx-on="dom_event->machine_event"`.
-fn parse_fx_on(el: &Element) -> Option<(String, String)> {
-    let fx_on = el.get_attribute("fx-on")?;
-    let (dom, machine) = fx_on.split_once("->")?;
-    Some((dom.trim().to_string(), machine.trim().to_string()))
+/// `el`'s `fx-on` bindings — see [`foster_core::fx_on`] for the grammar.
+fn fx_on_bindings(el: &Element) -> Vec<foster_core::FxOn> {
+    el.get_attribute("fx-on").map(|a| foster_core::parse_fx_on(&a)).unwrap_or_default()
+}
+
+/// The event `el` binds to `trigger` (no key filter), if any.
+fn bound_event(el: &Element, trigger: &str) -> Option<String> {
+    fx_on_bindings(el).into_iter().find(|b| b.matches(trigger, None)).map(|b| b.event)
 }
 
 /// Fire `machine_event` (from `fx_on_el`'s trigger) and apply the result,
@@ -1006,25 +1009,31 @@ fn attach_delegating_listener(document: Document, own: Target) {
         let Some(target) = event.target() else { return };
         let Ok(target_el): Result<Element, _> = target.dyn_into() else { return };
 
-        let Some(fx_on_el) = find_fx_on_ancestor(&target_el, root) else { return };
+        let kind = event.type_();
+        let key = event.dyn_ref::<web_sys::KeyboardEvent>().map(|k| k.key());
+
+        if kind == "click" {
+            copy_on_click(&target_el, root, &own.cache_key);
+        }
+
+        // Nearest ancestor with a binding for this event — an input's
+        // `keydown.Enter` doesn't swallow clicks meant for its row.
+        let Some((fx_on_el, machine_event)) = find_binding(&target_el, root, &kind, key.as_deref()) else { return };
 
         // If `fx_on_el` actually belongs to a more deeply-nested machine (its
         // nearest `[fx-machine]` ancestor isn't `root`), that machine's own
-        // listener owns this click — bail out instead of firing it here too.
+        // listener owns this event — bail out instead of firing it here too.
         match owning_machine_root(&fx_on_el) {
             Some(owner) if owner == *root => {}
             _ => return,
         }
 
-        let Some((dom_event, machine_event)) = parse_fx_on(&fx_on_el) else { return };
-        if event.type_() != dom_event { return; }
-
         fire_spec(&document, &own, &fx_on_el, machine_event);
     });
 
-    // Register for click, change (select/input blur), and input (live text) so
-    // fx-on="change->..." and fx-on="input->..." work alongside fx-on="click->...".
-    for ev_type in &["click", "change", "input"] {
+    // click, change (select/input blur), input (live text) and keydown
+    // (`fx-on="keydown.Enter->save"`).
+    for ev_type in &["click", "change", "input", "keydown"] {
         root.add_event_listener_with_callback(ev_type, cb.as_ref().unchecked_ref()).unwrap();
     }
     cb.forget();
@@ -1038,7 +1047,7 @@ fn attach_delegating_listener(document: Document, own: Target) {
 fn attach_visible_triggers(document: Document, own: Target, trigger: &'static str, root_margin: Option<&str>, once: bool) {
     let els: Vec<Element> = self_and_descendants(&own.root, "[fx-on]")
         .into_iter()
-        .filter(|el| matches!(parse_fx_on(el), Some((d, _)) if d == trigger))
+        .filter(|el| bound_event(el, trigger).is_some())
         .collect();
     if els.is_empty() { return; }
 
@@ -1051,7 +1060,7 @@ fn attach_visible_triggers(document: Document, own: Target, trigger: &'static st
                 if once {
                     observer.unobserve(&el);
                 }
-                if let Some((_, machine_event)) = parse_fx_on(&el) {
+                if let Some(machine_event) = bound_event(&el, trigger) {
                     fire_spec(&document, &own, &el, machine_event);
                 }
             }
@@ -1073,10 +1082,11 @@ fn attach_visible_triggers(document: Document, own: Target, trigger: &'static st
 fn attach_outside_triggers(document: Document, own: Target) {
     let specs: Vec<(Element, String, String)> = self_and_descendants(&own.root, "[fx-on]")
         .into_iter()
-        .filter_map(|el| {
-            let (dom, machine_event) = parse_fx_on(&el)?;
-            let dom_event = dom.strip_suffix("@outside")?.to_string();
-            Some((el, dom_event, machine_event))
+        .flat_map(|el| {
+            fx_on_bindings(&el)
+                .into_iter()
+                .filter_map(|b| Some((el.clone(), b.trigger.strip_suffix("@outside")?.to_string(), b.event)))
+                .collect::<Vec<_>>()
         })
         .collect();
     if specs.is_empty() { return; }
@@ -1165,10 +1175,56 @@ fn attach_sse(document: Document, subs: &[Sub]) {
     std::mem::forget(es);
 }
 
-fn find_fx_on_ancestor(el: &Element, root: &Element) -> Option<Element> {
+/// `fx-copy="ctx:key"` / `fx-copy="item:field"` — copy that context value (or
+/// `fx-for` item field) to the clipboard when the element is clicked. Pair it
+/// with `fx-on="click->copied"` for feedback.
+fn copy_on_click(target: &Element, root: &Element, cache_key: &str) {
+    let mut cur = Some(target.clone());
+    let el = loop {
+        let Some(c) = cur else { return };
+        if c.has_attribute("fx-copy") { break c; }
+        if c == *root { return; }
+        cur = c.parent_element();
+    };
+    if owning_machine_root(&el).as_ref() != Some(root) { return; }
+    let spec = el.get_attribute("fx-copy").unwrap_or_default();
+    let value = match spec.split_once(':') {
+        Some(("ctx", key)) => load_context(cache_key).get(key).cloned(),
+        Some(("item", field)) => find_item_ancestor(&el, root)
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+            .and_then(|item| item.get(field).cloned()),
+        _ => None,
+    };
+    let text = match value {
+        Some(Value::String(s)) => s,
+        Some(Value::Null) | None => {
+            web_sys::console::error_1(&format!("foster: fx-copy=\"{spec}\" has no value").into());
+            return;
+        }
+        Some(v) => v.to_string(),
+    };
+    // navigator.clipboard.writeText(text) — looked up dynamically, so no
+    // web-sys unstable-API features are needed.
+    let write = || -> Result<(), JsValue> {
+        let clipboard = js_sys::Reflect::get(&web_sys::window().unwrap().navigator(), &"clipboard".into())?;
+        let write_text: js_sys::Function = js_sys::Reflect::get(&clipboard, &"writeText".into())?.dyn_into()?;
+        write_text.call1(&clipboard, &text.into())?;
+        Ok(())
+    };
+    if let Err(e) = write() {
+        web_sys::console::error_1(&e);
+    }
+}
+
+/// Nearest element from `el` up to `root` with an `fx-on` binding for a DOM
+/// event of type `kind` (and `key`, for keyboard events), and that binding's
+/// event.
+fn find_binding(el: &Element, root: &Element, kind: &str, key: Option<&str>) -> Option<(Element, String)> {
     let mut cur: Option<Element> = Some(el.clone());
     while let Some(c) = cur {
-        if c.has_attribute("fx-on") { return Some(c); }
+        if let Some(b) = fx_on_bindings(&c).into_iter().find(|b| b.matches(kind, key)) {
+            return Some((c, b.event));
+        }
         if c == *root { return None; }
         cur = c.parent_element();
     }
@@ -1178,11 +1234,17 @@ fn find_fx_on_ancestor(el: &Element, root: &Element) -> Option<Element> {
 fn build_payload(fx_on_el: &Element, root: &Element) -> Value {
     let mut map = serde_json::Map::new();
 
-    let els = self_and_descendants(root, "[fx-collect]");
-    for el in els {
+    // Several inputs can collect the same key (a "new" and an "edit" dialog
+    // both collecting `title`); the one on screen wins over hidden ones,
+    // else the first.
+    let mut from_visible: HashSet<String> = HashSet::new();
+    for el in self_and_descendants(root, "[fx-collect]") {
         let key = el.get_attribute("fx-collect").unwrap_or_default();
-        if let Some(val) = read_input_value(&el) {
-            map.insert(key, Value::String(val));
+        let Some(val) = read_input_value(&el) else { continue };
+        let visible = el.get_client_rects().length() > 0;
+        if !map.contains_key(&key) || (visible && !from_visible.contains(&key)) {
+            map.insert(key.clone(), Value::String(val));
+            if visible { from_visible.insert(key); }
         }
     }
 

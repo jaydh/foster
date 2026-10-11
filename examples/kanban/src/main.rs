@@ -125,6 +125,7 @@ async fn main() {
                         div[class="task-card", data_template, style="display:none"] {
                             div[class="task-title", field="title"] { "—" }
                             div[class="card-actions"] {
+                                button[class="btn", fx_copy="item:title"] { "copy" }
                                 button[class="btn", on="click->start_edit"] { "edit" }
                                 button[class="btn btn-danger", on="click->start_delete"] { "del" }
                                 button[class="btn btn-safe", on="click->move_task", payload=r#"{"column":"in_progress"}"#] { "→ IP" }
@@ -162,7 +163,7 @@ async fn main() {
             div[class="modal", show="creating"] {
                 div[class="modal-box"] {
                     div[class="modal-title"] { "New task" }
-                    input[type="text", placeholder="Task title…", collect="draft_title", autofocus]
+                    input[type="text", placeholder="Task title…", collect="draft_title", autofocus, on="keydown.Enter->save keydown.Escape->cancel"]
                     div[class="modal-actions"] {
                         button[class="btn", on="click->cancel"] { "Cancel" }
                         button[class="btn btn-safe", on="click->save"] { "Save" }
@@ -172,7 +173,7 @@ async fn main() {
             div[class="modal", show="editing"] {
                 div[class="modal-box"] {
                     div[class="modal-title"] { "Edit task" }
-                    input[type="text", placeholder="Task title…", value="draft_title", collect="draft_title"]
+                    input[type="text", placeholder="Task title…", value="draft_title", collect="draft_title", on="keydown.Enter->save keydown.Escape->cancel"]
                     div[class="modal-actions"] {
                         button[class="btn", on="click->cancel"] { "Cancel" }
                         button[class="btn btn-safe", on="click->save"] { "Save" }
