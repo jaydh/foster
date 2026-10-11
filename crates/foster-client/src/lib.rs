@@ -979,17 +979,18 @@ fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &st
 
         match dispatch(&mid, &machine_event, payload, &sid, &ck).await {
             Ok(Some(snap)) => {
-                let prev = apply_snapshot(&doc_clone, &root_clone, &snap);
-                update_debug(&doc_clone, &root_clone, &snap);
+                // A server effect can answer over SSE before this response
+                // arrives (`open` → effect → `loaded` pushed at v2, while the
+                // response still carries v1): don't let the older snapshot
+                // overwrite the newer one.
+                let Some(prev) = apply_snapshot_if_newer(&doc_clone, &root_clone, &snap) else { return };
                 // fx-enter: fire follow-up events triggered by state entry.
                 for ev in collect_enter_events(&root_clone, &prev, &snap.state) {
                     if let Ok(Some(s2)) = dispatch(&mid, &ev, serde_json::json!({}), &sid, &ck).await {
-                        let prev2 = apply_snapshot(&doc_clone, &root_clone, &s2);
-                        update_debug(&doc_clone, &root_clone, &s2);
+                        let Some(prev2) = apply_snapshot_if_newer(&doc_clone, &root_clone, &s2) else { continue };
                         for ev2 in collect_enter_events(&root_clone, &prev2, &s2.state) {
                             if let Ok(Some(s3)) = dispatch(&mid, &ev2, serde_json::json!({}), &sid, &ck).await {
-                                apply_snapshot(&doc_clone, &root_clone, &s3);
-                                update_debug(&doc_clone, &root_clone, &s3);
+                                apply_snapshot_if_newer(&doc_clone, &root_clone, &s3);
                             }
                         }
                     }

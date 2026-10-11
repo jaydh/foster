@@ -811,7 +811,19 @@ where
             tx.send_modify(|n| *n += 1);
             guards.push(WatchGuard(tx.clone()));
         }
-        streams.push(app.pubsub.subscribe(&session, &machine).map(move |snap| (sub.clone(), snap)).boxed());
+        // Subscribe, *then* read the stored snapshot and send it first: an
+        // update published before this stream connected (an effect finishing
+        // while the page loads, a reconnect after a network blip) isn't lost,
+        // and nothing can slip between the read and the subscription. The
+        // client drops anything not newer than what it has.
+        let live = app.pubsub.subscribe(&session, &machine);
+        let current = app.store.load(&session, &machine).await;
+        streams.push(
+            futures_util::stream::iter(current)
+                .chain(live)
+                .map(move |snap| (sub.clone(), snap))
+                .boxed(),
+        );
     }
 
     let mut prev: HashMap<String, Snapshot> = HashMap::new();
@@ -1971,6 +1983,21 @@ mod tests {
         let _ = Foster::new(HashMap::from([("dir".to_string(), dir().build())]))
             .effect("ghost", "open", |_fx: Effect| async {})
             .router();
+    }
+
+    #[tokio::test]
+    async fn events_start_with_the_current_snapshot() {
+        // A result that lands before the page's stream connects isn't lost.
+        let app = router(HashMap::from([("dir".to_string(), dir().build())]));
+        send(&app, "dir", "open", "s", json!({ "path": "/x" })).await;
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/events?subs=dir@s").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await.expect("snapshot without any new transition").unwrap().unwrap();
+        let text = String::from_utf8_lossy(frame.data_ref().unwrap()).into_owned();
+        assert!(text.contains("event: snapshot") && text.contains(r#""state":"loading""#), "{text}");
     }
 
     // ── identity ───────────────────────────────────────────────────────────────
