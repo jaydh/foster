@@ -15,7 +15,7 @@ path = "src/bin/gen_tests.rs"
 foster-core   = { path = "../../crates/foster-core" }
 foster-server = { path = "../../crates/foster-server" }
 foster-testgen = { path = "../../crates/foster-testgen" }
-axum = "0.7"
+axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
-tower-http = { version = "0.5", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs"] }

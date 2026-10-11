@@ -674,7 +674,8 @@ async fn get_state<S, P>(
     State(app): State<AppState<S, P>>,
     who: Option<Extension<Identity>>,
     headers: HeaderMap,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    // axum 0.8 has no `Option<ConnectInfo>` extractor; it's an extension.
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Response
 where
     S: StateStore + Clone,
@@ -690,7 +691,7 @@ where
     // Request events refresh on every load — see `Foster::request_event`.
     if let Some(re) = app.request_events.get(&q.machine).cloned() {
         let identity = who.map(|Identity(id)| id);
-        let payload = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0), identity }).await;
+        let payload = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|Extension(ConnectInfo(a))| a), identity }).await;
         return match app.fire(session, &q.machine, &re.event, payload).await {
             Ok(snap) => msgpack(&snap),
             Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
@@ -708,7 +709,8 @@ async fn post_transition<S, P>(
     State(app): State<AppState<S, P>>,
     who: Option<Extension<Identity>>,
     headers: HeaderMap,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    // axum 0.8 has no `Option<ConnectInfo>` extractor; it's an extension.
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
     body: Bytes,
 ) -> Response
 where
@@ -730,7 +732,7 @@ where
     let mut payload = req.payload;
     if let Some(re) = app.request_events.get(&req.machine).filter(|re| re.event == req.event).cloned() {
         let identity = who.map(|Identity(id)| id);
-        let extra = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0), identity }).await;
+        let extra = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|Extension(ConnectInfo(a))| a), identity }).await;
         payload = merge_shallow(payload, extra);
     }
 
