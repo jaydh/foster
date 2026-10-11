@@ -5,9 +5,10 @@ pub use store::{RedisStore, RedisPubSub};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Extension, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
+    middleware::{self, Next},
     routing::{get, post},
     Json, Router,
 };
@@ -45,13 +46,48 @@ where
     request_events: Arc<HashMap<String, RequestEvent>>,
     /// machine id → event → handler run after that transition — see [`Foster::effect`].
     effects: Arc<HashMap<String, HashMap<String, EffectFn>>>,
+    /// Whether [`Foster::identity`] is set, i.e. session keys are scoped by user.
+    scoped: bool,
 }
 
+/// The authenticated user of a request, from [`Foster::identity`]; put in the
+/// request's extensions by the identity middleware.
+#[derive(Clone, Debug)]
+struct Identity(String);
+
 impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
-    /// The store/pubsub session for `machine`: [`SHARED_SESSION`] for `.shared()`
-    /// machines (one instance for everyone), the caller's session otherwise.
-    fn session<'a>(&self, machine: &str, requested: &'a str) -> &'a str {
-        if self.watchers.contains_key(machine) { SHARED_SESSION } else { requested }
+    /// The store/pubsub key for `machine`: [`SHARED_SESSION`] for `.shared()`
+    /// machines (one instance for everyone), else the caller's session —
+    /// prefixed with their identity when [`Foster::identity`] is set, so a
+    /// session ID is only meaningful to the user it belongs to.
+    fn session(&self, machine: &str, requested: &str, who: Option<&Identity>) -> String {
+        if self.watchers.contains_key(machine) {
+            SHARED_SESSION.to_string()
+        } else {
+            match who {
+                // Length-prefixed, so no (identity, session) pair can collide
+                // with another's however either is spelled.
+                Some(Identity(id)) => format!("{}:{id}:{requested}", id.len()),
+                None => requested.to_string(),
+            }
+        }
+    }
+
+    /// Inverse of [`session`](Self::session) for a per-session key:
+    /// (identity, client session).
+    fn split_key<'a>(&self, key: &'a str) -> (Option<&'a str>, &'a str) {
+        if !self.scoped || key == SHARED_SESSION {
+            return (None, key);
+        }
+        let parsed = key.split_once(':').and_then(|(len, rest)| {
+            let len: usize = len.parse().ok()?;
+            let id = rest.get(..len)?;
+            Some((id, rest.get(len + 1..)?))
+        });
+        match parsed {
+            Some((id, session)) => (Some(id), session),
+            None => (None, key),
+        }
     }
 
     /// Fire `event` on `(session, machine_id)` atomically, broadcast the result,
@@ -89,8 +125,11 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
             .await?;
         self.pubsub.publish(session, machine_id, snap.clone()).await;
         if let (Some(effect), Some(payload)) = (effect, effect_payload) {
+            let (identity, client_session) = self.split_key(session);
             tokio::spawn(effect(Effect {
-                session: session.to_string(),
+                session: client_session.to_string(),
+                identity: identity.map(str::to_string),
+                key: session.to_string(),
                 machine: machine_id.to_string(),
                 event: event.to_string(),
                 payload,
@@ -106,11 +145,13 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
     /// `.shared()` machine as well as its own session's machines.
     fn fire_fn(&self) -> FireFn {
         let app = self.clone();
-        Arc::new(move |session, machine, event, payload| {
+        // `key` is an already-scoped per-session key (an effect's own); only
+        // `.shared()` targets need remapping.
+        Arc::new(move |key, machine, event, payload| {
             let app = app.clone();
             async move {
-                let session = app.session(&machine, &session).to_string();
-                app.fire(&session, &machine, &event, payload).await
+                let key = if app.watchers.contains_key(&machine) { SHARED_SESSION.to_string() } else { key };
+                app.fire(&key, &machine, &event, payload).await
             }
             .boxed()
         })
@@ -133,7 +174,12 @@ fn unix_millis() -> u64 {
 pub struct RequestInfo {
     pub headers: HeaderMap,
     pub remote_addr: Option<SocketAddr>,
+    /// The authenticated user, when [`Foster::identity`] is set (`None` when
+    /// it's the identity function itself being called).
+    pub identity: Option<String>,
 }
+
+type IdentityFn = Arc<dyn Fn(&RequestInfo) -> Option<String> + Send + Sync>;
 
 type RequestFn = Arc<dyn Fn(RequestInfo) -> BoxFuture<'static, Value> + Send + Sync>;
 
@@ -160,8 +206,14 @@ pub struct Effect {
     /// The session the triggering event came from (the client's random session
     /// ID; `__shared__` for `.shared()` machines). Useful as a key for
     /// per-session server resources, such as a job a later event cancels — not
-    /// an identity: it's client-generated.
+    /// an identity: it's client-generated. Pair it with `identity` when
+    /// [`Foster::identity`] is set.
     pub session: String,
+    /// The authenticated user whose session this is, when [`Foster::identity`]
+    /// is set.
+    pub identity: Option<String>,
+    /// Store key of the session — what follow-up events are sent to.
+    key: String,
     pub machine: String,
     pub event: String,
     /// The triggering event's payload (after any request-event merge).
@@ -176,13 +228,13 @@ impl Effect {
     /// update, an error. It goes through the reducer like any transition and is
     /// pushed to the session's open pages; it can trigger its own effect.
     pub async fn send(&self, event: &str, payload: Value) -> Result<Snapshot, String> {
-        (self.fire)(self.session.clone(), self.machine.clone(), event.to_string(), payload).await
+        (self.fire)(self.key.clone(), self.machine.clone(), event.to_string(), payload).await
     }
 
     /// Send `event` to another machine in the same session (or to a
     /// `.shared()` machine).
     pub async fn send_to(&self, machine: &str, event: &str, payload: Value) -> Result<Snapshot, String> {
-        (self.fire)(self.session.clone(), machine.to_string(), event.to_string(), payload).await
+        (self.fire)(self.key.clone(), machine.to_string(), event.to_string(), payload).await
     }
 }
 
@@ -200,11 +252,39 @@ pub struct Foster {
     feeds: Vec<Feed>,
     request_events: HashMap<String, RequestEvent>,
     effects: HashMap<String, HashMap<String, EffectFn>>,
+    identity: Option<IdentityFn>,
 }
 
 impl Foster {
     pub fn new(machines: HashMap<String, Arc<Machine>>) -> Self {
-        Self { machines, feeds: Vec::new(), request_events: HashMap::new(), effects: HashMap::new() }
+        Self { machines, feeds: Vec::new(), request_events: HashMap::new(), effects: HashMap::new(), identity: None }
+    }
+
+    /// Require an authenticated user on every Foster route (the page, `/state`,
+    /// `/transition`, `/events`, debug routes). `identify` maps a request to its
+    /// user — typically from a header set by a trusted auth proxy — or `None`,
+    /// which gets `401 Unauthorized`.
+    ///
+    /// Session state is then stored per user: a session ID only addresses that
+    /// user's machines, so knowing someone else's (client-generated) session ID
+    /// gets you nothing. Effects and request events see the user as `identity`.
+    /// `.shared()` machines stay one instance for everyone.
+    ///
+    /// ```ignore
+    /// .identity(|req| {
+    ///     let user = req.headers.get("tailscale-user-login")?.to_str().ok()?;
+    ///     ALLOWED.contains(&user).then(|| user.to_string())
+    /// })
+    /// ```
+    ///
+    /// Only trust a header if the app is reachable solely through the proxy
+    /// that sets it.
+    pub fn identity<F>(mut self, identify: F) -> Self
+    where
+        F: Fn(&RequestInfo) -> Option<String> + Send + Sync + 'static,
+    {
+        self.identity = Some(Arc::new(identify));
+        self
     }
 
     /// Run async server-side work after `machine` takes `event`: a database
@@ -375,7 +455,7 @@ where
     S: StateStore + Clone + 'static,
     P: PubSub + Clone + 'static,
 {
-    let Foster { machines, feeds, request_events, effects } = foster;
+    let Foster { machines, feeds, request_events, effects, identity } = foster;
     // Collect template HTML and machine metadata before machines are moved into AppState.
     // Only one machine needs `.template(...)` set — the whole page is shared, and each
     // machine below validates only its own `[fx-machine="{id}"]` subtree(s) within it.
@@ -472,6 +552,7 @@ where
         watchers: Arc::new(watchers),
         request_events: Arc::new(request_events),
         effects: Arc::new(effects),
+        scoped: identity.is_some(),
     };
 
     for feed in feeds {
@@ -506,7 +587,30 @@ where
         router = router.route("/", get(move || async move { Html(served) }));
     }
 
-    router
+    match identity {
+        Some(identify) => router.layer(middleware::from_fn(move |req: Request, next: Next| {
+            let identify = identify.clone();
+            async move { require_identity(identify, req, next).await }
+        })),
+        None => router,
+    }
+}
+
+/// [`Foster::identity`]'s gate: `401` without a user, else the user goes into
+/// the request's extensions for the handlers to scope sessions by.
+async fn require_identity(identify: IdentityFn, mut req: Request, next: Next) -> Response {
+    let info = RequestInfo {
+        headers: req.headers().clone(),
+        remote_addr: req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0),
+        identity: None,
+    };
+    match identify(&info) {
+        Some(id) => {
+            req.extensions_mut().insert(Identity(id));
+            next.run(req).await
+        }
+        None => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+    }
 }
 
 // ── wire helpers ──────────────────────────────────────────────────────────────
@@ -568,6 +672,7 @@ struct TransitionRequest {
 async fn get_state<S, P>(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
     headers: HeaderMap,
     connect: Option<ConnectInfo<SocketAddr>>,
 ) -> Response
@@ -578,11 +683,14 @@ where
     let Some(machine) = app.machines.get(&q.machine).cloned() else {
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine));
     };
-    let session = app.session(&q.machine, q.session_id());
+    let who = who.map(|Extension(w)| w);
+    let session = app.session(&q.machine, q.session_id(), who.as_ref());
+    let session = session.as_str();
 
     // Request events refresh on every load — see `Foster::request_event`.
     if let Some(re) = app.request_events.get(&q.machine).cloned() {
-        let payload = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0) }).await;
+        let identity = who.map(|Identity(id)| id);
+        let payload = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0), identity }).await;
         return match app.fire(session, &q.machine, &re.event, payload).await {
             Ok(snap) => msgpack(&snap),
             Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
@@ -598,6 +706,7 @@ where
 
 async fn post_transition<S, P>(
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
     headers: HeaderMap,
     connect: Option<ConnectInfo<SocketAddr>>,
     body: Bytes,
@@ -615,11 +724,13 @@ where
     if !app.machines.contains_key(&req.machine) {
         return msgpack_err(StatusCode::NOT_FOUND, format!("machine '{}' not found", req.machine));
     }
-    let session = app.session(&req.machine, requested).to_string();
+    let who = who.map(|Extension(w)| w);
+    let session = app.session(&req.machine, requested, who.as_ref());
 
     let mut payload = req.payload;
     if let Some(re) = app.request_events.get(&req.machine).filter(|re| re.event == req.event).cloned() {
-        let extra = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0) }).await;
+        let identity = who.map(|Identity(id)| id);
+        let extra = (re.handler)(RequestInfo { headers, remote_addr: connect.map(|c| c.0), identity }).await;
         payload = merge_shallow(payload, extra);
     }
 
@@ -663,6 +774,7 @@ struct EventsQuery {
 async fn get_events<S, P>(
     Query(q): Query<EventsQuery>,
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
 ) -> Response
 where
     S: StateStore + Clone,
@@ -690,14 +802,14 @@ where
             continue;
         }
         let sub = format!("{machine}@{sid}");
-        let session = app.session(&machine, &sid);
+        let session = app.session(&machine, &sid, who.as_ref().map(|Extension(w)| w));
         // Count this stream as a watcher of a shared machine (wakes its
         // feed) for as long as it's open: the guards drop with the stream.
         if let Some(tx) = app.watchers.get(&machine) {
             tx.send_modify(|n| *n += 1);
             guards.push(WatchGuard(tx.clone()));
         }
-        streams.push(app.pubsub.subscribe(session, &machine).map(move |snap| (sub.clone(), snap)).boxed());
+        streams.push(app.pubsub.subscribe(&session, &machine).map(move |snap| (sub.clone(), snap)).boxed());
     }
 
     let mut prev: HashMap<String, Snapshot> = HashMap::new();
@@ -732,6 +844,7 @@ where
 async fn get_debug_history<S, P>(
     Query(q): Query<MachineQuery>,
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
 ) -> Response
 where
     S: StateStore + Clone,
@@ -740,7 +853,7 @@ where
     if !app.test_mode {
         return (StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable").into_response();
     }
-    let history = app.store.history(app.session(&q.machine, q.session_id()), &q.machine).await;
+    let history = app.store.history(&app.session(&q.machine, q.session_id(), who.as_ref().map(|Extension(w)| w)), &q.machine).await;
     Json(history).into_response()
 }
 
@@ -768,6 +881,7 @@ impl RewindQuery {
 async fn post_debug_rewind<S, P>(
     Query(q): Query<RewindQuery>,
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
 ) -> Result<Json<Snapshot>, (StatusCode, String)>
 where
     S: StateStore + Clone,
@@ -777,7 +891,7 @@ where
         return Err((StatusCode::FORBIDDEN, "debug endpoints are disabled in production; set FOSTER_TEST_MODE=1 to enable".to_string()));
     }
 
-    let session_id = app.session(&q.machine, q.session_id()).to_string();
+    let session_id = app.session(&q.machine, q.session_id(), who.as_ref().map(|Extension(w)| w));
 
     let Some(machine) = app.machines.get(&q.machine).cloned() else {
         return Err((StatusCode::NOT_FOUND, format!("machine '{}' not found", q.machine)));
@@ -1477,6 +1591,7 @@ const GRAPH_RENDER_JS: &str = r#"
 async fn post_test_state<S, P>(
     Query(q): Query<SessionQuery>,
     State(app): State<AppState<S, P>>,
+    who: Option<Extension<Identity>>,
     Json(snap): Json<Snapshot>,
 ) -> Result<Json<Snapshot>, (StatusCode, String)>
 where
@@ -1488,7 +1603,7 @@ where
     }
 
     let machine_id = snap.machine_id.clone();
-    let session_id = app.session(&machine_id, q.session_id()).to_string();
+    let session_id = app.session(&machine_id, q.session_id(), who.as_ref().map(|Extension(w)| w));
 
     let Some(machine) = app.machines.get(&machine_id).cloned() else {
         return Err((StatusCode::NOT_FOUND, format!("machine '{machine_id}' not found")));
@@ -1854,6 +1969,108 @@ mod tests {
         let _ = Foster::new(HashMap::from([("dir".to_string(), dir().build())]))
             .effect("ghost", "open", |_fx: Effect| async {})
             .router();
+    }
+
+    // ── identity ───────────────────────────────────────────────────────────────
+
+    /// `x-user` header = the user; a template so `GET /` exists.
+    fn authed(machines: HashMap<String, Arc<Machine>>) -> Foster {
+        Foster::new(machines)
+            .identity(|req: &RequestInfo| req.headers.get("x-user")?.to_str().ok().map(str::to_string))
+    }
+
+    fn page_dir() -> MachineBuilder {
+        dir().template(r#"<div fx-machine="dir"><button fx-on="click->open">o</button></div>"#)
+    }
+
+    async fn send_as(app: &Router, user: &str, machine: &str, event: &str, session: &str, payload: Value) -> (StatusCode, Option<Snapshot>) {
+        let body = rmp_serde::to_vec_named(&json!({"machine": machine, "event": event, "payload": payload, "session": session})).unwrap();
+        let mut req = Request::builder().method("POST").uri("/transition");
+        if !user.is_empty() { req = req.header("x-user", user); }
+        let resp = app.clone().oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, (status == StatusCode::OK).then(|| rmp_serde::from_slice(&bytes).unwrap()))
+    }
+
+    async fn state_as(app: &Router, user: &str, uri: &str) -> Snapshot {
+        let resp = app.clone()
+            .oneshot(Request::builder().uri(uri).header("x-user", user).body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn identity_rejects_anonymous_requests() {
+        let app = authed(HashMap::from([("dir".to_string(), page_dir().build())])).router();
+        for uri in ["/", "/state?machine=dir&session=s", "/events?subs=dir@s"] {
+            let (status, _) = get(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        let (status, _) = send_as(&app, "", "dir", "open", "s", json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/").header("x-user", "alice").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn identity_scopes_sessions_per_user() {
+        let app = authed(HashMap::from([("dir".to_string(), dir().build())])).router();
+        // Same session ID, different users: separate instances.
+        let (_, snap) = send_as(&app, "alice", "dir", "open", "shared-id", json!({ "path": "/a" })).await;
+        assert_eq!(snap.unwrap().state, "loading");
+        assert_eq!(state_as(&app, "mallory", "/state?machine=dir&session=shared-id").await.state, "idle");
+        assert_eq!(state_as(&app, "alice", "/state?machine=dir&session=shared-id").await.state, "loading");
+    }
+
+    #[tokio::test]
+    async fn identity_reaches_effects_and_their_results_stay_scoped() {
+        let app = authed(HashMap::from([("dir".to_string(), dir().build())]))
+            .effect("dir", "open", |fx: Effect| async move {
+                assert_eq!(fx.session, "s1", "the client's own session ID");
+                let who = fx.identity.clone().unwrap_or_default();
+                fx.send("loaded", json!({ "by": who })).await.unwrap();
+            })
+            .router();
+        send_as(&app, "alice", "dir", "open", "s1", json!({})).await;
+        let uri = "/state?machine=dir&session=s1";
+        for _ in 0..200 {
+            if state_as(&app, "alice", uri).await.state == "ready" { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let done = state_as(&app, "alice", uri).await;
+        assert_eq!((done.state.as_str(), done.context["by"].as_str()), ("ready", Some("alice")));
+        assert_eq!(state_as(&app, "bob", uri).await.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn identity_leaves_shared_machines_global() {
+        let app = authed(HashMap::from([("live".to_string(), live().shared().build())])).router();
+        send_as(&app, "alice", "live", "tick", "a", json!({ "n": 1 })).await;
+        assert_eq!(state_as(&app, "bob", "/state?machine=live&session=b").await.state, "live");
+    }
+
+    #[test]
+    fn scoped_keys_round_trip_and_cannot_collide() {
+        let app = AppState {
+            machines: Arc::new(HashMap::new()),
+            store: InMemoryStore::default(),
+            pubsub: InMemoryPubSub::default(),
+            test_mode: false,
+            watchers: Arc::new(HashMap::new()),
+            request_events: Arc::new(HashMap::new()),
+            effects: Arc::new(HashMap::new()),
+            scoped: true,
+        };
+        let key = |id: &str, sid: &str| app.session("m", sid, Some(&Identity(id.into())));
+        assert_ne!(key("a:b", "c"), key("a", "b:c"));
+        assert_ne!(key("a", "1:x"), key("1:a", "x"));
+        for (id, sid) in [("alice@example.com", "s1"), ("we:ird", "se:ss:ion"), ("", "")] {
+            assert_eq!(app.split_key(&key(id, sid)), (Some(id), sid));
+        }
     }
 
     #[tokio::test]

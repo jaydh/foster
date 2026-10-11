@@ -166,7 +166,26 @@ Foster::new(machines)
   and events sent by other effects (chains are allowed — avoid cycles).
 - One handler per `(machine, event)`. Panics at build for unknown machines or events.
 - `fx.session` is the client's random session ID — a key for per-session server
-  resources (a job a later event cancels), not an identity.
+  resources (a job a later event cancels), not an identity. `fx.identity` is the
+  user, when `Foster::identity` is set.
+
+### Identity — authenticated users
+
+```rust
+Foster::new(machines)
+    .identity(|req: &RequestInfo| {
+        let user = req.headers.get("tailscale-user-login")?.to_str().ok()?;
+        ALLOWED.contains(&user).then(|| user.to_string())
+    })
+```
+
+- Every Foster route (page, `/state`, `/transition`, `/events`, debug) returns
+  `401` when the function returns `None`.
+- Per-session state is keyed by `(user, session)` (length-prefixed key, so no two
+  pairs collide): a session ID only addresses its own user's machines.
+  `.shared()` machines stay global.
+- Effects get `fx.identity`; request-event handlers get `RequestInfo::identity`.
+- Trust a header only if the app is reachable solely through the proxy that sets it.
 
 ### Local (client-only) machines
 
@@ -442,6 +461,7 @@ No pending items — all planned features are implemented. See "Already implemen
 - Effects: `Foster::effect(machine, event, handler)` — async server work after a transition, reporting back via `Effect::send` into the same session — `crates/foster-server/src/lib.rs`.
 - `fx-on` grammar in `foster-core` (`parse_fx_on` / `FxOn`, shared by validation and client): several bindings per element, `keydown.Key` filters — `crates/foster-core/src/fx_on.rs`. Hand-written spec: `examples/kanban/tests/keys.spec.ts`.
 - `fx-copy` clipboard attribute — `crates/foster-client/src/lib.rs`.
+- `Foster::identity` — 401 gate + per-user session scoping; identity passed to effects and request events — `crates/foster-server/src/lib.rs`.
 - Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
 - `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
 - `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.
@@ -454,4 +474,5 @@ No pending items — all planned features are implemented. See "Already implemen
 - **All state transitions go through `machine.send()`** — never mutate `MachineInstance` directly
 - **`POST /test/state` is debug-only** — gated by `cfg(debug_assertions)` or `FOSTER_TEST_MODE=1`; do not widen this
 - **Session keys are random UUIDs** — do not add any endpoint that accepts a user-supplied session ID without validation
+- **With `Foster::identity` set, every per-session store key goes through `AppState::session(machine, requested, who)`** — never use a client-supplied session ID as a store key directly, or users can address each other's sessions
 - **Schema validation runs on both `send()` and `restore()`** — do not add a path that bypasses it
