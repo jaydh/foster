@@ -94,6 +94,12 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
     /// Fire `event` on `(session, machine_id)` atomically, broadcast the result,
     /// and start the event's [effect](Foster::effect), if any.
     async fn fire(&self, session: &str, machine_id: &str, event: &str, payload: Value) -> Result<Snapshot, String> {
+        self.fire_from(session, machine_id, event, payload).await.map(|(_, next)| next)
+    }
+
+    /// [`fire`](Self::fire), also returning the snapshot the transition
+    /// started from (the machine's initial one for a new instance).
+    async fn fire_from(&self, session: &str, machine_id: &str, event: &str, payload: Value) -> Result<(Snapshot, Snapshot), String> {
         let machine = self
             .machines
             .get(machine_id)
@@ -107,12 +113,15 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
         // progress update). Reducers are pure, so run it again on the newer
         // state rather than dropping the event.
         let mut attempt = 0;
+        let mut prev: Option<Snapshot> = None;
         let snap = loop {
             let (machine, payload, event_owned) = (machine.clone(), payload.clone(), event.to_string());
+            let prev_slot = &mut prev;
             let result = self
                 .store
                 .apply(session, machine_id, move |current| {
                     let mut inst = MachineInstance::new(machine);
+                    *prev_slot = Some(current.clone().unwrap_or_else(|| inst.snapshot()));
                     if let Some(snap) = current {
                         inst.restore(snap).map_err(|e| e.to_string())?;
                     }
@@ -149,7 +158,8 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
                 fire: self.fire_fn(),
             }));
         }
-        Ok(snap)
+        let prev = prev.expect("apply ran the reducer");
+        Ok((prev, snap))
     }
 
     /// [`fire`](Self::fire), type-erased for [`Effect::send`]. The target
@@ -736,6 +746,11 @@ struct TransitionRequest {
     /// Session ID — set by the WASM client from the URL's `?session=` param.
     #[serde(default)]
     session: String,
+    /// `"patch"`: answer with a [`ContextPatch`] from the instance's previous
+    /// version instead of the whole snapshot (what the WASM client asks
+    /// for — a click on a page with a large list shouldn't send the list).
+    #[serde(default)]
+    reply: String,
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────────
@@ -807,8 +822,9 @@ where
         payload = merge_shallow(payload, extra);
     }
 
-    match app.fire(&session, &req.machine, &req.event, payload).await {
-        Ok(snap) => msgpack(&snap),
+    match app.fire_from(&session, &req.machine, &req.event, payload).await {
+        Ok((prev, snap)) if req.reply == "patch" => msgpack(&ContextPatch::between(&prev, &snap)),
+        Ok((_, snap)) => msgpack(&snap),
         Err(e) => msgpack_err(StatusCode::BAD_REQUEST, e),
     }
 }
@@ -819,9 +835,24 @@ struct ContextPatch {
     machine_id: String,
     state: String,
     version: u64,
+    /// The version `patch` applies to.
+    base: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_event: Option<String>,
     patch: json_patch::Patch,
+}
+
+impl ContextPatch {
+    fn between(prev: &Snapshot, next: &Snapshot) -> Self {
+        Self {
+            machine_id: next.machine_id.clone(),
+            state: next.state.clone(),
+            version: next.version,
+            base: prev.version,
+            last_event: next.last_event.clone(),
+            patch: json_patch::diff(&prev.context, &next.context),
+        }
+    }
 }
 
 /// `GET /events` query: either one `machine` (+ `session`), or `subs` — a
@@ -908,16 +939,7 @@ where
         let _keep_alive = &guards;
         let (name, mut data) = match prev.get(&sub) {
             None => ("snapshot", serde_json::to_value(&snap).unwrap_or_default()),
-            Some(p) => {
-                let msg = ContextPatch {
-                    machine_id: snap.machine_id.clone(),
-                    state: snap.state.clone(),
-                    version: snap.version,
-                    last_event: snap.last_event.clone(),
-                    patch: json_patch::diff(&p.context, &snap.context),
-                };
-                ("patch", serde_json::to_value(&msg).unwrap_or_default())
-            }
+            Some(p) => ("patch", serde_json::to_value(ContextPatch::between(p, &snap)).unwrap_or_default()),
         };
         data["sub"] = Value::String(sub.clone());
         prev.insert(sub, snap);
@@ -1888,6 +1910,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transition_can_answer_with_a_patch() {
+        let counter = MachineBuilder::new("counter", "idle", json!({ "n": 0, "big": [1, 2, 3] }))
+            .on("idle", "inc", "idle", |mut ctx, _| {
+                ctx["n"] = json!(ctx["n"].as_i64().unwrap_or(0) + 1);
+                Ok(ctx)
+            })
+            .build();
+        let app = router(HashMap::from([("counter".to_string(), counter)]));
+        let post = |reply: &'static str| {
+            let app = app.clone();
+            async move {
+                let body = rmp_serde::to_vec_named(&json!({"machine": "counter", "event": "inc", "session": "p", "reply": reply})).unwrap();
+                let resp = app.oneshot(Request::builder().method("POST").uri("/transition").body(Body::from(body)).unwrap()).await.unwrap();
+                rmp_serde::from_slice::<Value>(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+            }
+        };
+        // First event on a new instance: the patch is from the initial snapshot.
+        let first = post("patch").await;
+        assert_eq!((first["base"].as_u64(), first["version"].as_u64()), (Some(0), Some(1)));
+        assert_eq!(first["patch"], json!([{ "op": "replace", "path": "/n", "value": 1 }]));
+        // Each patch starts where the last one ended.
+        let second = post("patch").await;
+        assert_eq!(second["base"], first["version"]);
+        assert!(second["version"].as_u64() > second["base"].as_u64());
+        // Without `reply`, the whole snapshot, as before.
+        let full = post("").await;
+        assert_eq!(full["context"]["n"].as_i64(), Some(3));
+        assert!(full["version"].as_u64() > second["version"].as_u64());
+    }
+
+    #[tokio::test]
     async fn events_start_with_a_snapshot_even_for_a_new_session() {
         let counter = MachineBuilder::new("counter", "idle", json!({ "n": 0 })).pass("idle", "noop", "idle").build();
         let app = router(HashMap::from([("counter".to_string(), counter)]));
@@ -2294,6 +2347,7 @@ mod tests {
     async fn http_post_transition_increments_counter() {
         let app = router(test_machines());
         let req_body = TransitionRequest {
+            reply: String::new(),
             machine: "counter".to_string(),
             event: "increment".to_string(),
             payload: Value::Null,
@@ -2322,6 +2376,7 @@ mod tests {
     async fn http_post_transition_state_change() {
         let app = router(test_machines());
         let req_body = TransitionRequest {
+            reply: String::new(),
             machine: "counter".to_string(),
             event: "break_it".to_string(),
             payload: Value::Null,
@@ -2347,6 +2402,7 @@ mod tests {
     async fn http_post_transition_404_for_unknown_machine() {
         let app = router(test_machines());
         let req_body = TransitionRequest {
+            reply: String::new(),
             machine: "nope".to_string(),
             event: "x".to_string(),
             payload: Value::Null,
@@ -2369,6 +2425,7 @@ mod tests {
     async fn http_post_transition_400_for_invalid_event() {
         let app = router(test_machines());
         let req_body = TransitionRequest {
+            reply: String::new(),
             machine: "counter".to_string(),
             event: "no_such_event".to_string(),
             payload: Value::Null,
@@ -2423,6 +2480,7 @@ mod tests {
 
         // Fire a transition
         let req_body = TransitionRequest {
+            reply: String::new(),
             machine: "counter".to_string(),
             event: "increment".to_string(),
             payload: Value::Null,

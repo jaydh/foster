@@ -299,7 +299,7 @@ Inlined — no external dependencies, compiles to WASM.
 | Method | Path | Format | Purpose |
 |--------|------|--------|---------|
 | GET | `/state?machine=<id>&session=<sid>` | MessagePack | Current snapshot |
-| POST | `/transition` | MessagePack in/out | Fire event, get new snapshot |
+| POST | `/transition` | MessagePack in/out | Fire event, get new snapshot — or, with `"reply": "patch"` (what the WASM client sends), a JSON Patch from the version it started from (`base` → `version`) |
 | GET | `/events?machine=<id>&session=<sid>` | SSE (JSON) | Push stream for one machine |
 | GET | `/events?subs=<id>@<sid>,<id>@<sid>` | SSE (JSON) | Multiplexed push stream (what the client uses); each event's JSON has `"sub"` |
 | POST | `/test/state?session=<sid>` | JSON in/out | Inject snapshot (debug only) |
@@ -347,7 +347,8 @@ All attributes processed client-side by the WASM runtime.
 | `fx-on="click.shift->…"` | `fx-on="click.shift->select_range click->toggle"` | Click with a held modifier (`shift`, `ctrl`, `meta`, `alt`); bindings are tried in order, so put the specific one first |
 | `fx-copy` | `fx-copy="item:url"` / `fx-copy="ctx:share_url"` | On click, copy that `fx-for` item field / context value to the clipboard (pair with `fx-on="click->copied"` for feedback) |
 | `fx-state-label` | `fx-state-label` | Display current state name |
-| `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]` |
+| `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]`; on updates only changed rows are touched |
+| `fx-key` | `fx-key="id"` | On an `fx-for` container: the item field that identifies a row (else its position), so reordering/filtering moves rows instead of rebinding them. Rows bind to their item only (`fx-field`, `item:`); state/context bindings inside rows aren't applied |
 | `fx-where` | `fx-where='{"column":"todo"}'` | Filter `fx-for` items by key/value |
 | `fx-field` | `fx-field="title"` | Set text from item field inside `fx-for` |
 | `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload; when several inputs collect one key, the one that fired the event wins (a per-row input in an `fx-for`), then a visible one over hidden ones |

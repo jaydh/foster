@@ -10,20 +10,24 @@ use web_sys::{Document, Element, EventSource, HtmlElement, MessageEvent, Request
 
 // ── context cache ─────────────────────────────────────────────────────────────
 //
-// Tracks the last context Value received over SSE per machine instance, keyed
-// by `"{machine_id}:{effective_session}"`.  This makes the key unique across
-// both different machine types and multiple instances of the same type on the
-// same page (achieved via the `fx-machine="counter#1"` fragment syntax).
-// Used to apply JSON Patch diffs from "patch" SSE events against the correct
-// base.  Only SSE events (snapshot/patch) update this cache — direct transition
-// responses do not, keeping the cache aligned with the server's SSE diff chain.
+// The last snapshot this page has of each server machine instance, keyed by
+// `"{machine_id}:{effective_session}"` (unique across machine types and
+// `fx-machine="counter#1"` instances). Both channels send changes as JSON
+// patches between versions — SSE `patch` events and transition responses —
+// and each applies only onto the version it was made from ([`apply_delta`]):
+// one already here is skipped, and a gap (a patch from a version this page
+// never had) is filled by fetching the whole snapshot again.
 
 thread_local! {
-    static CONTEXT_CACHE: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+    static CONTEXT_CACHE: RefCell<HashMap<String, Snapshot>> = RefCell::new(HashMap::new());
 }
 
-fn store_context(cache_key: &str, ctx: Value) {
-    CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(cache_key.to_string(), ctx); });
+fn store_snapshot(cache_key: &str, snap: &Snapshot) {
+    CONTEXT_CACHE.with(|c| { c.borrow_mut().insert(cache_key.to_string(), snap.clone()); });
+}
+
+fn cached(cache_key: &str) -> Option<Snapshot> {
+    CONTEXT_CACHE.with(|c| c.borrow().get(cache_key).cloned())
 }
 
 fn has_context(cache_key: &str) -> bool {
@@ -31,9 +35,44 @@ fn has_context(cache_key: &str) -> bool {
 }
 
 fn load_context(cache_key: &str) -> Value {
-    CONTEXT_CACHE.with(|c| {
-        c.borrow().get(cache_key).cloned().unwrap_or_else(|| Value::Object(Default::default()))
-    })
+    cached(cache_key).map_or_else(|| Value::Object(Default::default()), |s| s.context)
+}
+
+/// What [`apply_delta`] made of a patch.
+enum Delta {
+    /// Applied: the new snapshot.
+    Applied(Snapshot),
+    /// This version (or a later one) is already here.
+    Stale,
+    /// It doesn't apply to what's here; fetch the whole snapshot.
+    Gap,
+}
+
+fn apply_delta(cache_key: &str, pe: ContextPatch) -> Delta {
+    let Some(have) = cached(cache_key) else { return Delta::Gap };
+    if pe.version <= have.version {
+        return Delta::Stale;
+    }
+    if pe.base != have.version {
+        return Delta::Gap;
+    }
+    let mut ctx = have.context;
+    if json_patch::patch(&mut ctx, &pe.patch.0).is_err() {
+        return Delta::Gap;
+    }
+    let snap = Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx };
+    store_snapshot(cache_key, &snap);
+    Delta::Applied(snap)
+}
+
+/// Fetch the whole snapshot after a [`Delta::Gap`], keeping it if it's newer
+/// than what's cached; returns what's cached afterwards.
+async fn resync(machine_id: &str, session_id: &str, cache_key: &str) -> Result<Snapshot, JsValue> {
+    let snap = fetch_snapshot(machine_id, session_id).await?;
+    if cached(cache_key).is_none_or(|have| snap.version > have.version) {
+        store_snapshot(cache_key, &snap);
+    }
+    Ok(cached(cache_key).unwrap_or(snap))
 }
 
 // ── local machines ────────────────────────────────────────────────────────────
@@ -166,7 +205,7 @@ async fn dispatch(
     if is_local(cache_key) {
         local_send(cache_key, event, payload)
     } else {
-        send_transition(machine_id, event, payload, session_id).await.map(Some)
+        send_transition(machine_id, event, payload, session_id, cache_key).await.map(Some)
     }
 }
 
@@ -286,6 +325,8 @@ struct ContextPatch {
     machine_id: String,
     state: String,
     version: u64,
+    /// The version `patch` applies to.
+    base: u64,
     #[serde(default)]
     last_event: Option<String>,
     patch: json_patch::Patch,
@@ -372,7 +413,7 @@ async fn bootstrap() {
                 // different one than the stream, and patches only apply onto
                 // the stream's own base.
                 if !has_context(&sub.cache_key) {
-                    store_context(&sub.cache_key, snap.context.clone());
+                    store_snapshot(&sub.cache_key, &snap);
                 }
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
@@ -553,6 +594,14 @@ fn self_and_descendants(root: &Element, selector: &str) -> Vec<Element> {
 /// `self_and_descendants` and the delegated click listener for why this
 /// matters: without it, an outer machine's snapshot application (or click
 /// delegation) reaches into a nested machine's own elements.
+/// [`self_and_descendants`] minus the rows an `fx-for` rendered: the render
+/// passes for state/context bindings. A row's bindings are its item's
+/// (`fx-field`, `item:`), applied by [`apply_fx_fields`]; walking every row
+/// of a long list on each update cost tens of ms.
+fn render_targets(root: &Element, selector: &str) -> Vec<Element> {
+    self_and_descendants(root, &format!("{selector}:not([data-fx-item]):not([data-fx-item] *)"))
+}
+
 fn owning_machine_root(el: &Element) -> Option<Element> {
     let mut cur: Option<Element> = Some(el.clone());
     while let Some(c) = cur {
@@ -563,7 +612,7 @@ fn owning_machine_root(el: &Element) -> Option<Element> {
 }
 
 fn apply_fx_show(root: &Element, state: &str) {
-    let els = self_and_descendants(root, "[fx-show]");
+    let els = render_targets(root, "[fx-show]");
     for el in els {
         let el: HtmlElement = el.dyn_into().unwrap();
         let attr = el.get_attribute("fx-show").unwrap_or_default();
@@ -575,7 +624,7 @@ fn apply_fx_show(root: &Element, state: &str) {
 }
 
 fn apply_fx_text(root: &Element, ctx: &Value) {
-    let els = self_and_descendants(root, "[fx-text]");
+    let els = render_targets(root, "[fx-text]");
     for el in els {
         let key = el.get_attribute("fx-text").unwrap_or_default();
         if let Some(val) = ctx.get(&key) {
@@ -585,7 +634,7 @@ fn apply_fx_text(root: &Element, ctx: &Value) {
 }
 
 fn apply_fx_disable(root: &Element, state: &str) {
-    let els = self_and_descendants(root, "[fx-disable]");
+    let els = render_targets(root, "[fx-disable]");
     for el in els {
         let attr = el.get_attribute("fx-disable").unwrap_or_default();
         if attr.split(',').any(|s| s.trim() == state) {
@@ -597,7 +646,7 @@ fn apply_fx_disable(root: &Element, state: &str) {
 }
 
 fn apply_fx_state_label(root: &Element, state: &str) {
-    let els = self_and_descendants(root, "[fx-state-label]");
+    let els = render_targets(root, "[fx-state-label]");
     for el in els {
         el.set_text_content(Some(state));
     }
@@ -609,7 +658,7 @@ fn apply_fx_state_label(root: &Element, state: &str) {
 /// applied from its response) can't wipe out what the user has typed since;
 /// entering a state (reopening a dialog) still resets it.
 fn apply_fx_value(root: &Element, state: &str, ctx: &Value) {
-    let els = self_and_descendants(root, "[fx-value]");
+    let els = render_targets(root, "[fx-value]");
     for el in els {
         let key = el.get_attribute("fx-value").unwrap_or_default();
         let Some(val) = ctx.get(&key) else { continue };
@@ -631,7 +680,7 @@ fn apply_fx_value(root: &Element, state: &str, ctx: &Value) {
 
 /// `fx-class="calm:gentle energized:vivid"` — toggle CSS classes based on state.
 fn apply_fx_class(root: &Element, state: &str) {
-    let els = self_and_descendants(root, "[fx-class]");
+    let els = render_targets(root, "[fx-class]");
     for el in els {
         let attr = el.get_attribute("fx-class").unwrap_or_default();
         let class_list = el.class_list();
@@ -659,7 +708,7 @@ fn apply_fx_class(root: &Element, state: &str) {
 /// A target of `style.<property>` sets an inline style property instead of an
 /// attribute: `style.left=item:x` positions each item from its own data.
 fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
-    let els = self_and_descendants(root, "[fx-bind-attr]");
+    let els = render_targets(root, "[fx-bind-attr]");
     for el in els {
         let attr_val = el.get_attribute("fx-bind-attr").unwrap_or_default();
         for pair in attr_val.split_whitespace() {
@@ -716,7 +765,7 @@ fn set_bound(el: &Element, target: &str, val: Option<&Value>) {
 ///
 /// Truthy: non-null, non-false, non-zero, non-empty string/array/object.
 fn apply_fx_if(root: &Element, ctx: &Value) {
-    let els = self_and_descendants(root, "[fx-if]");
+    let els = render_targets(root, "[fx-if]");
     for el in els {
         let el: HtmlElement = el.dyn_into().unwrap();
         let attr = el.get_attribute("fx-if").unwrap_or_default();
@@ -773,7 +822,7 @@ fn cmp_nums(a: &Value, b: &Value) -> i32 {
 /// Example: `fx-animate="error:shake:400 confirmed:pop-in:600"`
 fn apply_fx_animate(root: &Element, state: &str) {
     let window = match web_sys::window() { Some(w) => w, None => return };
-    let els = self_and_descendants(root, "[fx-animate]");
+    let els = render_targets(root, "[fx-animate]");
     for el in els {
         let attr = el.get_attribute("fx-animate").unwrap_or_default();
         for spec in attr.split_whitespace() {
@@ -836,29 +885,86 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
             continue;
         }
         let _ = container.set_attribute("data-fx-rendered", &rendered);
+        reconcile_rows(document, &container, &template_html, &array);
+    }
+}
 
-        container.set_inner_html("");
-
-        // Parse the template once and clone it per item (parsing HTML per row
-        // dominated long lists), and attach all rows in one DOM operation.
-        let scratch = document.create_element("div").unwrap();
-        scratch.set_inner_html(&template_html);
-        let Some(template_el) = scratch.first_element_child() else { continue };
-        let rows = document.create_document_fragment();
-
-        for item in &array {
-            let Ok(item_el) = template_el.clone_node_with_deep(true).map(|n| n.unchecked_into::<Element>()) else { continue };
-
-            item_el.set_attribute("data-fx-item", &item.to_string()).unwrap();
-
-            if let Some(el) = item_el.dyn_ref::<HtmlElement>() {
-                let _ = el.style().remove_property("display");
-            }
-
-            apply_fx_fields(&item_el, item);
-            rows.append_child(&item_el).unwrap();
+/// Bring `container`'s rows in line with `items`, touching only what
+/// changed. Rows are matched by `fx-key="field"` on the container (an item
+/// field unique within the list), else by position: an unchanged row keeps
+/// its node as is (focus, an open `<details>`, scroll position survive), a
+/// changed one is re-bound in place, a new one is cloned from the template,
+/// and a row no longer listed is removed. Rebuilding every row on any
+/// change took most of a second on a 2,000-row list.
+fn reconcile_rows(document: &Document, container: &Element, template_html: &str, items: &[Value]) {
+    let key_field = container.get_attribute("fx-key");
+    let key_of = |item: &Value, i: usize| -> String {
+        match key_field.as_deref().and_then(|f| item.get(f)) {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => format!("#{i}"),
         }
-        container.append_child(&rows).unwrap();
+    };
+    // Current rows by key (the key is kept on the row as data-fx-key).
+    let mut existing: HashMap<String, Element> = HashMap::new();
+    let mut child = container.first_element_child();
+    while let Some(el) = child {
+        child = el.next_element_sibling();
+        match el.get_attribute("data-fx-key") {
+            Some(k) if !existing.contains_key(&k) => { existing.insert(k, el); }
+            _ => el.remove(), // a stray (e.g. the template's own markup)
+        }
+    }
+
+    let mut template_el: Option<Element> = None;
+    let mut cursor = container.first_element_child();
+    for (i, item) in items.iter().enumerate() {
+        let key = key_of(item, i);
+        let json = item.to_string();
+        // Compare a short hash, not the item itself: reading 2,000 rows'
+        // JSON back out of the DOM was most of a re-render.
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            json.hash(&mut h);
+            format!("{:x}", h.finish())
+        };
+        let el = match existing.remove(&key) {
+            Some(el) => {
+                if el.get_attribute("data-fx-hash").as_deref() != Some(hash.as_str()) {
+                    let _ = el.set_attribute("data-fx-item", &json);
+                    let _ = el.set_attribute("data-fx-hash", &hash);
+                    apply_fx_fields(&el, item);
+                }
+                el
+            }
+            None => {
+                // Parse the template once per render, clone it per new row.
+                let tpl = template_el.get_or_insert_with(|| {
+                    let scratch = document.create_element("div").unwrap();
+                    scratch.set_inner_html(template_html);
+                    scratch.first_element_child().unwrap_or_else(|| document.create_element("div").unwrap())
+                });
+                let Ok(el) = tpl.clone_node_with_deep(true).map(|n| n.unchecked_into::<Element>()) else { continue };
+                let _ = el.set_attribute("data-fx-item", &json);
+                let _ = el.set_attribute("data-fx-hash", &hash);
+                let _ = el.set_attribute("data-fx-key", &key);
+                if let Some(h) = el.dyn_ref::<HtmlElement>() {
+                    let _ = h.style().remove_property("display");
+                }
+                apply_fx_fields(&el, item);
+                el
+            }
+        };
+        // Move it only if it isn't already in place.
+        if cursor.as_ref() == Some(&el) {
+            cursor = el.next_element_sibling();
+        } else {
+            let _ = container.insert_before(&el, cursor.as_ref().map(|c| c.unchecked_ref::<web_sys::Node>()));
+        }
+    }
+    for el in existing.into_values() {
+        el.remove();
     }
 }
 
@@ -1244,14 +1350,23 @@ fn open_sse(document: Document, routes: std::rc::Rc<HashMap<String, Sub>>, failu
             let Some(sub) = v.get("sub").and_then(|s| s.as_str()).and_then(|k| routes.get(k)) else { return };
             let snap = if name == "snapshot" {
                 let Ok(snap) = serde_json::from_value::<Snapshot>(v) else { return };
-                store_context(&sub.cache_key, snap.context.clone());
+                store_snapshot(&sub.cache_key, &snap);
                 snap
             } else {
                 let Ok(pe) = serde_json::from_value::<ContextPatch>(v) else { return };
-                let mut ctx = load_context(&sub.cache_key);
-                if json_patch::patch(&mut ctx, &pe.patch.0).is_err() { return; }
-                store_context(&sub.cache_key, ctx.clone());
-                Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx }
+                match apply_delta(&sub.cache_key, pe) {
+                    Delta::Applied(snap) => snap,
+                    Delta::Stale => return,
+                    Delta::Gap => {
+                        let (doc, root, mid, sid, ck) = (document.clone(), sub.root.clone(), sub.machine_id.clone(), sub.session_id.clone(), sub.cache_key.clone());
+                        spawn_local(async move {
+                            if let Ok(snap) = resync(&mid, &sid, &ck).await {
+                                apply_snapshot_if_newer(&doc, &root, &snap);
+                            }
+                        });
+                        return;
+                    }
+                }
             };
             // A full snapshot is what the server has when the stream (re)connects:
             // take it even if its version is lower than what's shown, which happens
@@ -1265,11 +1380,11 @@ fn open_sse(document: Document, routes: std::rc::Rc<HashMap<String, Sub>>, failu
                 apply_snapshot_if_newer(&document, &sub.root, &snap)
             };
             if let Some(prev) = applied {
-                let (root, doc, mid, sid) = (sub.root.clone(), document.clone(), sub.machine_id.clone(), sub.session_id.clone());
+                let (root, doc, mid, sid, ck) = (sub.root.clone(), document.clone(), sub.machine_id.clone(), sub.session_id.clone(), sub.cache_key.clone());
                 let new_state = snap.state.clone();
                 spawn_local(async move {
                     for ev in collect_enter_events(&root, &prev, &new_state) {
-                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid).await {
+                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid, &ck).await {
                             apply_snapshot(&doc, &root, &s2);
                             update_debug(&doc, &root, &s2);
                         }
@@ -1417,17 +1532,22 @@ async fn fetch_snapshot(machine_id: &str, session_id: &str) -> Result<Snapshot, 
     rmp_serde::from_slice::<Snapshot>(&bytes).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// POST a transition. The server answers with a patch from the version
+/// the transition started from; applied onto the cached snapshot it gives
+/// the new one (or what's cached, if an SSE push already brought it).
 async fn send_transition(
     machine_id: &str,
     event: &str,
     payload: Value,
     session_id: &str,
+    cache_key: &str,
 ) -> Result<Snapshot, JsValue> {
     let body_value = serde_json::json!({
         "machine":  machine_id,
         "event":    event,
         "payload":  payload,
         "session":  session_id,
+        "reply":    "patch",
     });
     let body_bytes =
         rmp_serde::to_vec_named(&body_value).map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1446,7 +1566,12 @@ async fn send_transition(
     let window = web_sys::window().unwrap();
     let resp: Response = JsFuture::from(window.fetch_with_request(&req)).await?.dyn_into()?;
     let bytes = response_bytes(resp).await?;
-    rmp_serde::from_slice::<Snapshot>(&bytes).map_err(|e| JsValue::from_str(&e.to_string()))
+    let pe = rmp_serde::from_slice::<ContextPatch>(&bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    match apply_delta(cache_key, pe) {
+        Delta::Applied(snap) => Ok(snap),
+        Delta::Stale => cached(cache_key).ok_or_else(|| JsValue::from_str("no cached snapshot")),
+        Delta::Gap => resync(machine_id, session_id, cache_key).await,
+    }
 }
 
 async fn response_bytes(resp: Response) -> Result<Vec<u8>, JsValue> {
