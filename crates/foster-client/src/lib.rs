@@ -1192,11 +1192,48 @@ struct Sub {
 /// on HTTP/1.1 and starve every other request on the page.
 fn attach_sse(document: Document, subs: &[Sub]) {
     if subs.is_empty() { return; }
-    let query: Vec<&str> = subs.iter().map(|s| s.key.as_str()).collect();
-    let url = format!("/events?subs={}", query.join(","));
-    let Ok(es) = EventSource::new(&url) else { return };
     let routes: std::rc::Rc<HashMap<String, Sub>> =
         std::rc::Rc::new(subs.iter().map(|s| (s.key.clone(), s.clone())).collect());
+    open_sse(document, routes, 0);
+}
+
+/// Longest wait between attempts to reopen a closed `/events` stream.
+const SSE_RETRY_MAX_MS: i32 = 30_000;
+
+/// Open the stream, and reopen it if the browser gives up on it. An
+/// `EventSource` retries a dropped connection by itself, but a failed
+/// reconnect (the server mid-restart, a proxy's 502 during a rollout)
+/// closes it for good — leaving the page silently frozen. Each reopen is
+/// sent fresh snapshots, which resync the page.
+fn open_sse(document: Document, routes: std::rc::Rc<HashMap<String, Sub>>, failures: u32) {
+    let query: Vec<&str> = routes.keys().map(String::as_str).collect();
+    let url = format!("/events?subs={}", query.join(","));
+    let Ok(es) = EventSource::new(&url) else { return };
+    let failures = std::rc::Rc::new(std::cell::Cell::new(failures));
+    {
+        let failures = failures.clone();
+        let on_open = Closure::<dyn FnMut()>::new(move || failures.set(0));
+        es.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        on_open.forget();
+    }
+    {
+        let (document, routes, es2) = (document.clone(), routes.clone(), es.clone());
+        let on_error = Closure::<dyn FnMut()>::new(move || {
+            if es2.ready_state() != EventSource::CLOSED {
+                return; // the browser is reconnecting by itself
+            }
+            es2.set_onerror(None);
+            let n = failures.get();
+            let wait = 1000_i32.saturating_mul(1 << n.min(5)).min(SSE_RETRY_MAX_MS);
+            let (document, routes) = (document.clone(), routes.clone());
+            let retry = Closure::once_into_js(move || open_sse(document, routes, n + 1));
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(retry.unchecked_ref(), wait);
+            }
+        });
+        es.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        on_error.forget();
+    }
 
     for name in ["snapshot", "patch"] {
         let document = document.clone();

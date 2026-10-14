@@ -888,7 +888,13 @@ where
         // and nothing can slip between the read and the subscription. The
         // client drops anything not newer than what it has.
         let live = app.pubsub.subscribe(&session, &machine);
-        let current = app.store.load(&session, &machine).await;
+        // No instance yet (a new session, or one dropped as idle): send the
+        // initial snapshot, as /state does, so a page that had an older
+        // instance learns it started over.
+        let current = match app.store.load(&session, &machine).await {
+            Some(snap) => Some(snap),
+            None => Some(MachineInstance::new(app.machines[&machine].clone()).snapshot()),
+        };
         streams.push(
             futures_util::stream::iter(current)
                 .chain(live)
@@ -1876,8 +1882,22 @@ mod tests {
             .await.unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
         // The unwatched session starts over; the one with a page open is kept.
+        // (Its page's stream, had it one, would be sent the initial snapshot.)
         assert_eq!(state_of(&app, "/state?machine=counter&session=gone").await.context["n"], 0);
         assert_eq!(state_of(&app, "/state?machine=counter&session=open").await.context["n"], 1);
+    }
+
+    #[tokio::test]
+    async fn events_start_with_a_snapshot_even_for_a_new_session() {
+        let counter = MachineBuilder::new("counter", "idle", json!({ "n": 0 })).pass("idle", "noop", "idle").build();
+        let app = router(HashMap::from([("counter".to_string(), counter)]));
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/events?machine=counter&session=brand-new").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(2), body.frame()).await.unwrap().unwrap().unwrap();
+        let text = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        assert!(text.contains("event: snapshot") && text.contains(r#""state":"idle""#), "{text}");
     }
 
     /// Concurrent events on one instance (two effects reporting at once)
