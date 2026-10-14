@@ -4,13 +4,19 @@
 //! `fx-on` holds one or more space-separated bindings, each `trigger->event`:
 //! - `trigger` is a DOM event (`click`, `input`, `change`, `keydown`), a
 //!   keyboard event narrowed to one key (`keydown.Enter`, `keydown.Escape`,
-//!   `keydown.Space` — any `KeyboardEvent.key` value), or one of the special
-//!   triggers `visible`, `enter`, `click@outside`;
+//!   `keydown.Space` — any `KeyboardEvent.key` value), a click with a held
+//!   modifier (`click.shift`, `click.ctrl`, `click.meta`, `click.alt`), or one of the special
+//!   triggers `visible`, `enter`;
+//! - an optional `@scope` suffix listens beyond the element: `click@outside`
+//!   (a click anywhere else — closing a menu), `keydown.Escape@document`
+//!   (anywhere on the page, except while typing in a field — global shortcuts);
 //! - `event` is an event on the owning machine, or `machine:event` /
 //!   `machine#1:event` for another machine on the page.
 //!
 //! ```text
 //! fx-on="keydown.Enter->save keydown.Escape->cancel"
+//! fx-on="click.shift->select_range click->toggle"   (first match wins)
+//! fx-on="keydown.Escape@document->close"
 //! ```
 
 /// One `trigger->event` binding.
@@ -20,6 +26,8 @@ pub struct FxOn {
     pub trigger: String,
     /// The key a keyboard trigger is limited to (`Enter` in `keydown.Enter`).
     pub key: Option<String>,
+    /// Where it listens beyond the element: `outside`, `document`.
+    pub scope: Option<String>,
     /// `save`, or `other:save` for another machine.
     pub event: String,
 }
@@ -48,12 +56,16 @@ pub fn parse_fx_on(attr: &str) -> Vec<FxOn> {
     attr.split_whitespace()
         .filter_map(|spec| {
             let (trigger, event) = spec.split_once("->")?;
+            let (trigger, scope) = match trigger.split_once('@') {
+                Some((t, sc)) => (t, Some(sc.to_string()).filter(|sc| !sc.is_empty())),
+                None => (trigger, None),
+            };
             let (trigger, key) = match trigger.split_once('.') {
                 Some((t, k)) => (t, Some(k.to_string()).filter(|k| !k.is_empty())),
                 None => (trigger, None),
             };
             (!trigger.is_empty() && !event.is_empty())
-                .then(|| FxOn { trigger: trigger.to_string(), key, event: event.to_string() })
+                .then(|| FxOn { trigger: trigger.to_string(), key, scope, event: event.to_string() })
         })
         .collect()
 }
@@ -63,13 +75,17 @@ mod tests {
     use super::*;
 
     fn on(trigger: &str, key: Option<&str>, event: &str) -> FxOn {
-        FxOn { trigger: trigger.into(), key: key.map(Into::into), event: event.into() }
+        FxOn { trigger: trigger.into(), key: key.map(Into::into), scope: None, event: event.into() }
     }
 
     #[test]
     fn single_binding() {
         assert_eq!(parse_fx_on("click->increment"), vec![on("click", None, "increment")]);
-        assert_eq!(parse_fx_on("click@outside->close"), vec![on("click@outside", None, "close")]);
+        assert_eq!(parse_fx_on("click@outside->close"), vec![FxOn { scope: Some("outside".into()), ..on("click", None, "close") }]);
+        assert_eq!(
+            parse_fx_on("keydown.Escape@document->close"),
+            vec![FxOn { scope: Some("document".into()), ..on("keydown", Some("Escape"), "close") }]
+        );
         assert_eq!(parse_fx_on("click->theme:toggle"), vec![on("click", None, "theme:toggle")]);
     }
 

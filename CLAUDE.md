@@ -344,6 +344,7 @@ All attributes processed client-side by the WASM runtime.
 | `fx-disable` | `fx-disable="loading"` | Add `disabled` in listed states |
 | `fx-on` | `fx-on="click->increment"` | Fire machine event on DOM event (`click`, `input`, `change`, `keydown`); several space-separated bindings allowed |
 | `fx-on="keydown.Key->…"` | `fx-on="keydown.Enter->save keydown.Escape->cancel"` | Keyboard binding limited to one `KeyboardEvent.key` (`Space` for `" "`). The nearest ancestor with a binding *for this event* handles it, so an input's key bindings don't swallow its row's clicks |
+| `fx-on="click.shift->…"` | `fx-on="click.shift->select_range click->toggle"` | Click with a held modifier (`shift`, `ctrl`, `meta`, `alt`); bindings are tried in order, so put the specific one first |
 | `fx-copy` | `fx-copy="item:url"` / `fx-copy="ctx:share_url"` | On click, copy that `fx-for` item field / context value to the clipboard (pair with `fx-on="click->copied"` for feedback) |
 | `fx-state-label` | `fx-state-label` | Display current state name |
 | `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]` |
@@ -363,15 +364,18 @@ All attributes processed client-side by the WASM runtime.
 | `fx-on="enter->…"` | `fx-on="enter->about"` | Fire every time the element crosses the reading line (30–40% down the viewport) — scroll-spy |
 | `fx-on="…->machine:event"` | `fx-on="click->theme:toggle"` | Send the event to another machine on the page (by its `fx-machine` value, e.g. `counter#1:inc`); template validation checks it against that machine |
 | `fx-on="click@outside->…"` | `fx-on="click@outside->close"` | Fire on a click anywhere outside the element (close a dropdown) |
+| `fx-on="…@document->…"` | `fx-on="keydown.Escape@document->close"` | Listen on the whole document (global shortcuts; closing a dialog whatever has focus). Keyboard events typed into an input/textarea/select/contenteditable are ignored |
 
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
+- Booleans follow HTML boolean attributes: `true` → present (`hidden=""`), `false`/`null` → removed (`fx-bind-attr="hidden=item:no_preview"`)
 - `attr=state:name` — set `attr=""` when in that state (use for `disabled`, `hidden`, `aria-current`)
 - `attr=item:field` — inside an `fx-for` item: set from that item's field (`<img fx-bind-attr="src=item:thumb_url alt=item:name">`)
 - Target `style.<prop>` sets an inline style property instead of an attribute: `fx-bind-attr="style.left=item:x style.top=item:y"`
 
 **`fx-if` format:**
 - `fx-if="field"` — show when `context[field]` is truthy (non-null, non-false, non-zero, non-empty)
+- Showing clears the inline `display` (the element keeps its CSS display — flex, grid…); hiding sets `display:none`. (`fx-show` sets `display:block`, since `[fx-show]{display:none}` hides it until then — wrap a flex/grid container in a plain div.)
 - `fx-if='{"field":"count","op":"gt","value":0}'` — comparison; ops: `eq neq gt lt gte lte`
 
 **`fx-animate` format:** space-separated `state:class:duration_ms` specs.

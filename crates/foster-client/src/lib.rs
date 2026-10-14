@@ -473,7 +473,7 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> Strin
     apply_fx_text(root, &snap.context);
     apply_fx_disable(root, &snap.state);
     apply_fx_state_label(root, &snap.state);
-    apply_fx_value(root, &snap.context);
+    apply_fx_value(root, &snap.state, &snap.context);
     apply_fx_class(root, &snap.state);
     apply_fx_animate(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
@@ -603,19 +603,28 @@ fn apply_fx_state_label(root: &Element, state: &str) {
     }
 }
 
-fn apply_fx_value(root: &Element, ctx: &Value) {
+/// `fx-value="key"` — fill a field from `ctx[key]`. A field is only written
+/// when the value or the machine's state changed since it was last written,
+/// so a re-render of the same snapshot (an SSE echo of a transition already
+/// applied from its response) can't wipe out what the user has typed since;
+/// entering a state (reopening a dialog) still resets it.
+fn apply_fx_value(root: &Element, state: &str, ctx: &Value) {
     let els = self_and_descendants(root, "[fx-value]");
     for el in els {
         let key = el.get_attribute("fx-value").unwrap_or_default();
-        if let Some(val) = ctx.get(&key) {
-            let text = val_to_string(val);
-            if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
-                input.set_value(&text);
-            } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
-                ta.set_value(&text);
-            } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
-                sel.set_value(&text);
-            }
+        let Some(val) = ctx.get(&key) else { continue };
+        let text = val_to_string(val);
+        let stamp = format!("{state}\u{1f}{text}");
+        if el.get_attribute("data-fx-value-applied").as_deref() == Some(stamp.as_str()) {
+            continue;
+        }
+        let _ = el.set_attribute("data-fx-value-applied", &stamp);
+        if let Some(input) = el.dyn_ref::<web_sys::HtmlInputElement>() {
+            input.set_value(&text);
+        } else if let Some(ta) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+            ta.set_value(&text);
+        } else if let Some(sel) = el.dyn_ref::<web_sys::HtmlSelectElement>() {
+            sel.set_value(&text);
         }
     }
 }
@@ -679,18 +688,24 @@ fn bind_item_attrs(el: &Element, item: &Value) {
 }
 
 /// Set (`Some`) or clear (`None`) a bound attribute, or a style property for a
-/// `style.<property>` target.
+/// `style.<property>` target. Booleans follow HTML boolean attributes:
+/// `true` sets it empty (`hidden=""`), `false`/`null` removes it.
 fn set_bound(el: &Element, target: &str, val: Option<&Value>) {
+    let val: Option<String> = match val {
+        None | Some(Value::Null | Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => Some(String::new()),
+        Some(v) => Some(val_to_string(v)),
+    };
     if let Some(prop) = target.strip_prefix("style.") {
         if let Some(style) = el.dyn_ref::<HtmlElement>().map(|h| h.style()) {
-            let _ = match val {
-                Some(v) => style.set_property(prop, &val_to_string(v)),
+            let _ = match &val {
+                Some(v) => style.set_property(prop, v),
                 None => style.remove_property(prop).map(|_| ()),
             };
         }
     } else {
-        let _ = match val {
-            Some(v) => el.set_attribute(target, &val_to_string(v)),
+        let _ = match &val {
+            Some(v) => el.set_attribute(target, v),
             None => el.remove_attribute(target),
         };
     }
@@ -705,10 +720,13 @@ fn apply_fx_if(root: &Element, ctx: &Value) {
     for el in els {
         let el: HtmlElement = el.dyn_into().unwrap();
         let attr = el.get_attribute("fx-if").unwrap_or_default();
-        let visible = eval_condition(&attr, ctx);
-        el.style()
-            .set_property("display", if visible { "block" } else { "none" })
-            .unwrap();
+        // Visible = no inline display, so the element keeps its own CSS
+        // display (flex, grid, inline…) rather than being forced to block.
+        let _ = if eval_condition(&attr, ctx) {
+            el.style().remove_property("display").map(drop)
+        } else {
+            el.style().set_property("display", "none")
+        };
     }
 }
 
@@ -939,7 +957,8 @@ fn attach_triggers(document: Document, root: Element, machine_id: String, sessio
     attach_visible_triggers(document.clone(), own.clone(), "visible", None, true);
     // Reading-line band (30–40% down the viewport): scroll-spy style.
     attach_visible_triggers(document.clone(), own.clone(), "enter", Some("-30% 0px -60% 0px"), false);
-    attach_outside_triggers(document, own);
+    attach_outside_triggers(document.clone(), own.clone());
+    attach_document_triggers(document, own);
 }
 
 /// `el`'s `fx-on` bindings — see [`foster_core::fx_on`] for the grammar.
@@ -949,7 +968,7 @@ fn fx_on_bindings(el: &Element) -> Vec<foster_core::FxOn> {
 
 /// The event `el` binds to `trigger` (no key filter), if any.
 fn bound_event(el: &Element, trigger: &str) -> Option<String> {
-    fx_on_bindings(el).into_iter().find(|b| b.matches(trigger, None)).map(|b| b.event)
+    fx_on_bindings(el).into_iter().find(|b| b.scope.is_none() && b.matches(trigger, None)).map(|b| b.event)
 }
 
 /// Fire `machine_event` (from `fx_on_el`'s trigger) and apply the result,
@@ -1011,7 +1030,7 @@ fn attach_delegating_listener(document: Document, own: Target) {
         let Ok(target_el): Result<Element, _> = target.dyn_into() else { return };
 
         let kind = event.type_();
-        let key = event.dyn_ref::<web_sys::KeyboardEvent>().map(|k| k.key());
+        let key = event_key(&event);
 
         if kind == "click" {
             copy_on_click(&target_el, root, &own.cache_key);
@@ -1086,7 +1105,8 @@ fn attach_outside_triggers(document: Document, own: Target) {
         .flat_map(|el| {
             fx_on_bindings(&el)
                 .into_iter()
-                .filter_map(|b| Some((el.clone(), b.trigger.strip_suffix("@outside")?.to_string(), b.event)))
+                .filter(|b| b.scope.as_deref() == Some("outside"))
+                .map(|b| (el.clone(), b.trigger, b.event))
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -1106,6 +1126,47 @@ fn attach_outside_triggers(document: Document, own: Target) {
         document.add_event_listener_with_callback(ev_type, cb.as_ref().unchecked_ref()).unwrap();
     }
     cb.forget();
+}
+
+/// `fx-on="keydown.Escape@document->close"` — the binding listens on the
+/// whole document (global shortcuts, closing a dialog whatever has focus).
+/// Keyboard events typed into a field (input, textarea, select, editable) are
+/// left alone, so shortcuts don't fire while typing.
+fn attach_document_triggers(document: Document, own: Target) {
+    let specs: Vec<(Element, foster_core::FxOn)> = self_and_descendants(&own.root, "[fx-on]")
+        .into_iter()
+        .flat_map(|el| {
+            fx_on_bindings(&el)
+                .into_iter()
+                .filter(|b| b.scope.as_deref() == Some("document"))
+                .map(|b| (el.clone(), b))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if specs.is_empty() { return; }
+    let mut kinds: Vec<String> = specs.iter().map(|(_, b)| b.trigger.clone()).collect();
+    kinds.sort();
+    kinds.dedup();
+
+    let doc_for_listener = document.clone();
+    let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        if event.dyn_ref::<web_sys::KeyboardEvent>().is_some() && typing_in_field(&event) {
+            return;
+        }
+        let (kind, key) = (event.type_(), event_key(&event));
+        if let Some((el, b)) = specs.iter().find(|(_, b)| b.matches(&kind, key.as_deref())) {
+            fire_spec(&doc_for_listener, &own, el, b.event.clone());
+        }
+    });
+    for kind in &kinds {
+        document.add_event_listener_with_callback(kind, cb.as_ref().unchecked_ref()).unwrap();
+    }
+    cb.forget();
+}
+
+fn typing_in_field(event: &web_sys::Event) -> bool {
+    let Some(el) = event.target().and_then(|t| t.dyn_into::<HtmlElement>().ok()) else { return false };
+    matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.is_content_editable()
 }
 
 // ── SSE listener ──────────────────────────────────────────────────────────────
@@ -1217,13 +1278,25 @@ fn copy_on_click(target: &Element, root: &Element, cache_key: &str) {
     }
 }
 
+/// What a binding's `.qualifier` is matched against: the key for keyboard
+/// events (`keydown.Enter`), the held modifier for mouse events
+/// (`click.shift`, `click.ctrl`, `click.meta`, `click.alt`).
+fn event_key(event: &web_sys::Event) -> Option<String> {
+    event.dyn_ref::<web_sys::KeyboardEvent>().map(|k| k.key()).or_else(|| {
+        let m = event.dyn_ref::<web_sys::MouseEvent>()?;
+        [(m.shift_key(), "shift"), (m.ctrl_key(), "ctrl"), (m.meta_key(), "meta"), (m.alt_key(), "alt")]
+            .into_iter()
+            .find_map(|(held, name)| held.then(|| name.to_string()))
+    })
+}
+
 /// Nearest element from `el` up to `root` with an `fx-on` binding for a DOM
 /// event of type `kind` (and `key`, for keyboard events), and that binding's
 /// event.
 fn find_binding(el: &Element, root: &Element, kind: &str, key: Option<&str>) -> Option<(Element, String)> {
     let mut cur: Option<Element> = Some(el.clone());
     while let Some(c) = cur {
-        if let Some(b) = fx_on_bindings(&c).into_iter().find(|b| b.matches(kind, key)) {
+        if let Some(b) = fx_on_bindings(&c).into_iter().find(|b| b.scope.is_none() && b.matches(kind, key)) {
             return Some((c, b.event));
         }
         if c == *root { return None; }
