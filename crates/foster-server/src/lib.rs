@@ -100,29 +100,40 @@ impl<S: StateStore + Clone, P: PubSub + Clone> AppState<S, P> {
             .ok_or_else(|| format!("machine '{machine_id}' not found"))?;
         let effect = self.effects.get(machine_id).and_then(|m| m.get(event)).cloned();
         let effect_payload = effect.is_some().then(|| payload.clone());
-        let event_owned = event.to_string();
         let shared = self.watchers.contains_key(machine_id);
-        let snap = self
-            .store
-            .apply(session, machine_id, move |current| {
-                let mut inst = MachineInstance::new(machine);
-                if let Some(snap) = current {
-                    inst.restore(snap).map_err(|e| e.to_string())?;
-                }
-                let mut snap = inst.send(&event_owned, payload).map_err(|e| e.to_string())?;
-                // Shared machines can live on several replicas at once (each
-                // with its own in-memory store, each driven by its own feed),
-                // and a page may read /state from one replica and stream
-                // /events from another. Per-replica counters diverge (one
-                // replica at v17000, another at v4000), and the client drops
-                // every "older" update. Wall-clock versions keep replicas
-                // comparable while staying monotonic per replica.
-                if shared {
-                    snap.version = snap.version.max(unix_millis());
-                }
-                Ok(snap)
-            })
-            .await?;
+        // The store rejects a write that raced another one to the same
+        // instance (two effects reporting at once, a click during a job's
+        // progress update). Reducers are pure, so run it again on the newer
+        // state rather than dropping the event.
+        let mut attempt = 0;
+        let snap = loop {
+            let (machine, payload, event_owned) = (machine.clone(), payload.clone(), event.to_string());
+            let result = self
+                .store
+                .apply(session, machine_id, move |current| {
+                    let mut inst = MachineInstance::new(machine);
+                    if let Some(snap) = current {
+                        inst.restore(snap).map_err(|e| e.to_string())?;
+                    }
+                    let mut snap = inst.send(&event_owned, payload).map_err(|e| e.to_string())?;
+                    // Shared machines can live on several replicas at once (each
+                    // with its own in-memory store, each driven by its own feed),
+                    // and a page may read /state from one replica and stream
+                    // /events from another. Per-replica counters diverge (one
+                    // replica at v17000, another at v4000), and the client drops
+                    // every "older" update. Wall-clock versions keep replicas
+                    // comparable while staying monotonic per replica.
+                    if shared {
+                        snap.version = snap.version.max(unix_millis());
+                    }
+                    Ok(snap)
+                })
+                .await;
+            match result {
+                Err(e) if is_conflict(&e) && attempt < CONFLICT_RETRIES => attempt += 1,
+                other => break other?,
+            }
+        };
         self.pubsub.publish(session, machine_id, snap.clone()).await;
         if let (Some(effect), Some(payload)) = (effect, effect_payload) {
             let (identity, client_session) = self.split_key(session);
@@ -221,6 +232,14 @@ pub struct Effect {
     /// The machine's snapshot right after the triggering transition.
     pub snapshot: Snapshot,
     fire: FireFn,
+}
+
+/// How many times [`Foster`] reruns a transition whose write raced another.
+const CONFLICT_RETRIES: usize = 16;
+
+/// A store's "someone else wrote first" error (in-memory or Redis).
+fn is_conflict(err: &str) -> bool {
+    err.starts_with("concurrent write") || err.contains("version_conflict") || err.contains("version conflict")
 }
 
 impl Effect {
@@ -1785,6 +1804,29 @@ mod tests {
             .await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    /// Concurrent events on one instance (two effects reporting at once)
+    /// must all land: a raced write is retried, not dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_transitions_on_one_instance_all_apply() {
+        let counter = MachineBuilder::new("counter", "idle", json!({ "n": 0 }))
+            .on("idle", "inc", "idle", |mut ctx, _| {
+                // Widen the window between the store's read and write.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                ctx["n"] = json!(ctx["n"].as_i64().unwrap_or(0) + 1);
+                Ok(ctx)
+            })
+            .build();
+        let app = router(HashMap::from([("counter".to_string(), counter)]));
+        let sends = (0..12).map(|_| {
+            let app = app.clone();
+            tokio::spawn(async move { transition(&app, "counter", "inc", "s").await })
+        });
+        for t in futures_util::future::join_all(sends).await {
+            t.unwrap();
+        }
+        assert_eq!(state_of(&app, "/state?machine=counter&session=s").await.context["n"], 12);
     }
 
     #[tokio::test]
