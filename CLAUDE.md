@@ -350,7 +350,7 @@ All attributes processed client-side by the WASM runtime.
 | `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]` |
 | `fx-where` | `fx-where='{"column":"todo"}'` | Filter `fx-for` items by key/value |
 | `fx-field` | `fx-field="title"` | Set text from item field inside `fx-for` |
-| `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload; when several inputs collect one key, a visible one wins over hidden ones |
+| `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload; when several inputs collect one key, the one that fired the event wins (a per-row input in an `fx-for`), then a visible one over hidden ones |
 | `fx-value` | `fx-value="draft_title"` | Pre-populate input from context |
 | `fx-payload` | `fx-payload='{"col":"done"}'` | Static JSON merged into transition payload |
 | `fx-class` | `fx-class="calm:is-active"` | Add CSS class when in named state |

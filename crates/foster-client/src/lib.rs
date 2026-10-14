@@ -1321,6 +1321,11 @@ fn build_payload(fx_on_el: &Element, root: &Element) -> Value {
             if visible { from_visible.insert(key); }
         }
     }
+    // The field that fired the event (`<input fx-collect="dest"
+    // fx-on="change->set_dest">` on each row of a list) supplies its own value.
+    if let (Some(key), Some(val)) = (fx_on_el.get_attribute("fx-collect"), read_input_value(fx_on_el)) {
+        map.insert(key, Value::String(val));
+    }
 
     if let Some(item_json) = find_item_ancestor(fx_on_el, root) {
         if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&item_json) {
