@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// Session key every `.shared()` machine is stored and broadcast under.
@@ -272,11 +273,38 @@ pub struct Foster {
     request_events: HashMap<String, RequestEvent>,
     effects: HashMap<String, HashMap<String, EffectFn>>,
     identity: Option<IdentityFn>,
+    session_ttl: Option<Duration>,
+}
+
+/// How long an unwatched session's instances live after their last use.
+pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Debug builds, or `FOSTER_TEST_MODE=1`: debug routes, the dev overlay and
+/// snapshot history are on.
+pub(crate) fn debug_mode() -> bool {
+    cfg!(debug_assertions) || std::env::var("FOSTER_TEST_MODE").is_ok_and(|v| v == "1")
 }
 
 impl Foster {
     pub fn new(machines: HashMap<String, Arc<Machine>>) -> Self {
-        Self { machines, feeds: Vec::new(), request_events: HashMap::new(), effects: HashMap::new(), identity: None }
+        Self {
+            machines,
+            feeds: Vec::new(),
+            request_events: HashMap::new(),
+            effects: HashMap::new(),
+            identity: None,
+            session_ttl: Some(DEFAULT_SESSION_TTL),
+        }
+    }
+
+    /// Drop a session's instances once nothing has used them for `ttl` and
+    /// no page is subscribed to them (default [`DEFAULT_SESSION_TTL`]);
+    /// `None` keeps them forever. A page that comes back later starts that
+    /// machine fresh (it gets the new instance's snapshot on reconnecting).
+    /// `.shared()` machines are never dropped.
+    pub fn session_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.session_ttl = ttl;
+        self
     }
 
     /// Require an authenticated user on every Foster route (the page, `/state`,
@@ -412,6 +440,28 @@ where
     });
 }
 
+/// Every minute (or `ttl`, if shorter), drop per-session instances idle
+/// for `ttl` that no page is subscribed to. Needs a tokio runtime; without
+/// one (a router built outside it) sessions are kept.
+fn spawn_session_sweeper<S, P>(app: AppState<S, P>, ttl: Duration)
+where
+    S: StateStore + Clone + 'static,
+    P: PubSub + Clone + 'static,
+{
+    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+    let every = ttl.min(Duration::from_secs(60)).max(Duration::from_millis(10));
+    rt.spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let pubsub = app.pubsub.clone();
+            let keep = move |session: &str, machine: &str| session == SHARED_SESSION || pubsub.watched(session, machine);
+            app.store.evict_idle(ttl, &keep).await;
+        }
+    });
+}
+
 /// Decrements a shared machine's watcher count when an `/events` stream closes.
 struct WatchGuard(watch::Sender<usize>);
 
@@ -474,7 +524,7 @@ where
     S: StateStore + Clone + 'static,
     P: PubSub + Clone + 'static,
 {
-    let Foster { machines, feeds, request_events, effects, identity } = foster;
+    let Foster { machines, feeds, request_events, effects, identity, session_ttl } = foster;
     // Collect template HTML and machine metadata before machines are moved into AppState.
     // Only one machine needs `.template(...)` set — the whole page is shared, and each
     // machine below validates only its own `[fx-machine="{id}"]` subtree(s) within it.
@@ -511,8 +561,7 @@ where
     let machines: HashMap<String, Arc<Machine>> =
         machines.into_iter().filter(|(_, m)| !m.local).collect();
 
-    let test_mode = cfg!(debug_assertions)
-        || std::env::var("FOSTER_TEST_MODE").map(|v| v == "1").unwrap_or(false);
+    let test_mode = debug_mode();
 
     // Inject overlay CSS + machine metadata in debug builds.
     // CSS is served here (not by WASM) so it's in the document before WASM runs,
@@ -576,6 +625,9 @@ where
 
     for feed in feeds {
         spawn_feed(app.clone(), feed);
+    }
+    if let Some(ttl) = session_ttl {
+        spawn_session_sweeper(app.clone(), ttl);
     }
 
     let mut router = Router::new()
@@ -1804,6 +1856,28 @@ mod tests {
             .await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn idle_sessions_are_dropped_unless_watched() {
+        let counter = MachineBuilder::new("counter", "idle", json!({ "n": 0 }))
+            .on("idle", "inc", "idle", |mut ctx, _| {
+                ctx["n"] = json!(ctx["n"].as_i64().unwrap_or(0) + 1);
+                Ok(ctx)
+            })
+            .build();
+        let app = Foster::new(HashMap::from([("counter".to_string(), counter)]))
+            .session_ttl(Some(Duration::from_millis(50)))
+            .router();
+        transition(&app, "counter", "inc", "gone").await;
+        transition(&app, "counter", "inc", "open").await;
+        let _sse = app.clone()
+            .oneshot(Request::builder().uri("/events?machine=counter&session=open").body(Body::empty()).unwrap())
+            .await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        // The unwatched session starts over; the one with a page open is kept.
+        assert_eq!(state_of(&app, "/state?machine=counter&session=gone").await.context["n"], 0);
+        assert_eq!(state_of(&app, "/state?machine=counter&session=open").await.context["n"], 1);
     }
 
     /// Concurrent events on one instance (two effects reporting at once)

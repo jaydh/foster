@@ -1216,7 +1216,18 @@ fn attach_sse(document: Document, subs: &[Sub]) {
                 store_context(&sub.cache_key, ctx.clone());
                 Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx }
             };
-            if let Some(prev) = apply_snapshot_if_newer(&document, &sub.root, &snap) {
+            // A full snapshot is what the server has when the stream (re)connects:
+            // take it even if its version is lower than what's shown, which happens
+            // when the server dropped an idle session (or restarted) and the
+            // instance started over.
+            let applied = if name == "snapshot" {
+                let prev = apply_snapshot(&document, &sub.root, &snap);
+                update_debug(&document, &sub.root, &snap);
+                Some(prev)
+            } else {
+                apply_snapshot_if_newer(&document, &sub.root, &snap)
+            };
+            if let Some(prev) = applied {
                 let (root, doc, mid, sid) = (sub.root.clone(), document.clone(), sub.machine_id.clone(), sub.session_id.clone());
                 let new_state = snap.state.clone();
                 spawn_local(async move {
