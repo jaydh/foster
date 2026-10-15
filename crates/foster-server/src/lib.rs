@@ -2095,7 +2095,7 @@ mod tests {
             .oneshot(Request::builder().method("POST").uri("/transition").header("user-agent", "btn/2").body(Body::from(body)).unwrap())
             .await.unwrap();
         let snap: Snapshot = rmp_serde::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        assert_eq!(snap.context, json!({"keep": 1, "ua": "btn/2"}));
+        assert_eq!(*snap.context, json!({"keep": 1, "ua": "btn/2"}));
     }
 
     // ── effects ────────────────────────────────────────────────────────────────
@@ -2450,7 +2450,7 @@ mod tests {
         let snap = Snapshot {
             machine_id: "counter".to_string(),
             state: "error".to_string(),
-            context: json!({ "count": 99 }),
+            context: json!({ "count": 99 }).into(),
             version: 0,
             last_event: None,
         };
@@ -2546,7 +2546,7 @@ mod tests {
         let snap_a = Snapshot {
             machine_id: "counter".into(),
             state: "idle".into(),
-            context: json!({ "count": 42 }),
+            context: json!({ "count": 42 }).into(),
             version: 1,
             last_event: Some("increment".into()),
         };
@@ -2561,8 +2561,8 @@ mod tests {
     async fn ha_shared_store_history_visible_across_replicas() {
         let store = InMemoryStore::default();
         let store_b = store.clone();
-        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "a".into(), context: json!({}), version: 1, last_event: None }).await.unwrap();
-        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "b".into(), context: json!({}), version: 2, last_event: None }).await.unwrap();
+        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "a".into(), context: json!({}).into(), version: 1, last_event: None }).await.unwrap();
+        store.store("s", "m", &Snapshot { machine_id: "m".into(), state: "b".into(), context: json!({}).into(), version: 2, last_event: None }).await.unwrap();
         let history = store_b.history("s", "m").await;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].state, "a");

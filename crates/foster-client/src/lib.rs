@@ -35,7 +35,7 @@ fn has_context(cache_key: &str) -> bool {
 }
 
 fn load_context(cache_key: &str) -> Value {
-    cached(cache_key).map_or_else(|| Value::Object(Default::default()), |s| s.context)
+    cached(cache_key).map_or_else(|| Value::Object(Default::default()), |s| std::sync::Arc::unwrap_or_clone(s.context))
 }
 
 /// What [`apply_delta`] made of a patch.
@@ -56,11 +56,11 @@ fn apply_delta(cache_key: &str, pe: ContextPatch) -> Delta {
     if pe.base != have.version {
         return Delta::Gap;
     }
-    let mut ctx = have.context;
+    let mut ctx = std::sync::Arc::unwrap_or_clone(have.context);
     if json_patch::patch(&mut ctx, &pe.patch.0).is_err() {
         return Delta::Gap;
     }
-    let snap = Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx };
+    let snap = Snapshot { machine_id: pe.machine_id, state: pe.state, version: pe.version, last_event: pe.last_event, context: ctx.into() };
     store_snapshot(cache_key, &snap);
     Delta::Applied(snap)
 }
@@ -140,7 +140,7 @@ fn init_local(root: &Element, raw_attr: &str, def: LocalMachineDef, cache_key: &
     let snap = Snapshot {
         machine_id: def.id.clone(),
         state: state.clone(),
-        context: context.clone(),
+        context: context.clone().into(),
         version: 0,
         last_event: None,
     };
@@ -186,7 +186,7 @@ fn local_send(cache_key: &str, event: &str, payload: Value) -> Result<Option<Sna
         Ok(Some(Snapshot {
             machine_id: inst.def.id.clone(),
             state: inst.state.clone(),
-            context: inst.context.clone(),
+            context: inst.context.clone().into(),
             version: inst.version,
             last_event: Some(event.to_string()),
         }))
@@ -1097,7 +1097,7 @@ fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &st
                 state:      opt.clone(),
                 version:    0,          // real response will overwrite
                 last_event: None,
-                context:    load_context(&ck),
+                context:    load_context(&ck).into(),
             };
             apply_snapshot(&doc_clone, &root_clone, &fake);
         }

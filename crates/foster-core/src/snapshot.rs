@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// The full serializable state of a machine instance at a point in time.
 /// This is the unit of time-travel, test injection, and state sync.
@@ -8,8 +9,11 @@ pub struct Snapshot {
     pub machine_id: String,
     /// Name of the active state node (e.g. "idle", "error").
     pub state: String,
-    /// Arbitrary context data associated with this machine instance.
-    pub context: Value,
+    /// Arbitrary context data associated with this machine instance. Shared:
+    /// storing, broadcasting and handing a snapshot to an effect copy a
+    /// pointer, not a context that can be megabytes (serialized as the value
+    /// itself).
+    pub context: Arc<Value>,
     /// Monotonically increasing version counter — used by the client
     /// to detect stale snapshots and by tests to await specific transitions.
     pub version: u64,

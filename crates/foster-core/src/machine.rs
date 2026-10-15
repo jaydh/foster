@@ -721,7 +721,7 @@ impl MachineBuilder {
 pub struct MachineInstance {
     machine: Arc<Machine>,
     pub current_state: String,
-    pub context: Value,
+    pub context: Arc<Value>,
     pub version: u64,
     last_event: Option<String>,
 }
@@ -729,7 +729,7 @@ pub struct MachineInstance {
 impl MachineInstance {
     pub fn new(machine: Arc<Machine>) -> Self {
         let current_state = machine.initial_state.clone();
-        let context = machine.initial_context.clone();
+        let context = Arc::new(machine.initial_context.clone());
         Self { machine, current_state, context, version: 0, last_event: None }
     }
 
@@ -746,9 +746,11 @@ impl MachineInstance {
             event: event.to_string(),
         })?;
 
+        // The reducer gets its own copy (the one deep clone per transition):
+        // the current context stays intact if it fails.
         let next_context = match &def.reduce {
-            Some(f) => f(self.context.clone(), payload)?,
-            None => self.context.clone(),
+            Some(f) => Arc::new(f((*self.context).clone(), payload)?),
+            None => Arc::clone(&self.context),
         };
 
         validate_context(&self.machine, &def.target, &next_context)?;
@@ -973,7 +975,7 @@ mod tests {
         let injected = Snapshot {
             machine_id: "counter".into(),
             state: "error".into(),
-            context: json!({ "count": 99 }),
+            context: json!({ "count": 99 }).into(),
             version: 42,
             last_event: None,
         };
@@ -990,7 +992,7 @@ mod tests {
         let bad = Snapshot {
             machine_id: "counter".into(),
             state: "nonexistent".into(),
-            context: json!({}),
+            context: json!({}).into(),
             version: 0,
             last_event: None,
         };
@@ -1026,7 +1028,7 @@ mod tests {
         let bad_snap = Snapshot {
             machine_id: "m".into(),
             state: "ready".into(),
-            context: json!({ "count": -1 }),
+            context: json!({ "count": -1 }).into(),
             version: 0,
             last_event: None,
         };
@@ -1050,7 +1052,7 @@ mod tests {
         let good_snap = Snapshot {
             machine_id: "m".into(),
             state: "ready".into(),
-            context: json!({ "count": 5 }),
+            context: json!({ "count": 5 }).into(),
             version: 10,
             last_event: None,
         };
@@ -1261,7 +1263,7 @@ mod tests {
         let snap = Snapshot {
             machine_id: "counter".into(),
             state: "idle".into(),
-            context: json!({ "count": 5 }),
+            context: json!({ "count": 5 }).into(),
             version: 10,
             last_event: None,
         };
@@ -1301,7 +1303,7 @@ mod tests {
     fn merge_transition_works_on_server_machines() {
         let mut m = MachineInstance::new(lightbox().build());
         let snap = m.send("open", json!({"idx": 3})).unwrap();
-        assert_eq!((snap.state.as_str(), snap.context), ("open", json!({"idx": 3})));
+        assert_eq!((snap.state.as_str(), &*snap.context), ("open", &json!({"idx": 3})));
     }
 
     #[test]
@@ -1380,7 +1382,7 @@ mod tests {
             .step("viewing", "next", "viewing", "photos", "index", 1)
             .local().build().local_def().unwrap();
         let (_, lctx) = local.send("viewing", json!({"photos": [{"url": "a"}, {"url": "b"}], "index": 1}), "next", json!(null)).unwrap();
-        assert_eq!(s.context, lctx);
+        assert_eq!(*s.context, lctx);
         assert_eq!(lctx["url"], "a");
     }
 

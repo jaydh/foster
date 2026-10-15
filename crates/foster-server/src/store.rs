@@ -580,7 +580,7 @@ mod tests {
         Snapshot {
             machine_id: "counter".into(),
             state: "idle".into(),
-            context: json!({ "count": version }),
+            context: json!({ "count": version }).into(),
             version,
             last_event: None,
         }
