@@ -1,501 +1,166 @@
-# Foster — LLM iteration guide
+# Foster — guide for working on it
 
-Everything you need to iterate on this framework. For architecture diagrams,
-design rationale, and deployment see [`README.md`](README.md).
+Server-owned state machines with a generic WASM client. A page is HTML with
+`fx-*` attributes; the client wires them to machines on the server (or, for
+`.local()` machines, in the browser) and keeps the DOM in sync over SSE.
+What a page *looks at* — a list's filter, sort, selection, focus — stays in
+the browser (`fx-view`). Users: files (`~/repos/files`) and jaydanhoward.com
+(`~/repos/jaydanhoward`), each pinning a Foster rev in its Cargo.toml.
 
-## Workspace layout
+## Layout
 
 ```
-foster/
-├── crates/
-│   ├── foster-macros/     # Proc macro: html! DSL for inline templates
-│   ├── foster-core/       # State machine primitives, serialization, schema validation
-│   ├── foster-server/     # Axum HTTP router (4 routes) + SSE broadcast
-│   ├── foster-client/     # WASM runtime — processes fx-* attributes
-│   └── foster-testgen/    # Playwright test generation from machine definition
-├── examples/
-│   ├── counter/           # Simple idle ↔ error counter (port 3000)
-│   ├── player/            # 6-state media player (port 3001)
-│   ├── kanban/            # Multi-column task board with fx-for (port 3002)
-│   ├── aura/              # CSS animation showcase with fx-class (port 3003)
-│   ├── checkout/          # 7-state checkout flow, showcases graph + history (port 3004)
-│   ├── plane/             # Linear-style issue tracker — 5 states, 15 transitions (port 3005)
-│   ├── notion/            # Notion-style block editor — 2 states, 10 transitions (port 3006)
-│   ├── form/              # Multi-step conference registration form — 5 states, 11 transitions (port 3007)
-│   └── collab/            # Real-time collab voting poll via Redis pub/sub — 2 states, 3 transitions (port 3008)
-└── scripts/
-    ├── build-wasm.sh      # Build foster-client (release); pass --dev for dev overlay
-    ├── demo.sh            # Build WASM (dev) + start all demo servers (Ctrl-C stops all)
-    └── gen-tests.sh       # Regenerate Playwright specs for all examples (counter player kanban aura checkout plane notion form collab)
+crates/
+  foster-core/     state machines (MachineBuilder, MachineInstance, Snapshot), fx-on grammar, page()
+  foster-server/   axum router: /state, /transition, /events (SSE), effects, feeds, identity, sessions
+  foster-client/   WASM runtime for fx-* attributes (wasm-only; not in the workspace)
+    src/view.rs    list views (fx-view)
+    src/url.rs     fx-url, per-tab sessions
+examples/counter/  smallest app + browser smoke test
+scripts/           build-wasm.sh, check.sh
 ```
 
-`Cargo.toml` includes native crates only. `crates/foster-client` targets
-`wasm32-unknown-unknown` and must be built separately with `wasm-pack`.
-`./scripts/demo.sh` handles this automatically — it builds dev WASM then starts servers.
-
-## Iteration loop
-
-The primary feedback signal is a **failing Playwright assertion** — state names
-and event names in the test exactly match the machine definition.
-
-### Tight loop (type-check + unit tests, no browser)
+## Loop
 
 ```bash
-./scripts/check.sh          # cargo check + cargo test + gen_tests (all examples)
-./scripts/check.sh kanban   # same, one example only
+./scripts/check.sh                       # cargo test + clippy (native crates)
+./scripts/build-wasm.sh                  # foster-client → pkg/
+cargo run -p counter                     # http://localhost:3000
+(cd examples/counter && npx playwright test)
 ```
 
-### Full loop (browser)
+Real coverage lives in the apps: files' `e2e/` (Playwright, ~20 tests) runs
+against a local Foster with
+`cargo build --config 'patch."https://github.com/jaydh/foster".foster-server.path="…/crates/foster-server"'`
+(and the same for foster-core) and `FILES_PKG=~/repos/foster/pkg`.
 
-```bash
-./scripts/demo.sh kanban    # builds dev WASM + starts server (separate terminal)
-cd examples/kanban && npx playwright test --reporter=line
-```
-
-### Adding a feature — minimal change
-
-1. Add a transition in `src/main.rs`:
-   `.on("from", "event", "to", reducer_fn)` or `.pass(...)` for no-op
-2. Add the reducer (if not a passthrough)
-3. Add the `html!` element: `button[on="click->event_name"] { "label" }`
-4. Run `./scripts/check.sh` — tests for the new edge appear automatically
-
-No test file to edit. No type file to update. The machine definition is the
-single source of truth; tests and template validation are derived.
-
-### What good iteration looks like
-
-```
-Write machine definition
-  → ./scripts/check.sh  (type-safe, unit tests green, specs regenerated)
-  → npx playwright test
-  → One test fails: "kanban | viewing →[move_task]→ viewing"
-  → The failure names the exact state/event/transition that's wrong
-  → Fix the reducer, re-run, green
-```
-
-## State machine API (foster-core)
+## Machines (foster-core)
 
 ```rust
 MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
     .state("error")
-    .schema("idle", json!({          // optional — validated on every entry
-        "type": "object",
-        "required": ["count"],
-        "properties": { "count": { "type": "integer", "minimum": 0 } }
-    }))
-    .on("idle", "increment", "idle", |ctx, _| {
-        Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-    })
-    .pass("idle",  "break_it", "error")   // context unchanged
-    .pass("error", "recover",  "idle")
-    .template(page("Counter", include_str!("../static/style.css"), html! {
-        div[machine="counter"] {
-            div[show="idle"] {
-                span[text="count"] {}
-                button[on="click->increment"] { "+" }
-            }
-            div[show="error"] {
-                button[on="click->recover"] { "recover" }
-            }
-        }
-    }))
-    .build()  // → Arc<Machine>
-```
-
-### Transition methods
-
-| Method | When to use |
-|--------|-------------|
-| `.on(from, event, to, reducer)` | Reducer transforms `Value` context directly |
-| `.pass(from, event, to)` | Context passes through unchanged |
-| `.typed_on(from, event, to, reducer)` | Reducer works with a typed struct — no `json!` unwrapping |
-| `.merge(from, event, to)` | Shallow-merge the event payload's top-level keys into context |
-| `.step(from, event, to, list, index, by)` | List navigation: move `ctx[index]` by `by` through `ctx[list]` (wrapping) and merge the selected item into context — prev/next for lightboxes, carousels, wizards |
-
-### Shared machines, feeds, request events
-
-`.shared()` — one server-side instance for every visitor (the session is
-ignored), for genuinely global data. Server code drives it with a feed, and
-per-visitor request data comes in through request events, both via the
-`foster_server::Foster` builder:
-
-```rust
-let app = foster_server::Foster::new(machines)
-    // each item → event "tick" (payload = item) on the shared "cluster" machine
-    .feed("cluster", "tick", interval_stream.then(|_| fetch_view()))
-    // every GET /state (and client "trace" event) gets handler output merged into the payload
-    .request_event("request_trace", "trace", |req: RequestInfo| async move { view(&req.headers) })
-    .router();
-```
-
-- Feed items go through the machine's reducer/schema like any transition.
-- Shared machines use wall-clock (unix-ms) versions so snapshots from different
-  replicas stay comparable — with in-memory stores, a page can read `/state` from one
-  replica and stream `/events` from another. (Per-session machines don't get this;
-  multi-replica deployments of those need session affinity or the Redis backend.)
-- A feed's stream is only polled while someone has the machine's `/events`
-  open — a polling stream does no work with no viewers. Panics at build if the
-  machine isn't `.shared()` or never handles the event.
-- `RequestInfo { headers, remote_addr }` (`remote_addr` needs
-  `into_make_service_with_connect_info::<SocketAddr>()`).
-
-### Effects — async server work after a transition
-
-Reducers are pure and synchronous. For I/O (a query, a filesystem call, a long
-job with progress), register an effect: it's spawned after the transition is
-committed and broadcast, and reports back by sending events into the **same
-session** — which go through reducers and reach the session's pages over SSE.
-
-```rust
-Foster::new(machines)
-    // "open" moves "dir" to "loading"; the effect fills it in.
-    .effect("dir", "open", |fx: Effect| async move {
-        match list_dir(fx.payload["path"].as_str().unwrap_or("/")).await {
-            Ok(entries) => { let _ = fx.send("loaded", json!({ "entries": entries })).await; }
-            Err(e) => { let _ = fx.send("failed", json!({ "error": e.to_string() })).await; }
-        }
-    })
-    .router();
-```
-
-- `Effect { session, machine, event, payload, snapshot }` + `fx.send(event, payload)`
-  (same machine) / `fx.send_to(machine, event, payload)` (another machine in the
-  session, or a `.shared()` one).
-- Fires for every successful `(machine, event)`: client transitions, feed items,
-  and events sent by other effects (chains are allowed — avoid cycles).
-- One handler per `(machine, event)`. Panics at build for unknown machines or events.
-- `fx.session` is the client's random session ID — a key for per-session server
-  resources (a job a later event cancels), not an identity. `fx.identity` is the
-  user, when `Foster::identity` is set.
-
-### Identity — authenticated users
-
-```rust
-Foster::new(machines)
-    .identity(|req: &RequestInfo| {
-        let user = req.headers.get("tailscale-user-login")?.to_str().ok()?;
-        ALLOWED.contains(&user).then(|| user.to_string())
-    })
-```
-
-- Every Foster route (page, `/state`, `/transition`, `/events`, debug) returns
-  `401` when the function returns `None`.
-- Per-session state is keyed by `(user, session)` (length-prefixed key, so no two
-  pairs collide): a session ID only addresses its own user's machines.
-  `.shared()` machines stay global.
-- Effects get `fx.identity`; request-event handlers get `RequestInfo::identity`.
-- Trust a header only if the app is reachable solely through the proxy that sets it.
-
-### Local (client-only) machines
-
-`.local()` runs a machine in the browser instead of on the server — for
-per-visitor UI state (theme, an open dropdown, a lightbox) where a shared
-server instance is wrong and a round trip is wasted. `.persist()` = `.local()`
-plus state/context saved to `localStorage["foster_local:<fx-machine attr>"]`.
-
-```rust
-MachineBuilder::new("theme", "light", json!({}))
-    .pass("light", "toggle", "dark")
-    .pass("dark", "toggle", "light")
-    .persist()
+    .on("idle", "increment", "idle", |ctx, _payload| Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 })))
+    .pass("idle", "break_it", "error")       // context unchanged
+    .template(page("Counter", css, body))     // the page, served at GET /
     .build()
 ```
 
-- Only `.pass()` / `.merge()` / `.step()` edges and no `.schema()` — the generic client
-  can't run Rust reducers; `build()` panics otherwise.
-- `foster_server::router` embeds the definitions in the served template as
-  `<script type="application/json" id="fx-local-machines">` and serves no
-  `/state` / `/transition` / `/events` for them (404).
-- Initial state: persisted value → `data-fx-state` already on the root (lets an
-  inline `<head>` script choose first-paint state, e.g. from
-  `prefers-color-scheme`) → the machine's initial state.
-- An event with no edge from the current state is silently ignored (server
-  machines log an error) — "close" on a closed menu is routine.
-- Same markup as server machines; `fx-machine` can go on `<html>` itself.
+| Method | |
+|---|---|
+| `.on(from, event, to, reducer)` | `fn(Value ctx, Value payload) -> Result<Value, MachineError>`; pure, synchronous |
+| `.pass(from, event, to)` | no change to context |
+| `.merge(from, event, to)` | shallow-merge the payload into context |
+| `.step(from, event, to, list, index, by)` | move `ctx[index]` through `ctx[list]`, merge the item (prev/next) |
+| `.local()` / `.persist()` | runs in the browser (only pass/merge/step); `.persist()` saves to localStorage |
+| `.shared()` | one instance for every visitor (feeds drive it) |
 
-`.typed_on` avoids `json!` reconstruction for complex context:
+`Snapshot { machine_id, state, context: Arc<Value>, version, last_event }` —
+the context is shared, so storing/broadcasting a snapshot copies a pointer;
+the reducer gets the one deep copy (a failing reducer leaves the instance
+intact). Build one with `json!(…).into()`; read with `snap.context["x"]`.
 
-```rust
-#[derive(Serialize, Deserialize, Clone, Default)]
-struct KanbanCtx { tasks: Vec<Task>, draft_title: String, editing_id: String }
-
-fn begin_edit(mut ctx: KanbanCtx, payload: Value) -> Result<KanbanCtx, MachineError> {
-    ctx.editing_id  = payload["id"].as_str().unwrap_or("").to_string();
-    ctx.draft_title = ctx.tasks.iter().find(|t| t.id == ctx.editing_id)
-                          .map(|t| t.title.clone()).unwrap_or_default();
-    Ok(ctx)
-}
-
-builder.typed_on("viewing", "start_edit", "editing", begin_edit)
-```
-
-### Key types
-
-- `Machine` — static, `Arc`-shared; reducers are `Arc<dyn Fn>` so closures, fn pointers, and typed wrappers all work
-- `MachineInstance` — mutable runtime state: current state + context `Value` + monotonic version
-- `Snapshot` — unit of everything: wire format, test injection, state diffing
-
-**Invariant: state transitions are the only way state changes.** The server owns server and `.shared()` instances (feeds deliver data as events, through the same reducers); `.local()` instances run in the client, which is otherwise a render layer.
-
-### Inline templates — `html!` + `page()`
-
-`foster_core::html!` is a compile-time DSL that generates HTML strings with shorthand `fx-*` attributes:
+## Server (foster-server)
 
 ```rust
-use foster_core::{html, page};
-
-// Shorthand → HTML attribute
-// machine="id"   → fx-machine="id"
-// show="states"  → fx-show="states"
-// text="key"     → fx-text="key"
-// on="evt->act"  → fx-on="evt->act"
-// each="key"     → fx-for="key"
-// filter=r#"..."# → fx-where="..."
-// collect="key"  → fx-collect="key"
-// disable="s"    → fx-disable="s"
-// value="key"    → fx-value="key"
-// payload=r#"..."# → fx-payload="..."
-// field="key"    → fx-field="key"
-// state_label    → fx-state-label (boolean)
-// foo_bar="v"    → foo-bar="v"  (underscore → hyphen for everything else)
-
-.template(page("My App", include_str!("../static/style.css"), html! {
-    div[machine="counter"] {
-        span[state_label] {}
-        div[show="idle"] {
-            span[text="count"] { "0" }
-            button[on="click->increment"] { "+" }
-        }
-        div[show="error"] {
-            button[on="click->recover"] { "recover" }
-        }
-    }
-}))
+Foster::new(machines)
+    .identity(|req| /* user from a trusted proxy header, or None → 401 */)
+    .effect("dir", "open", |fx: Effect| async move { /* I/O, then fx.send("loaded", …) */ })
+    .feed("cluster", "tick", stream)                 // .shared() machines; polled only while watched
+    .request_event("trace", "trace", |req| async { … })
+    .session_ttl(Some(Duration::from_secs(6 * 3600)))   // default; None keeps sessions forever
+    .router()
 ```
 
-`page(title, style, body)` wraps the body in a complete HTML shell: DOCTYPE, `<head>`, the `[fx-show]{display:none}` rule, the CSS, and the WASM `<script>` tag. Raw string literals (`r#"..."#`) are useful for JSON in `filter=` and `payload=` attributes.
+- **Effects** run after a committed transition and report back with
+  `fx.send(event, payload)` / `fx.send_to(machine, …)`; one per (machine,
+  event). They see `fx.snapshot` (after the transition), `fx.payload`,
+  `fx.identity`.
+- **Concurrency**: a write that raced another to the same instance is
+  retried (reducers are pure) — two effects reporting at once both land.
+- **Memory**: one snapshot per instance; no history unless debug mode.
+  Instances idle for `session_ttl` with no page subscribed are dropped.
+- **Debug mode** (debug builds, or `FOSTER_TEST_MODE=1`): `POST /test/state`
+  (inject a snapshot) and `GET /debug/history` (last 50 snapshots). Off in
+  release.
 
-### Template validation
+| Route | |
+|---|---|
+| `GET /state?machine=&session=` | current snapshot (msgpack) |
+| `POST /transition` | `{machine, event, payload, session, reply}` → snapshot, or with `reply: "patch"` (what the client sends) a JSON Patch `{base, version, patch}` |
+| `GET /events?subs=m@s,…` | SSE: a full `snapshot` per sub on connect, then `patch`es (each with `base`) |
 
-`.template(html)` causes `foster_server::router()` to:
-1. Serve it at `GET /` automatically
-2. Panic at startup if any `fx-show` or `fx-on` value references an unknown state or event
+## Client (foster-client)
 
-```rust
-// Panics: "event 'incremnt' not defined in machine 'counter'"
-.template(r#"<button fx-on="click->incremnt">+</button>"#)
-```
+**Sync.** Each instance's last snapshot is cached with its version. Patches
+from either channel (a click's response, SSE) apply only onto their `base`;
+already-seen ones are skipped; a gap refetches `/state`. A reconnect's full
+snapshot is always taken (the server may have dropped the session or
+restarted). The client reopens `/events` itself if the browser gives up
+(back-off 1 s → 30 s).
 
-### Schema validation
+**Sessions.** One per tab: a per-browser base (localStorage) plus the tab's
+Web Locks slot (`<base>-t0`, `-t1`…; a closed tab's slot is reused).
+`?session=` overrides; `<meta name="foster-session" content="browser">`
+shares one across tabs.
 
-`.schema(state, json_schema)` — validated on every state entry (both `send()` and `restore()`).
-Supported keywords: `type`, `required`, `properties`, `minimum`, `maximum`, `minLength`, `maxLength`, `enum`.
-Returns `MachineError::SchemaViolation` before any state is committed.
-Inlined — no external dependencies, compiles to WASM.
+**Rendering.** Lists first (so `$view` values are current), then show/if/
+text/value/class/bind-attr. `fx-for` updates only changed rows (by
+`fx-key`); rows bind to their item only.
 
-## HTTP API (foster-server)
+### Attributes
 
-| Method | Path | Format | Purpose |
-|--------|------|--------|---------|
-| GET | `/state?machine=<id>&session=<sid>` | MessagePack | Current snapshot |
-| POST | `/transition` | MessagePack in/out | Fire event, get new snapshot — or, with `"reply": "patch"` (what the WASM client sends), a JSON Patch from the version it started from (`base` → `version`) |
-| GET | `/events?machine=<id>&session=<sid>` | SSE (JSON) | Push stream for one machine |
-| GET | `/events?subs=<id>@<sid>,<id>@<sid>` | SSE (JSON) | Multiplexed push stream (what the client uses); each event's JSON has `"sub"` |
-| POST | `/test/state?session=<sid>` | JSON in/out | Inject snapshot (debug only) |
-| GET | `/debug/history?machine=<id>&session=<sid>` | JSON | History ring buffer — up to 50 snapshots, oldest first (debug only) |
-| POST | `/debug/rewind?machine=<id>&session=<sid>&version=N` | JSON | Restore a historical snapshot and broadcast via SSE (debug only) |
-| GET | `/debug/graph?machine=<id>&session=<sid>` | HTML | Self-contained state graph visualiser — SVG nodes/edges + live SSE state highlight (debug only) |
-| GET | `/debug/timeline?machine=<id>&session=<sid>` | HTML | History replay timeline — scrub through snapshots, auto-play, live tail (debug only) |
-| GET | `/debug/benchmark?machine=<id>` | JSON | Walk machine graph in-memory; report full-snapshot vs JSON Patch sizes per transition (debug only) |
+| Attribute | Example | |
+|---|---|---|
+| `fx-machine` | `fx-machine="counter"` | root; `"counter#2"` for a second instance. Gets `data-fx-state/version/session` |
+| `fx-show` | `fx-show="idle,loading"` | shown only in these states (`display:block`) |
+| `fx-if` | `fx-if="error"` / `fx-if='{"field":"n","op":"gt","value":0}'` | shown when truthy / the comparison holds (`eq neq gt lt gte lte`) |
+| `fx-text` | `fx-text="count"` | text from context |
+| `fx-value` | `fx-value="draft"` | fill an input (only when the value or state changed) |
+| `fx-class` | `fx-class="open:is-open"` | class in a state |
+| `fx-bind-attr` | `fx-bind-attr="href=ctx:url hidden=item:no_link style.left=ctx:x disabled=state:busy"` | attributes from context / row item / state |
+| `fx-for` / `fx-key` / `fx-field` | `fx-for="tasks" fx-key="id"` … `fx-field="title"` | a row per item, keyed; text from the item |
+| `fx-on` | `fx-on="click->save keydown.Enter->save click.shift->range"` | DOM event → machine event; also `visible->`, `enter->`, `click@outside->`, `keydown.Escape@document->`, `->other:event` |
+| `fx-collect` | `fx-collect="title"` | input value into payloads (every event of the machine; the firing field wins) |
+| `fx-payload` | `fx-payload='{"col":"done"}'` | static JSON merged into the payload (wins over everything) |
+| `fx-copy` | `fx-copy="item:url"` | copy to the clipboard on click |
+| `fx-widget` | `fx-widget="/widgets/x.js"` | lazy ES module: `mount(el)`, `update(el, state, ctxJson)` |
+| `fx-url` | `fx-url="path->open"` | one root: context field ↔ URL hash; Back/Forward and links fire the event; on (re)connect the URL wins |
+| `fx-view*` | see below | a list's filter/sort/selection/focus in the browser |
 
-`session` defaults to `"default"` if omitted.
+Payload order: collected inputs, then the row's item (`data-fx-item`), then
+a list view's `selected`/`focused` or a step's neighbour, then `fx-payload`.
+To send something computed in page JS, set `fx-payload` on a (hidden)
+button and click it.
 
-```bash
-curl -X POST 'http://localhost:3000/test/state?session=my-test' \
-     -H 'Content-Type: application/json' \
-     -d '{"machine_id":"counter","state":"error","context":{"count":99},"version":0}'
-```
+### List views (`fx-view`)
 
-`POST /test/state` returns 403 in release builds unless `FOSTER_TEST_MODE=1` is set.
+| Attribute | Where | |
+|---|---|---|
+| `fx-view="files"` | `fx-for` container (with `fx-key`) | rows filtered/sorted; `selected`/`focused` classes. Lists sharing a name share the view |
+| `fx-view-filter-fields` / `fx-view-group` / `fx-view-reset` | container | fields the filter searches (default `name`) / truthy-first field / context fields whose change resets filter, selection, focus |
+| `fx-view-filter="files"` | input | every word must be in one of the fields |
+| `fx-view-sort="files:field"` | button | numbers numerically, text case-insensitively; again flips |
+| `fx-view-select` / `-select-all` / `-clear` | row / anywhere | shift-click selects a range |
+| `fx-view-keys="files"` | focusable element | ↑/↓ move focus |
+| `fx-view-payload="files"` | ancestor of `fx-on` elements | events carry `selected` (keys) and `focused` (item) |
+| `fx-view-step="files:1"` + `fx-view-from` (+ `fx-view-where`) | button | disabled without a neighbour; its event carries the neighbour's item. `fx-view-pos` shows "3 of 12" |
+| `fx-view-inputs="files" data-name="path"` | in a `<form>` | hidden inputs for the selection |
+| `$files.shown/total/selected/all_selected/filtered/filter/sort_<field>` | binding keys | the view's values |
 
-## Session isolation
+State is per tab (sessionStorage). Full reference: `crates/foster-client/src/view.rs`.
 
-Every machine instance is keyed by `(session_id, machine_id)`, created lazily on first access.
-`.shared()` machines ignore the session (one instance for everyone); `.local()` machines
-have no server instance and no `data-fx-session`.
-The WASM client generates a 128-bit random UUID if none is in the URL and stamps it as
-`data-fx-session` on server-machine `[fx-machine]` roots:
+## Template validation
 
-```typescript
-const sid = await root.getAttribute('data-fx-session');
-await request.post(`/test/state?session=${sid}`, { data: { ... } });
-```
+`.template(html)` checks each machine's own `[fx-machine]` subtree at
+startup: an `fx-show` state or `fx-on` event the machine doesn't have
+panics.
 
-## HTML template DSL (fx-* attributes)
+## Security invariants — don't break
 
-All attributes processed client-side by the WASM runtime.
-
-| Attribute | Example | Meaning |
-|-----------|---------|---------|
-| `fx-machine` | `fx-machine="counter"` | Root; stamped with `data-fx-state`, `data-fx-version`, `data-fx-session` |
-| `fx-show` | `fx-show="idle,loading"` | Visible only in listed states |
-| `fx-text` | `fx-text="count"` | Set text from `context[key]` |
-| `fx-disable` | `fx-disable="loading"` | Add `disabled` in listed states |
-| `fx-on` | `fx-on="click->increment"` | Fire machine event on DOM event (`click`, `input`, `change`, `keydown`); several space-separated bindings allowed |
-| `fx-on="keydown.Key->…"` | `fx-on="keydown.Enter->save keydown.Escape->cancel"` | Keyboard binding limited to one `KeyboardEvent.key` (`Space` for `" "`). The nearest ancestor with a binding *for this event* handles it, so an input's key bindings don't swallow its row's clicks |
-| `fx-on="click.shift->…"` | `fx-on="click.shift->select_range click->toggle"` | Click with a held modifier (`shift`, `ctrl`, `meta`, `alt`); bindings are tried in order, so put the specific one first |
-| `fx-copy` | `fx-copy="item:url"` / `fx-copy="ctx:share_url"` | On click, copy that `fx-for` item field / context value to the clipboard (pair with `fx-on="click->copied"` for feedback) |
-| `fx-state-label` | `fx-state-label` | Display current state name |
-| `fx-for` | `fx-for="tasks"` | Clone first child per item in `context[key]`; on updates only changed rows are touched |
-| `fx-key` | `fx-key="id"` | On an `fx-for` container: the item field that identifies a row (else its position), so reordering/filtering moves rows instead of rebinding them. Rows bind to their item only (`fx-field`, `item:`); state/context bindings inside rows aren't applied |
-| `fx-where` | `fx-where='{"column":"todo"}'` | Filter `fx-for` items by key/value |
-| `fx-field` | `fx-field="title"` | Set text from item field inside `fx-for` |
-| `fx-collect` | `fx-collect="draft_title"` | Read input value into transition payload; when several inputs collect one key, the one that fired the event wins (a per-row input in an `fx-for`), then a visible one over hidden ones |
-| `fx-value` | `fx-value="draft_title"` | Pre-populate input from context |
-| `fx-payload` | `fx-payload='{"col":"done"}'` | Static JSON merged into transition payload |
-| `fx-class` | `fx-class="calm:is-active"` | Add CSS class when in named state |
-| `fx-bind-attr` | `fx-bind-attr="href=ctx:url"` | Bind HTML attribute from context or state |
-| `fx-if` | `fx-if="error_msg"` | Show when `context[key]` is truthy; supports comparison object |
-| `fx-animate` | `fx-animate="error:shake:400"` | Add CSS class for N ms when entering a state |
-| `fx-enter` | `fx-enter="open:load_data"` | Fire machine event when entering listed states; `*` fires on any transition |
-| `fx-optimistic` | `fx-optimistic="done"` | Instantly render expected state before server confirms (on `fx-on` buttons) |
-| `fx-url` | `fx-url="path->open"` | On a machine root (one per page): `context[path]` ↔ URL hash; see **URL** below |
-| `fx-widget` | `fx-widget="/widgets/life/life_widget.js"` | Lazy-load an ES module (e.g. a wasm-pack `--target web` crate) within 200px of the viewport: `await default()`, then `mount(el)`; inside an `[fx-machine]`, `update(el, state, ctxJson)` gets every snapshot |
-| `fx-on="visible->…"` | `fx-on="visible->load"` | Fire once, the first time the element is ≥10% on screen |
-| `fx-on="enter->…"` | `fx-on="enter->about"` | Fire every time the element crosses the reading line (30–40% down the viewport) — scroll-spy |
-| `fx-on="…->machine:event"` | `fx-on="click->theme:toggle"` | Send the event to another machine on the page (by its `fx-machine` value, e.g. `counter#1:inc`); template validation checks it against that machine |
-| `fx-on="click@outside->…"` | `fx-on="click@outside->close"` | Fire on a click anywhere outside the element (close a dropdown) |
-| `fx-on="…@document->…"` | `fx-on="keydown.Escape@document->close"` | Listen on the whole document (global shortcuts; closing a dialog whatever has focus). Keyboard events typed into an input/textarea/select/contenteditable are ignored |
-
-**List views (`fx-view`)** — filter, sort, selection and ↑/↓ focus for an `fx-for` list, kept in the browser (per tab, sessionStorage): no round trip, no server state. Full reference in `crates/foster-client/src/view.rs`.
-
-| Attribute | Where | Meaning |
-|-----------|-------|---------|
-| `fx-view="files"` | the `fx-for` container (needs `fx-key`) | rows shown filtered/sorted; rows get `selected` / `focused` classes. Lists sharing a name (a list and a grid) share the view |
-| `fx-view-filter-fields="name,title"` / `fx-view-group="is_dir"` / `fx-view-reset="path epoch"` | the container | fields the filter matches (default `name`) / rows with this field truthy sort first / context fields whose change resets filter, selection and focus |
-| `fx-view-filter="files"` | an input | filter text: every word in one of the filter fields |
-| `fx-view-sort="files:field"` | a button | sort by an item field (numbers numerically, text case-insensitively); again flips direction |
-| `fx-view-select="files"` / `fx-view-select-all` / `fx-view-clear` | in a row / anywhere | toggle the row (shift: range) / all shown rows / clear |
-| `fx-view-keys="files"` | a focusable element | ↑/↓ move the focused row |
-| `fx-view-payload="files"` | an ancestor of `fx-on` elements | their events carry `selected` (keys, view order) and `focused` (the row's item or null) |
-| `fx-view-step="files:1"` + `fx-view-from="ctx field"` (+ `fx-view-where="item field"`) | a button | disabled without a neighbour; its event carries the neighbouring row's item (prev/next in a viewer). `fx-view-pos` (no step) shows "3 of 12" |
-| `fx-view-inputs="files" data-name="path"` | in a `<form>` | hidden inputs for the selected keys |
-| `$files.shown` / `total` / `selected` / `all_selected` / `filtered` / `filter` / `sort_<field>` | any binding key | the view's own values (`sort_<field>`: ▲ / ▼ / "") |
-
-**`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
-- `attr=ctx:key` — set from `context[key]`; removes attr if key absent
-- Booleans follow HTML boolean attributes: `true` → present (`hidden=""`), `false`/`null` → removed (`fx-bind-attr="hidden=item:no_preview"`)
-- `attr=state:name` — set `attr=""` when in that state (use for `disabled`, `hidden`, `aria-current`)
-- `attr=item:field` — inside an `fx-for` item: set from that item's field (`<img fx-bind-attr="src=item:thumb_url alt=item:name">`)
-- Target `style.<prop>` sets an inline style property instead of an attribute: `fx-bind-attr="style.left=item:x style.top=item:y"`
-
-**`fx-if` format:**
-- `fx-if="field"` — show when `context[field]` is truthy (non-null, non-false, non-zero, non-empty)
-- Showing clears the inline `display` (the element keeps its CSS display — flex, grid…); hiding sets `display:none`. (`fx-show` sets `display:block`, since `[fx-show]{display:none}` hides it until then — wrap a flex/grid container in a plain div.)
-- `fx-if='{"field":"count","op":"gt","value":0}'` — comparison; ops: `eq neq gt lt gte lte`
-
-**`fx-animate` format:** space-separated `state:class:duration_ms` specs.
-- `fx-animate="confirmed:pop-in:600"` — adds `pop-in` class for 600 ms when entering `confirmed`
-- `fx-animate="*:flash:200"` — fires on every state transition
-- Multiple: `fx-animate="error:shake:400 confirmed:pop-in:600"`
-
-CSS convention: `[fx-show] { display: none; }` hides showable elements before WASM loads.
-
-**Sessions:** each tab has its own session — a per-browser base ID (`localStorage["foster_session"]`, per origin) plus the tab's slot, `<base>-t0` for the first open tab, `-t1` for a second open at the same time (Web Locks, held until the tab closes, so a closed tab's slot and server state are reused). Reloads keep it. `?session=` overrides it (Playwright, the timeline preview); `<meta name="foster-session" content="browser">` shares one session between a browser's tabs.
-
-**URL (`fx-url`):** `fx-url="path->open"` on one machine root keeps `context[path]` in the URL hash (`#/photos/2024`, each `/`-segment URI-encoded). A changed value pushes a history entry; Back/Forward and edits fire `open {path}`. On connecting — the first snapshot and every stream reconnect — the URL wins, so links and bookmarks open their value and a page whose session was dropped (or whose server restarted) returns to it.
-
-## Playwright integration
-
-```typescript
-const root = page.locator('[fx-machine="counter"]');
-const sid  = await root.getAttribute('data-fx-session');
-
-await expect(root).toHaveAttribute('data-fx-state', 'idle');
-
-// Inject state — SSE pushes it immediately, no reload needed
-await request.post(`/test/state?session=${sid}`, {
-  data: { machine_id: 'counter', state: 'error', context: { count: 99 }, version: 0 }
-});
-await expect(root).toHaveAttribute('data-fx-state', 'error');
-
-await page.locator('[fx-on="click->recover"]').first().click();
-await expect(root).toHaveAttribute('data-fx-state', 'idle');
-```
-
-### Test generation
-
-`foster-testgen` derives the full suite from the machine graph. Four suites, nothing written by hand:
-
-| Suite | Catches |
-|-------|---------|
-| **Transition coverage** (1 per edge) | Missing or broken reducers |
-| **Multi-step walk** (1 test, visits every state ≥2×) | SSE ordering bugs, stale `data-fx-state` |
-| **Rapid toggle pairs** (1 per bidirectional pair, 4× each) | `fx-class` / animation sync bugs |
-| **Snapshot injection** (1 per state) | Broken `POST /test/state` |
-
-```bash
-./scripts/gen-tests.sh                      # all examples
-cargo run -p aura --bin gen_tests           # one example
-```
-
-The generated `injectState` helper waits for WASM bootstrap before injecting,
-so the SSE listener is always wired before state is pushed.
-
-## Roadmap — what to build next
-
-When asked to add a feature, check here first so your design is consistent with planned work.
-
-### Pending items
-
-No pending items — all planned features are implemented. See "Already implemented" below.
-
-### Already implemented
-
-- `StateStore` / `PubSub` traits + `InMemoryStore` / `InMemoryPubSub` impls — `crates/foster-server/src/store.rs`
-- Time-travel debugger: `GET /debug/history` + `POST /debug/rewind`, 50-entry ring buffer in `InMemoryStore`, `history()` on `StateStore` trait — `crates/foster-server/src/`
-- State graph UI: `GET /debug/graph` — self-contained SVG visualiser with live SSE state highlighting — `crates/foster-server/src/lib.rs`
-- Dev overlay: Rust/WASM panel in `crates/foster-client/src/lib.rs` — compiled with `debug_assertions`; server injects only `window.__FOSTER_MACHINES` metadata (no JS logic); CSS injected server-side so no flash on load
-- `Snapshot.last_event: Option<String>` — set by `MachineInstance::send()`, `None` for `restore()` and initial state — `crates/foster-core/src/`
-- Differential rendering: SSE emits named `snapshot` (full, on connect) + `patch` (RFC 6902 JSON Patch) events — `crates/foster-server/src/lib.rs`; WASM client applies patches via `json-patch` crate — `crates/foster-client/src/lib.rs`
-- Checkout example: 7-state checkout flow (`cart → shipping → payment → review → processing → confirmed/failed`), port 3004 — `examples/checkout/`
-- `demo.sh` is self-sufficient: builds dev WASM then starts all servers; `<link rel="icon" href="data:,">` in HTML shell eliminates favicon 404s
-- Multiple machines per page: `fx-machine="counter#1"` / `fx-machine="counter#2"` — fragment appended to session with `.` separator; context cache and dev overlay panels are keyed per instance — `crates/foster-client/src/lib.rs`
-- Generated TypeScript SDK: `foster_testgen::generate_sdk` emits `tests/{name}.sdk.ts` alongside each Playwright spec. Exports `{Name}State`, `{Name}Event`, `{Name}Snapshot`, and `{Name}Client` (with `sendEvent`, `getState`, `setState`). `@msgpack/msgpack` added to all example `devDependencies` — `crates/foster-testgen/src/lib.rs`
-- Compiled machine validation: `machine_graph!` proc-macro in `crates/foster-macros/src/lib.rs`, re-exported from `foster-core`. Accepts `{id, initial, states, transitions}` block. Emits `compile_error!` for unknown states in transitions or unreachable states. Generates `{PascalId}State` + `{PascalId}Event` enums with `as_str()`. Used in `examples/counter/src/main.rs`.
-- Generic `AppState<S, P>` + `router_with()`: generic over `S: StateStore + Clone + 'static` and `P: PubSub + Clone + 'static` with default type params. HTTP integration tests in `crates/foster-server/src/lib.rs`. `RedisStore` + `RedisPubSub` behind `--features redis-backend` in `crates/foster-server/src/store.rs`.
-- History replay timeline: `GET /debug/timeline?machine=<id>&session=<sid>` — self-contained HTML page with horizontal scrollable snapshot rail, ◀ / ▶ step controls, auto-play with configurable speed, live SSE tail, and split bottom panel: **live UI preview iframe** (left, shows the actual app UI at the selected snapshot via isolated `{session}__tl` preview session + `POST /test/state` injection) and context JSON (right, 320 px). Overlay "history" link updated to point here. Gated by `test_mode` — `crates/foster-server/src/lib.rs`.
-- `plane` and `notion` added to `gen-tests.sh` and `check.sh` gen_tests loop so their Playwright specs are regenerated on every `./scripts/check.sh` run.
-- `fx-if` — context-conditional visibility: `fx-if="field"` (truthy check) or `fx-if='{"field":"f","op":"eq|neq|gt|lt|gte|lte","value":...}'` — `crates/foster-client/src/lib.rs`.
-- `fx-animate` — timed CSS class on state enter: `fx-animate="state:class:ms"`, `*` for any state — `crates/foster-client/src/lib.rs`.
-- Sessions per tab (Web Locks slots on a localStorage base; `?session=` first; `meta foster-session=browser` to share) and `fx-url` — `crates/foster-client/src/{lib,url}.rs`.
-- `GET /debug/benchmark` — BFS walk of machine graph in-memory; reports full-snapshot vs JSON Patch bytes per transition and overall ratio — `crates/foster-server/src/lib.rs`.
-- `fx-enter` — fire machine event on state entry: `fx-enter="state:event"` space-separated specs; `*` fires on any transition. Max 3 levels of chaining to prevent loops — `crates/foster-client/src/lib.rs`.
-- `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
-- Local machines: `.local()` / `.persist()` / `.merge()` on `MachineBuilder`, `LocalMachineDef` in `foster-core`; server embeds `#fx-local-machines` and excludes them from routes; client runs them with `localStorage` persistence — `crates/foster-{core,server,client}/src/`.
-- `fx-on="visible->event"` (IntersectionObserver, fires once) and `fx-on="click@outside->event"` triggers — `crates/foster-client/src/lib.rs`.
-- `fx-on="enter->…"` (repeating reading-line trigger) and cross-machine `fx-on="…->machine:event"` — `crates/foster-{core,client}/src/`.
-- `fx-widget` — lazy-loaded app modules (WebGL etc.) with `mount`/`update` hooks; `import()` via a wasm-bindgen `inline_js` snippet — `crates/foster-client/src/lib.rs`.
-- `.step()` list-navigation transitions (`LocalReduce::Step`, `step_list`) — `crates/foster-core/src/machine.rs`.
-- Shared machines + `Foster::feed` / `Foster::request_event` — `crates/foster-{core,server}/src/`.
-- Multiplexed SSE: `/events?subs=…`; the client opens one stream per page instead of one per machine (HTTP/1.1 caps browsers at 6 connections per host) — `crates/foster-{server,client}/src/lib.rs`.
-- `fx-bind-attr` `item:` source (per `fx-for` item) and `style.<prop>` targets — `crates/foster-client/src/lib.rs`.
-- Effects: `Foster::effect(machine, event, handler)` — async server work after a transition, reporting back via `Effect::send` into the same session — `crates/foster-server/src/lib.rs`.
-- `fx-on` grammar in `foster-core` (`parse_fx_on` / `FxOn`, shared by validation and client): several bindings per element, `keydown.Key` filters — `crates/foster-core/src/fx_on.rs`. Hand-written spec: `examples/kanban/tests/keys.spec.ts`.
-- `fx-copy` clipboard attribute — `crates/foster-client/src/lib.rs`.
-- `Foster::identity` — 401 gate + per-user session scoping; identity passed to effects and request events — `crates/foster-server/src/lib.rs`.
-- Size-optimized `foster-client` release profile (`opt-level = "z"`, LTO, 1 codegen unit) — `crates/foster-client/Cargo.toml`.
-- `check.sh` per-step timing: prints elapsed seconds after each of cargo check / cargo test / gen_tests steps, and total at end.
-- `foster_testgen::summary(machine)` — one-line coverage string: `"{id}  N states  M transitions  all edges covered"` — called from all gen_tests.rs binaries.
-- `form` example: multi-step conference registration (5 states, 11 transitions) showcasing `fx-if` validation + `fx-optimistic`. Validate self-transitions always succeed and set error fields; advance transitions return `MachineError` when step not valid — port 3007.
-- `collab` example: real-time voting poll via Redis pub/sub — open state votes update all tabs instantly via SSE; poll can be closed (shows ranked results) and reset — port 3008. Requires Redis: `docker compose up -d redis`. `docker-compose.yml` at repo root.
-- `form` and `collab` added to workspace `Cargo.toml`, `scripts/demo.sh`, and `scripts/gen-tests.sh`.
-
-## Security invariants — do not break
-
-- **All state transitions go through `machine.send()`** — never mutate `MachineInstance` directly
-- **`POST /test/state` is debug-only** — gated by `cfg(debug_assertions)` or `FOSTER_TEST_MODE=1`; do not widen this
-- **Session keys are random UUIDs** — do not add any endpoint that accepts a user-supplied session ID without validation
-- **With `Foster::identity` set, every per-session store key goes through `AppState::session(machine, requested, who)`** — never use a client-supplied session ID as a store key directly, or users can address each other's sessions
-- **Schema validation runs on both `send()` and `restore()`** — do not add a path that bypasses it
+- State changes only through transitions (`machine.send()` via `fire()`).
+- `POST /test/state` and `/debug/history` only in debug mode.
+- With `identity`, every per-session store key goes through
+  `AppState::session(machine, requested, who)` — a client-supplied session ID
+  is never a key on its own, so users can't address each other's sessions.
+- Session IDs from the client are just names within the user's own space;
+  they're not authentication.

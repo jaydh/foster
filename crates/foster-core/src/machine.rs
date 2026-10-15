@@ -1,5 +1,4 @@
 use crate::snapshot::Snapshot;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,10 +13,6 @@ pub enum MachineError {
     InvalidTransition { state: String, event: String },
     #[error("reducer failed: {0}")]
     ReducerError(String),
-    #[error("context schema violation in state '{state}': {message}")]
-    SchemaViolation { state: String, message: String },
-    #[error("context parse error: {0}")]
-    ContextParse(String),
 }
 
 type ReducerFn = Arc<dyn Fn(Value, Value) -> Result<Value, MachineError> + Send + Sync>;
@@ -144,7 +139,6 @@ pub struct Machine {
     /// state_name → event_name → TransitionDef
     pub(crate) states: HashMap<String, HashMap<String, TransitionDef>>,
     /// Optional JSON Schema per state, validated on every state entry.
-    pub(crate) state_schemas: HashMap<String, Value>,
     /// Optional HTML template.  When present, `foster_server::router` serves it at `GET /`
     /// and validates all `fx-show` / `fx-on` attributes at startup.
     pub template: Option<String>,
@@ -479,7 +473,6 @@ pub struct MachineBuilder {
     initial_state: String,
     initial_context: Value,
     states: HashMap<String, HashMap<String, TransitionDef>>,
-    state_schemas: HashMap<String, Value>,
     template: Option<String>,
     local: bool,
     persist: bool,
@@ -500,7 +493,6 @@ impl MachineBuilder {
             initial_state,
             initial_context,
             states,
-            state_schemas: HashMap::new(),
             template: None,
             local: false,
             persist: false,
@@ -511,12 +503,6 @@ impl MachineBuilder {
     /// Declare a state node.  Idempotent — safe to call even if transitions already registered it.
     pub fn state(mut self, name: impl Into<String>) -> Self {
         self.states.entry(name.into()).or_default();
-        self
-    }
-
-    /// Attach a JSON Schema to a state.  Validated on every entry via `send` or `restore`.
-    pub fn schema(mut self, state: impl Into<String>, schema: Value) -> Self {
-        self.state_schemas.insert(state.into(), schema);
         self
     }
 
@@ -612,7 +598,7 @@ impl MachineBuilder {
     /// Register a transition with a reducer.
     ///
     /// Accepts named `fn` pointers and non-capturing closures.
-    /// For typed context structs use `.typed_on()`.  For passthrough use `.pass()`.
+    /// For passthrough use `.pass()`.
     pub fn on(
         mut self,
         from: impl Into<String>,
@@ -645,33 +631,9 @@ impl MachineBuilder {
         self
     }
 
-    /// Register a transition with a typed-context reducer.
-    ///
-    /// The reducer receives a deserialized `Ctx` struct and returns an updated one.
-    /// Serialization round-trips are handled automatically; a failure is reported as
-    /// `MachineError::ContextParse`.
-    pub fn typed_on<Ctx>(
-        self,
-        from: impl Into<String>,
-        event: impl Into<String>,
-        to: impl Into<String>,
-        reduce: fn(Ctx, Value) -> Result<Ctx, MachineError>,
-    ) -> Self
-    where
-        Ctx: Serialize + DeserializeOwned + Send + Sync + 'static,
-    {
-        self.on(from, event, to, move |ctx: Value, payload: Value| {
-            let typed: Ctx = serde_json::from_value(ctx)
-                .map_err(|e| MachineError::ContextParse(e.to_string()))?;
-            let result = reduce(typed, payload)?;
-            serde_json::to_value(result)
-                .map_err(|e| MachineError::ContextParse(e.to_string()))
-        })
-    }
-
     /// # Panics
-    /// For a `.local()` machine with a Rust-reducer edge (`.on()` / `.typed_on()`)
-    /// or a `.schema()` — neither can run in the browser.
+    /// For a `.local()` machine with a Rust-reducer edge (`.on()`), which
+    /// can't run in the browser.
     pub fn build(mut self) -> Arc<Machine> {
         assert!(
             !(self.local && self.shared),
@@ -689,11 +651,6 @@ impl MachineBuilder {
                     );
                 }
             }
-            assert!(
-                self.state_schemas.is_empty(),
-                "local machine '{}': .schema() isn't supported on local machines",
-                self.id,
-            );
             // Targets with no outgoing edges must still exist as states, so the
             // client can validate a persisted/server-rendered state against them.
             let targets: Vec<String> =
@@ -707,7 +664,6 @@ impl MachineBuilder {
             initial_state: self.initial_state,
             initial_context: self.initial_context,
             states: self.states,
-            state_schemas: self.state_schemas,
             template: self.template,
             local: self.local,
             persist: self.persist,
@@ -753,7 +709,6 @@ impl MachineInstance {
             None => Arc::clone(&self.context),
         };
 
-        validate_context(&self.machine, &def.target, &next_context)?;
 
         self.current_state = def.target.clone();
         self.context = next_context;
@@ -779,7 +734,6 @@ impl MachineInstance {
             return Err(MachineError::UnknownState(snap.state));
         }
 
-        validate_context(&self.machine, &snap.state, &snap.context)?;
 
         self.current_state = snap.state;
         self.context = snap.context;
@@ -801,120 +755,11 @@ impl MachineInstance {
     }
 }
 
-// ── Schema validation ─────────────────────────────────────────────────────────
-
-fn validate_context(machine: &Machine, state: &str, context: &Value) -> Result<(), MachineError> {
-    if let Some(schema) = machine.state_schemas.get(state) {
-        validate_schema(schema, context).map_err(|msg| MachineError::SchemaViolation {
-            state: state.to_string(),
-            message: msg,
-        })?;
-    }
-    Ok(())
-}
-
-fn validate_schema(schema: &Value, instance: &Value) -> Result<(), String> {
-    if let Some(ty) = schema.get("type").and_then(Value::as_str) {
-        let ok = match ty {
-            "object"  => instance.is_object(),
-            "array"   => instance.is_array(),
-            "string"  => instance.is_string(),
-            "number"  => instance.is_number(),
-            "integer" => instance.is_i64() || instance.is_u64(),
-            "boolean" => instance.is_boolean(),
-            "null"    => instance.is_null(),
-            _ => true,
-        };
-        if !ok {
-            return Err(format!("expected type '{ty}' but got {}", type_name(instance)));
-        }
-    }
-
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for key in required {
-            if let Some(k) = key.as_str() {
-                if instance.get(k).is_none() {
-                    return Err(format!("missing required field '{k}'"));
-                }
-            }
-        }
-    }
-
-    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-        for (key, sub_schema) in props {
-            if let Some(val) = instance.get(key) {
-                validate_schema(sub_schema, val).map_err(|e| format!("{key}: {e}"))?;
-            }
-        }
-    }
-
-    if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
-        if let Some(n) = instance.as_f64() {
-            if n < min {
-                return Err(format!("{n} is less than minimum {min}"));
-            }
-        }
-    }
-    if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
-        if let Some(n) = instance.as_f64() {
-            if n > max {
-                return Err(format!("{n} is greater than maximum {max}"));
-            }
-        }
-    }
-
-    if let Some(min_len) = schema.get("minLength").and_then(Value::as_u64) {
-        if let Some(s) = instance.as_str() {
-            if (s.len() as u64) < min_len {
-                return Err(format!("string length {} < minLength {min_len}", s.len()));
-            }
-        }
-    }
-    if let Some(max_len) = schema.get("maxLength").and_then(Value::as_u64) {
-        if let Some(s) = instance.as_str() {
-            if (s.len() as u64) > max_len {
-                return Err(format!("string length {} > maxLength {max_len}", s.len()));
-            }
-        }
-    }
-
-    if let Some(variants) = schema.get("enum").and_then(Value::as_array) {
-        if !variants.contains(instance) {
-            return Err(format!("{instance} is not one of the allowed enum values"));
-        }
-    }
-
-    Ok(())
-}
-
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null      => "null",
-        Value::Bool(_)   => "boolean",
-        Value::Number(n) => if n.is_i64() || n.is_u64() { "integer" } else { "number" },
-        Value::String(_) => "string",
-        Value::Array(_)  => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use crate::machine_graph;
 
-    // Generate typed enums used by machine_graph tests below.
-    machine_graph! {
-        id: "test_counter",
-        initial: "idle",
-        states: ["idle", "error"],
-        transitions: [
-            ("idle",  "increment", "idle"),
-            ("idle",  "break_it",  "error"),
-            ("error", "recover",   "idle"),
-        ]
-    }
 
     fn counter_machine() -> Arc<Machine> {
         MachineBuilder::new("counter", "idle", json!({ "count": 0 }))
@@ -1007,80 +852,6 @@ mod tests {
         assert!(triples.contains(&("idle", "increment", "idle")));
         assert!(triples.contains(&("idle", "break_it", "error")));
         assert!(triples.contains(&("error", "recover", "idle")));
-    }
-
-    #[test]
-    fn schema_rejects_invalid_context() {
-        let machine = MachineBuilder::new("m", "ready", json!({ "count": 0 }))
-            .schema("ready", json!({
-                "type": "object",
-                "required": ["count"],
-                "properties": { "count": { "type": "integer", "minimum": 0 } }
-            }))
-            .on("ready", "tick", "ready", |ctx, _| {
-                Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-            })
-            .build();
-
-        let mut inst = MachineInstance::new(machine);
-        assert!(inst.send("tick", json!(null)).is_ok());
-
-        let bad_snap = Snapshot {
-            machine_id: "m".into(),
-            state: "ready".into(),
-            context: json!({ "count": -1 }).into(),
-            version: 0,
-            last_event: None,
-        };
-        assert!(inst.restore(bad_snap).is_err());
-    }
-
-    #[test]
-    fn schema_allows_valid_context() {
-        let machine = MachineBuilder::new("m", "ready", json!({ "count": 0 }))
-            .schema("ready", json!({
-                "type": "object",
-                "required": ["count"],
-                "properties": { "count": { "type": "integer", "minimum": 0 } }
-            }))
-            .on("ready", "tick", "ready", |ctx, _| {
-                Ok(json!({ "count": ctx["count"].as_i64().unwrap_or(0) + 1 }))
-            })
-            .build();
-
-        let mut inst = MachineInstance::new(machine);
-        let good_snap = Snapshot {
-            machine_id: "m".into(),
-            state: "ready".into(),
-            context: json!({ "count": 5 }).into(),
-            version: 10,
-            last_event: None,
-        };
-        assert!(inst.restore(good_snap).is_ok());
-        assert_eq!(inst.version, 11);
-    }
-
-    #[test]
-    fn typed_on_reduces_typed_context() {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Serialize, Deserialize, Clone)]
-        struct Ctx {
-            count: i64,
-        }
-
-        fn increment(mut ctx: Ctx, _: Value) -> Result<Ctx, MachineError> {
-            ctx.count += 1;
-            Ok(ctx)
-        }
-
-        let machine = MachineBuilder::new("typed", "idle", json!({ "count": 0 }))
-            .typed_on("idle", "increment", "idle", increment)
-            .build();
-
-        let mut inst = MachineInstance::new(machine);
-        let snap = inst.send("increment", json!(null)).unwrap();
-        assert_eq!(snap.context["count"], 1);
     }
 
     #[test]
@@ -1196,29 +967,6 @@ mod tests {
 
         assert!(theme.validate_in(html).is_ok());
         assert!(nav.validate_in(html).is_ok());
-    }
-
-    // ── machine_graph! macro tests ──────────────────────────────────────────
-
-    #[test]
-    fn machine_graph_state_as_str() {
-        assert_eq!(TestCounterState::Idle.as_str(),  "idle");
-        assert_eq!(TestCounterState::Error.as_str(), "error");
-    }
-
-    #[test]
-    fn machine_graph_event_as_str() {
-        assert_eq!(TestCounterEvent::Increment.as_str(), "increment");
-        assert_eq!(TestCounterEvent::BreakIt.as_str(),   "break_it");
-        assert_eq!(TestCounterEvent::Recover.as_str(),   "recover");
-    }
-
-    #[test]
-    fn machine_graph_enum_copy_and_eq() {
-        let s = TestCounterState::Idle;
-        let s2 = s; // Copy
-        assert_eq!(s, s2);
-        assert_ne!(TestCounterState::Idle, TestCounterState::Error);
     }
 
     // ── valid_events and last_event tests ────────────────────────────────────
@@ -1348,12 +1096,6 @@ mod tests {
             .on("a", "go", "a", |c, _| Ok(c))
             .local()
             .build();
-    }
-
-    #[test]
-    #[should_panic(expected = ".schema() isn't supported")]
-    fn local_build_rejects_schemas() {
-        lightbox().schema("open", json!({"type": "object"})).local().build();
     }
 
     #[test]

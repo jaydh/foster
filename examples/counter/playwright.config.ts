@@ -7,6 +7,8 @@ export default defineConfig({
     baseURL        : 'http://localhost:3000',
     // Keeps the browser open long enough to see what happened on failure.
     actionTimeout  : 5_000,
+    // PW_CHANNEL=chrome uses the system Chrome instead of Playwright's own.
+    channel        : process.env.PW_CHANNEL || undefined,
   },
   // Run against a locally started server.  Adjust command/port as needed.
   webServer: {

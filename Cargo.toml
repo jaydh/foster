@@ -1,19 +1,8 @@
 [workspace]
 members = [
-    "crates/foster-macros",
     "crates/foster-core",
     "crates/foster-server",
-    "crates/foster-testgen",
     "examples/counter",
-    "examples/player",
-    "examples/kanban",
-    "examples/aura",
-    "examples/checkout",
-    "examples/plane",
-    "examples/notion",
-    "examples/form",
-    "examples/collab",
-    "examples/jaydanhoward",
 ]
 # foster-client is wasm-only — build it separately with wasm-pack
 exclude = ["crates/foster-client"]

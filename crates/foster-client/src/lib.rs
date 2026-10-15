@@ -425,8 +425,6 @@ async fn bootstrap() {
         url::bind(&document, &root, &machine_id, &effective_session, &cache_key);
         attach_triggers(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
-        #[cfg(debug_assertions)]
-        mount_overlay(&document, &root, &machine_id, &effective_session);
 
         subs.push(Sub { key: format!("{machine_id}@{effective_session}"), root, machine_id, session_id: effective_session, cache_key });
     }
@@ -454,7 +452,6 @@ async fn bootstrap() {
                 // Use _if_newer so a concurrent inject (version ≥ 1 after the
                 // restore() bump) is not clobbered by this v0 initial response.
                 apply_snapshot_if_newer(&document, &sub.root, &snap);
-                update_debug(&document, &sub.root, &snap);
             }
             Err(e) => web_sys::console::error_1(&e),
         }
@@ -575,20 +572,17 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> Strin
 
 /// Every render pass for `snap`. Lists first, so `$view` bindings see this
 /// render's rows. `fresh`: a new snapshot (vs. a list view's re-render),
-/// which also runs `fx-animate` and tells widgets.
+/// which also tells widgets and the URL binding.
 fn render(document: &Document, root: &Element, snap: &Snapshot, fresh: bool) {
     apply_fx_for(document, root, &snap.context);
     apply_fx_show(root, &snap.state);
     apply_fx_if(root, &snap.context);
     apply_fx_text(root, &snap.context);
-    apply_fx_disable(root, &snap.state);
-    apply_fx_state_label(root, &snap.state);
     apply_fx_value(root, &snap.state, &snap.context);
     apply_fx_class(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
     view::render(document, root, &snap.context);
     if fresh {
-        apply_fx_animate(root, &snap.state);
         notify_widgets(root, snap);
         url::follow(document, root, &snap.context);
     }
@@ -630,34 +624,12 @@ fn apply_snapshot_if_newer(document: &Document, root: &Element, snap: &Snapshot)
         .unwrap_or(0);
     if snap.version >= current {
         let prev = apply_snapshot(document, root, snap);
-        update_debug(document, root, snap);
         Some(prev)
     } else {
         None
     }
 }
 
-// ── fx-enter — fire machine events on state entry ─────────────────────────────
-//
-// `fx-enter="loading:begin_fetch confirmed:celebrate"` fires machine events
-// when the machine enters the listed states.  Use `*` to fire on any transition.
-// Placed on any element inside the machine root.
-
-fn collect_enter_events(root: &Element, prev_state: &str, new_state: &str) -> Vec<String> {
-    if prev_state == new_state { return vec![]; }
-    let mut events = vec![];
-    for el in self_and_descendants(root, "[fx-enter]") {
-        let attr = el.get_attribute("fx-enter").unwrap_or_default();
-        for spec in attr.split_whitespace() {
-            if let Some((state, event)) = spec.split_once(':') {
-                if state == new_state || state == "*" {
-                    events.push(event.to_string());
-                }
-            }
-        }
-    }
-    events
-}
 
 // ── attribute processors ─────────────────────────────────────────────────────
 
@@ -731,25 +703,6 @@ fn apply_fx_text(root: &Element, ctx: &Value) {
                 el.set_text_content(Some(&text));
             }
         }
-    }
-}
-
-fn apply_fx_disable(root: &Element, state: &str) {
-    let els = render_targets(root, "[fx-disable]");
-    for el in els {
-        let attr = el.get_attribute("fx-disable").unwrap_or_default();
-        if attr.split(',').any(|s| s.trim() == state) {
-            el.set_attribute("disabled", "").unwrap();
-        } else {
-            el.remove_attribute("disabled").unwrap();
-        }
-    }
-}
-
-fn apply_fx_state_label(root: &Element, state: &str) {
-    let els = render_targets(root, "[fx-state-label]");
-    for el in els {
-        el.set_text_content(Some(state));
     }
 }
 
@@ -916,39 +869,6 @@ fn cmp_nums(a: &Value, b: &Value) -> i32 {
     fa.partial_cmp(&fb).map(|o| o as i32).unwrap_or(0)
 }
 
-/// `fx-animate="state:css-class:duration_ms"` — add a CSS class for a fixed
-/// duration whenever the machine enters the given state.  Multiple space-separated
-/// specs are supported.  Use `*` as the state to animate on every transition.
-///
-/// Example: `fx-animate="error:shake:400 confirmed:pop-in:600"`
-fn apply_fx_animate(root: &Element, state: &str) {
-    let window = match web_sys::window() { Some(w) => w, None => return };
-    let els = render_targets(root, "[fx-animate]");
-    for el in els {
-        let attr = el.get_attribute("fx-animate").unwrap_or_default();
-        for spec in attr.split_whitespace() {
-            let parts: Vec<&str> = spec.splitn(3, ':').collect();
-            let (target, class, ms) = match parts.len() {
-                3 => (parts[0], parts[1], parts[2].parse::<i32>().unwrap_or(300)),
-                2 => (parts[0], parts[1], 300i32),
-                _ => continue,
-            };
-            if target != "*" && target != state { continue; }
-            let cl = el.class_list();
-            let _ = cl.add_1(class);
-            let class_owned = class.to_string();
-            let el_clone = el.clone();
-            let cb = Closure::once(move || {
-                let _ = el_clone.class_list().remove_1(&class_owned);
-            });
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                cb.as_ref().unchecked_ref(), ms,
-            );
-            cb.forget();
-        }
-    }
-}
-
 fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
     let containers = self_and_descendants(root, "[fx-for]");
     for container in containers {
@@ -958,18 +878,9 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
             continue;
         };
 
-        let where_filter: Option<serde_json::Map<String, Value>> = container
-            .get_attribute("fx-where")
-            .and_then(|s| serde_json::from_str(&s).ok());
 
         let array: Vec<Value> = full_array
             .iter()
-            .filter(|item| match &where_filter {
-                None => true,
-                Some(filter) => filter
-                    .iter()
-                    .all(|(k, v)| item.get(k).map(|iv| iv == v).unwrap_or(false)),
-            })
             .cloned()
             .collect();
 
@@ -1172,11 +1083,9 @@ fn bound_event(el: &Element, trigger: &str) -> Option<String> {
     fx_on_bindings(el).into_iter().find(|b| b.scope.is_none() && b.matches(trigger, None)).map(|b| b.event)
 }
 
-/// Fire `machine_event` (from `fx_on_el`'s trigger) and apply the result,
-/// including `fx-optimistic` and up to three levels of `fx-enter` chaining.
+/// Fire `machine_event` (from `fx_on_el`'s trigger) and apply the result.
 fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &str, session_id: &str, cache_key: &str, machine_event: String) {
     let payload          = build_payload(fx_on_el, root);
-    let optimistic_state = fx_on_el.get_attribute("fx-optimistic");
     let mid              = machine_id.to_string();
     let sid              = session_id.to_string();
     let ck               = cache_key.to_string();
@@ -1184,37 +1093,13 @@ fn fire(document: &Document, root: &Element, fx_on_el: &Element, machine_id: &st
     let doc_clone        = document.clone();
 
     spawn_local(async move {
-        // fx-optimistic: paint expected state immediately before the round-trip.
-        // Pointless for local machines, which answer synchronously.
-        if let Some(ref opt) = optimistic_state.filter(|_| !is_local(&ck)) {
-            let fake = Snapshot {
-                machine_id: mid.clone(),
-                state:      opt.clone(),
-                version:    0,          // real response will overwrite
-                last_event: None,
-                context:    load_context(&ck).into(),
-            };
-            apply_snapshot(&doc_clone, &root_clone, &fake);
-        }
-
         match dispatch(&mid, &machine_event, payload, &sid, &ck).await {
             Ok(Some(snap)) => {
                 // A server effect can answer over SSE before this response
                 // arrives (`open` → effect → `loaded` pushed at v2, while the
                 // response still carries v1): don't let the older snapshot
                 // overwrite the newer one.
-                let Some(prev) = apply_snapshot_if_newer(&doc_clone, &root_clone, &snap) else { return };
-                // fx-enter: fire follow-up events triggered by state entry.
-                for ev in collect_enter_events(&root_clone, &prev, &snap.state) {
-                    if let Ok(Some(s2)) = dispatch(&mid, &ev, serde_json::json!({}), &sid, &ck).await {
-                        let Some(prev2) = apply_snapshot_if_newer(&doc_clone, &root_clone, &s2) else { continue };
-                        for ev2 in collect_enter_events(&root_clone, &prev2, &s2.state) {
-                            if let Ok(Some(s3)) = dispatch(&mid, &ev2, serde_json::json!({}), &sid, &ck).await {
-                                apply_snapshot_if_newer(&doc_clone, &root_clone, &s3);
-                            }
-                        }
-                    }
-                }
+                apply_snapshot_if_newer(&doc_clone, &root_clone, &snap);
             }
             Ok(None) => {}
             Err(e) => web_sys::console::error_1(&e),
@@ -1468,24 +1353,10 @@ fn open_sse(document: Document, routes: std::rc::Rc<HashMap<String, Sub>>, failu
             // take it even if its version is lower than what's shown, which happens
             // when the server dropped an idle session (or restarted) and the
             // instance started over.
-            let applied = if name == "snapshot" {
-                let prev = apply_snapshot(&document, &sub.root, &snap);
-                update_debug(&document, &sub.root, &snap);
-                Some(prev)
+            if name == "snapshot" {
+                apply_snapshot(&document, &sub.root, &snap);
             } else {
-                apply_snapshot_if_newer(&document, &sub.root, &snap)
-            };
-            if let Some(prev) = applied {
-                let (root, doc, mid, sid, ck) = (sub.root.clone(), document.clone(), sub.machine_id.clone(), sub.session_id.clone(), sub.cache_key.clone());
-                let new_state = snap.state.clone();
-                spawn_local(async move {
-                    for ev in collect_enter_events(&root, &prev, &new_state) {
-                        if let Ok(s2) = send_transition(&mid, &ev, serde_json::json!({}), &sid, &ck).await {
-                            apply_snapshot(&doc, &root, &s2);
-                            update_debug(&doc, &root, &s2);
-                        }
-                    }
-                });
+                apply_snapshot_if_newer(&document, &sub.root, &snap);
             }
         });
         es.add_event_listener_with_callback(name, cb.as_ref().unchecked_ref()).unwrap();
@@ -1694,214 +1565,6 @@ fn val_to_string(v: &Value) -> String {
         other => other.to_string(),
     }
 }
-
-fn update_debug(document: &Document, root: &Element, snap: &Snapshot) {
-    #[cfg(debug_assertions)]
-    update_overlay(document, root, snap);
-    #[cfg(not(debug_assertions))]
-    let _ = (document, root, snap);
-}
-
-// ── dev overlay (debug builds only) ──────────────────────────────────────────
-// CSS is served by foster-server (in the HTML before WASM runs) so there's no
-// render-cycle flash. The WASM creates the panel DOM and wires all event handlers.
-
-#[cfg(debug_assertions)]
-fn read_machine_states(machine_id: &str) -> Vec<String> {
-    let global = js_sys::global();
-    let Ok(machines) = js_sys::Reflect::get(&global, &JsValue::from_str("__FOSTER_MACHINES"))
-    else {
-        return vec![];
-    };
-    if machines.is_undefined() || machines.is_null() {
-        return vec![];
-    }
-    let Ok(states) = js_sys::Reflect::get(&machines, &JsValue::from_str(machine_id)) else {
-        return vec![];
-    };
-    if !js_sys::Array::is_array(&states) {
-        return vec![];
-    }
-    js_sys::Array::from(&states)
-        .iter()
-        .filter_map(|v| v.as_string())
-        .collect()
-}
-
-/// Mount the debug overlay panel for one `[fx-machine]` root.
-///
-/// The panel ID incorporates both the machine name and the effective session so
-/// that two instances of the same machine on the same page (`fx-machine="counter#1"`
-/// and `fx-machine="counter#2"`) each get their own independent panel.
-/// The panel ID is also stamped as `data-fx-panel` on the root so that
-/// `update_overlay` can find the right panel when a snapshot arrives.
-#[cfg(debug_assertions)]
-fn mount_overlay(document: &Document, root: &Element, machine_id: &str, session_id: &str) {
-    // Replace '.' (fragment separator) with '-' for a CSS-safe element ID.
-    let safe_session = session_id.replace('.', "-");
-    let panel_id = format!("fx-dbg-{machine_id}-{safe_session}");
-
-    if document.get_element_by_id(&panel_id).is_some() {
-        return;
-    }
-
-    // Stamp so update_overlay can route snapshot updates to the right panel.
-    let _ = root.set_attribute("data-fx-panel", &panel_id);
-
-    let states = read_machine_states(machine_id);
-    let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
-    let options_html: String = states.iter()
-        .map(|s| format!("<option>{s}</option>"))
-        .collect();
-
-    let enc_machine = percent_encode(machine_id);
-    let enc_session = percent_encode(session_id);
-
-    let panel = document.create_element("div").unwrap();
-    panel.set_id(&panel_id);
-    panel.set_attribute("class", "fx-dbg").unwrap();
-    panel.set_inner_html(&format!(
-        "<div class=\"fx-dbg-head\">\
-          <span style=\"color:#4a9eff;font-weight:bold\">Foster</span>\
-          <span style=\"flex:1;color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis\" title=\"{session_id}\"> {short_sid}\u{2026}</span>\
-          <button class=\"fx-dbg-ctrl fx-dbg-mn\">\u{2014}</button>\
-          <button class=\"fx-dbg-ctrl fx-dbg-cl\">\u{d7}</button>\
-        </div>\
-        <div class=\"fx-dbg-body\">\
-          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">machine</span><span>{machine_id}</span></div>\
-          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">state</span><span class=\"fx-dbg-st\">\u{2014}</span></div>\
-          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">version</span><span class=\"fx-dbg-ver\">\u{2014}</span></div>\
-          <div class=\"fx-dbg-row\"><span class=\"fx-dbg-key\">event</span><span class=\"fx-dbg-ev\" style=\"color:#aaa\">\u{2014}</span></div>\
-          <div class=\"fx-dbg-jump\">\
-            <select class=\"fx-dbg-sel\">{options_html}</select>\
-            <button class=\"fx-dbg-go\">\u{2192}</button>\
-          </div>\
-          <div class=\"fx-dbg-links\">\
-            <a href=\"/debug/graph?machine={enc_machine}&session={enc_session}\" target=\"_blank\">graph \u{2197}</a>\
-            <a href=\"/debug/timeline?machine={enc_machine}&session={enc_session}\" target=\"_blank\">timeline \u{2197}</a>\
-          </div>\
-        </div>"
-    ));
-
-    let minimized = web_sys::window()
-        .and_then(|w| w.session_storage().ok().flatten())
-        .and_then(|s| s.get_item("fx-dbg-min").ok().flatten())
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if minimized {
-        panel.class_list().add_1("min").unwrap();
-        if let Some(btn) = panel.query_selector(".fx-dbg-mn").ok().flatten() {
-            btn.set_text_content(Some("\u{25a1}"));
-        }
-    }
-
-    // Minimize
-    let panel_mn = panel.clone();
-    let mn_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
-        let minimized = panel_mn.class_list().toggle("min").unwrap_or(false);
-        if let Some(btn) = panel_mn.query_selector(".fx-dbg-mn").ok().flatten() {
-            btn.set_text_content(Some(if minimized { "\u{25a1}" } else { "\u{2014}" }));
-        }
-        if let Some(s) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
-            let _ = s.set_item("fx-dbg-min", if minimized { "1" } else { "0" });
-        }
-    });
-    if let Some(btn) = panel.query_selector(".fx-dbg-mn").ok().flatten() {
-        btn.add_event_listener_with_callback("click", mn_cb.as_ref().unchecked_ref()).unwrap();
-    }
-    mn_cb.forget();
-
-    // Close
-    let panel_cl = panel.clone();
-    let cl_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
-        panel_cl.remove();
-    });
-    if let Some(btn) = panel.query_selector(".fx-dbg-cl").ok().flatten() {
-        btn.add_event_listener_with_callback("click", cl_cb.as_ref().unchecked_ref()).unwrap();
-    }
-    cl_cb.forget();
-
-    // Jump to state
-    let panel_go = panel.clone();
-    let mid_go = machine_id.to_string();
-    let sid_go = session_id.to_string();
-    let go_cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |_: web_sys::Event| {
-        let target_state = panel_go
-            .query_selector(".fx-dbg-sel").ok().flatten()
-            .and_then(|el| el.dyn_into::<web_sys::HtmlSelectElement>().ok())
-            .map(|s| s.value())
-            .unwrap_or_default();
-        if target_state.is_empty() { return; }
-
-        let last_ctx: Value = panel_go
-            .get_attribute("data-fx-last-ctx")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(Value::Object(Default::default()));
-
-        let body = serde_json::json!({
-            "machine_id": mid_go,
-            "state": target_state,
-            "context": last_ctx,
-            "version": 0,
-        });
-        let url = format!("/test/state?session={}", sid_go);
-        let body_str = body.to_string();
-        spawn_local(async move {
-            let opts = RequestInit::new();
-            opts.set_method("POST");
-            opts.set_body(&JsValue::from_str(&body_str));
-            opts.set_mode(RequestMode::SameOrigin);
-            let Ok(req) = Request::new_with_str_and_init(&url, &opts) else { return };
-            let _ = req.headers().set("content-type", "application/json");
-            let window = web_sys::window().unwrap();
-            let _ = JsFuture::from(window.fetch_with_request(&req)).await;
-        });
-    });
-    if let Some(btn) = panel.query_selector(".fx-dbg-go").ok().flatten() {
-        btn.add_event_listener_with_callback("click", go_cb.as_ref().unchecked_ref()).unwrap();
-    }
-    go_cb.forget();
-
-    if let Some(body) = document.query_selector("body").ok().flatten() {
-        body.append_child(&panel).unwrap();
-    }
-}
-
-#[cfg(debug_assertions)]
-fn update_overlay(document: &Document, root: &Element, snap: &Snapshot) {
-    let panel_id = root.get_attribute("data-fx-panel").unwrap_or_default();
-    let Some(panel) = document.get_element_by_id(&panel_id) else { return };
-
-    if let Some(el) = panel.query_selector(".fx-dbg-st").ok().flatten() {
-        el.set_text_content(Some(&snap.state));
-    }
-    if let Some(el) = panel.query_selector(".fx-dbg-ver").ok().flatten() {
-        el.set_text_content(Some(&format!("v{}", snap.version)));
-    }
-    if let Some(el) = panel.query_selector(".fx-dbg-ev").ok().flatten() {
-        el.set_text_content(Some(snap.last_event.as_deref().unwrap_or("\u{2014}")));
-    }
-    let _ = panel.set_attribute("data-fx-last-ctx", &snap.context.to_string());
-}
-
-#[cfg(debug_assertions)]
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                use std::fmt::Write;
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
-}
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

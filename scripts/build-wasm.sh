@@ -4,7 +4,7 @@ set -euo pipefail
 # Build WASM client and place pkg/ at workspace root.
 # Usage:
 #   ./scripts/build-wasm.sh        — release build
-#   ./scripts/build-wasm.sh --dev  — debug build (enables dev overlay)
+#   ./scripts/build-wasm.sh --dev  — debug build
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$SCRIPT_DIR/.."
