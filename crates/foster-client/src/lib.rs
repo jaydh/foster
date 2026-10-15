@@ -1,3 +1,4 @@
+mod url;
 mod view;
 
 use foster_core::{LocalMachineDef, MachineError, Snapshot};
@@ -375,7 +376,7 @@ async fn bootstrap() {
     let window = web_sys::window().expect("no window");
     let document = window.document().expect("no document");
 
-    let session_id = resolve_session_id(&window);
+    let session_id = resolve_session_id(&window, &document).await;
     let local_defs = read_local_defs(&document);
 
     let mut subs: Vec<Sub> = Vec::new();
@@ -421,6 +422,7 @@ async fn bootstrap() {
 
         ROOTS.with(|r| r.borrow_mut().push((root.clone(), cache_key.clone())));
         save_for_templates(&root);
+        url::bind(&document, &root, &machine_id, &effective_session, &cache_key);
         attach_triggers(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
         #[cfg(debug_assertions)]
@@ -490,29 +492,54 @@ fn split_instance(raw: &str) -> (String, String) {
 
 // ── session ID ────────────────────────────────────────────────────────────────
 //
-// Resolution order:
-//   1. `?session=<id>` URL query param (Playwright / timeline preview pass this)
-//   2. `localStorage["foster_session"]` — survives page reloads within the origin
-//   3. Freshly generated UUID, persisted to localStorage for future loads
-//
-// localStorage is scoped per origin (protocol + host + port), so localhost:3000
-// and localhost:3001 maintain independent sessions automatically.
+// `?session=` (Playwright / the timeline preview) → else this tab's session:
+// a per-browser base (localStorage, per origin) plus the tab's slot.
 
-fn resolve_session_id(window: &web_sys::Window) -> String {
-    // 1. URL query param takes precedence (Playwright / timeline preview iframes).
-    if let Ok(search) = window.location().search() {
-        for pair in search.trim_start_matches('?').split('&') {
-            let mut parts = pair.splitn(2, '=');
-            if parts.next() == Some("session") {
-                if let Some(val) = parts.next() {
-                    if !val.is_empty() {
-                        return val.to_string();
-                    }
-                }
-            }
-        }
+/// The page's session: `?session=` if given; else, per tab, a base ID kept
+/// in localStorage plus this tab's slot (`<base>-t0` for the first open
+/// tab, `-t1` for a second one open at the same time…), so two tabs don't
+/// drive the same machines and a closed tab's server state is reused, not
+/// leaked. `<meta name="foster-session" content="browser">` shares one
+/// session between all of a browser's tabs instead.
+async fn resolve_session_id(window: &web_sys::Window, document: &Document) -> String {
+    if let Some(id) = session_param(window) {
+        return id;
     }
-    // 2 & 3. localStorage persistence.
+    let base = browser_session_id(window);
+    let shared = document
+        .query_selector("meta[name=\"foster-session\"]")
+        .ok()
+        .flatten()
+        .and_then(|m| m.get_attribute("content"))
+        .is_some_and(|c| c == "browser");
+    if shared {
+        return base;
+    }
+    if let Some(slot) = url::tab_slot().await {
+        return format!("{base}-t{slot}");
+    }
+    // No Web Locks: a per-tab suffix kept for this tab's reloads.
+    let storage = window.session_storage().ok().flatten();
+    let suffix = storage.as_ref().and_then(|s| s.get_item("foster_tab").ok().flatten()).unwrap_or_else(|| {
+        let id = gen_uuid();
+        if let Some(s) = &storage {
+            let _ = s.set_item("foster_tab", &id);
+        }
+        id
+    });
+    format!("{base}-{suffix}")
+}
+
+fn session_param(window: &web_sys::Window) -> Option<String> {
+    let search = window.location().search().ok()?;
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("session=").filter(|v| !v.is_empty()).map(String::from))
+}
+
+/// One ID per browser (localStorage), the base of each tab's session.
+fn browser_session_id(window: &web_sys::Window) -> String {
     const LS_KEY: &str = "foster_session";
     if let Ok(Some(storage)) = window.local_storage() {
         if let Ok(Some(existing)) = storage.get_item(LS_KEY) {
@@ -563,6 +590,7 @@ fn render(document: &Document, root: &Element, snap: &Snapshot, fresh: bool) {
     if fresh {
         apply_fx_animate(root, &snap.state);
         notify_widgets(root, snap);
+        url::follow(document, root, &snap.context);
     }
 }
 
@@ -1418,6 +1446,7 @@ fn open_sse(document: Document, routes: std::rc::Rc<HashMap<String, Sub>>, failu
             let snap = if name == "snapshot" {
                 let Ok(snap) = serde_json::from_value::<Snapshot>(v) else { return };
                 store_snapshot(&sub.cache_key, &snap);
+                url::on_connect(&sub.root);
                 snap
             } else {
                 let Ok(pe) = serde_json::from_value::<ContextPatch>(v) else { return };

@@ -52,6 +52,7 @@ features = [
     "Storage",
     "Window",
     "ScrollIntoViewOptions",
+    "History",
     "ScrollLogicalPosition",
 ]
 

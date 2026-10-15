@@ -360,6 +360,7 @@ All attributes processed client-side by the WASM runtime.
 | `fx-animate` | `fx-animate="error:shake:400"` | Add CSS class for N ms when entering a state |
 | `fx-enter` | `fx-enter="open:load_data"` | Fire machine event when entering listed states; `*` fires on any transition |
 | `fx-optimistic` | `fx-optimistic="done"` | Instantly render expected state before server confirms (on `fx-on` buttons) |
+| `fx-url` | `fx-url="path->open"` | On a machine root (one per page): `context[path]` ↔ URL hash; see **URL** below |
 | `fx-widget` | `fx-widget="/widgets/life/life_widget.js"` | Lazy-load an ES module (e.g. a wasm-pack `--target web` crate) within 200px of the viewport: `await default()`, then `mount(el)`; inside an `[fx-machine]`, `update(el, state, ctxJson)` gets every snapshot |
 | `fx-on="visible->…"` | `fx-on="visible->load"` | Fire once, the first time the element is ≥10% on screen |
 | `fx-on="enter->…"` | `fx-on="enter->about"` | Fire every time the element crosses the reading line (30–40% down the viewport) — scroll-spy |
@@ -401,7 +402,9 @@ All attributes processed client-side by the WASM runtime.
 
 CSS convention: `[fx-show] { display: none; }` hides showable elements before WASM loads.
 
-**Session persistence:** The WASM client stores the session ID in `localStorage["foster_session"]` so state survives page reloads. Resolution order: URL `?session=` param → localStorage → new UUID (persisted). Each origin (host + port) has an independent localStorage scope.
+**Sessions:** each tab has its own session — a per-browser base ID (`localStorage["foster_session"]`, per origin) plus the tab's slot, `<base>-t0` for the first open tab, `-t1` for a second open at the same time (Web Locks, held until the tab closes, so a closed tab's slot and server state are reused). Reloads keep it. `?session=` overrides it (Playwright, the timeline preview); `<meta name="foster-session" content="browser">` shares one session between a browser's tabs.
+
+**URL (`fx-url`):** `fx-url="path->open"` on one machine root keeps `context[path]` in the URL hash (`#/photos/2024`, each `/`-segment URI-encoded). A changed value pushes a history entry; Back/Forward and edits fire `open {path}`. On connecting — the first snapshot and every stream reconnect — the URL wins, so links and bookmarks open their value and a page whose session was dropped (or whose server restarted) returns to it.
 
 ## Playwright integration
 
@@ -466,7 +469,7 @@ No pending items — all planned features are implemented. See "Already implemen
 - `plane` and `notion` added to `gen-tests.sh` and `check.sh` gen_tests loop so their Playwright specs are regenerated on every `./scripts/check.sh` run.
 - `fx-if` — context-conditional visibility: `fx-if="field"` (truthy check) or `fx-if='{"field":"f","op":"eq|neq|gt|lt|gte|lte","value":...}'` — `crates/foster-client/src/lib.rs`.
 - `fx-animate` — timed CSS class on state enter: `fx-animate="state:class:ms"`, `*` for any state — `crates/foster-client/src/lib.rs`.
-- Session persistence — `resolve_session_id` now persists the session UUID to `localStorage["foster_session"]`; URL `?session=` still takes precedence (Playwright / timeline preview) — `crates/foster-client/src/lib.rs`.
+- Sessions per tab (Web Locks slots on a localStorage base; `?session=` first; `meta foster-session=browser` to share) and `fx-url` — `crates/foster-client/src/{lib,url}.rs`.
 - `GET /debug/benchmark` — BFS walk of machine graph in-memory; reports full-snapshot vs JSON Patch bytes per transition and overall ratio — `crates/foster-server/src/lib.rs`.
 - `fx-enter` — fire machine event on state entry: `fx-enter="state:event"` space-separated specs; `*` fires on any transition. Max 3 levels of chaining to prevent loops — `crates/foster-client/src/lib.rs`.
 - `fx-optimistic` — instant UI feedback: `fx-optimistic="expected_state"` on `fx-on` buttons renders the expected state immediately with a fake `version: 0` snapshot; real server response overwrites it — `crates/foster-client/src/lib.rs`.
