@@ -67,6 +67,10 @@ thread_local! {
     /// view name → list (its `fx-for` key) → what it shows. Several lists can
     /// share a view (a list and a grid of the same rows, one of them empty).
     static SHOWN: RefCell<HashMap<String, HashMap<String, Shown>>> = RefCell::new(HashMap::new());
+    /// view name → (the `fx-view-from` value when a step was clicked, the
+    /// row it stepped to): until the context catches up, further steps go
+    /// on from that row — a quick second ← isn't the same step again.
+    static STEPPED: RefCell<HashMap<String, (String, String)>> = RefCell::new(HashMap::new());
 }
 
 /// Run `f` on what view `name` shows: its list with the most rows.
@@ -288,29 +292,39 @@ pub fn render(document: &Document, root: &Element, ctx: &Value) {
     for el in crate::render_targets(root, "[fx-view-step]").into_iter().chain(crate::render_targets(root, "[fx-view-pos]")) {
         let spec = el.get_attribute("fx-view-step").or_else(|| el.get_attribute("fx-view-pos")).unwrap_or_default();
         let (name, by) = spec.split_once(':').map_or((spec.as_str(), 0), |(n, b)| (n, b.parse::<i64>().unwrap_or(0)));
-        let from = el.get_attribute("fx-view-from").and_then(|f| ctx.get(&f).map(text));
+        let at_ctx = el.get_attribute("fx-view-from").and_then(|f| ctx.get(&f).map(text));
+        let from = STEPPED.with(|st| {
+            let mut st = st.borrow_mut();
+            match st.get(name) {
+                Some((was, to)) if Some(was) == at_ctx.as_ref() => Some(to.clone()),
+                Some(_) => {
+                    st.remove(name);
+                    at_ctx.clone()
+                }
+                None => at_ctx.clone(),
+            }
+        });
         let wanted = el.get_attribute("fx-view-where");
-        let (pos, count, neighbour) = with_shown(name, |v| {
+        let (pos, count, neighbour, neighbour_key) = with_shown(name, |v| {
             let rows: Vec<&(String, Value)> = v
                 .map(|v| v.rows.iter().filter(|(_, it)| wanted.as_ref().is_none_or(|w| truthy(it.get(w)))).collect())
                 .unwrap_or_default();
             let at = from.as_ref().and_then(|f| rows.iter().position(|(k, _)| k == f));
-            let neighbour = at
-                .and_then(|i| usize::try_from(i as i64 + by).ok().filter(|_| by != 0))
-                .and_then(|j| rows.get(j))
-                .map(|(_, v)| v.clone());
-            (at, rows.len(), neighbour)
+            let next = at.and_then(|i| usize::try_from(i as i64 + by).ok().filter(|_| by != 0)).and_then(|j| rows.get(j));
+            (at, rows.len(), next.map(|(_, v)| v.clone()), next.map(|(k, _)| k.clone()))
         });
         if el.has_attribute("fx-view-pos") {
             el.set_text_content(Some(&pos.map_or(String::new(), |i| format!("{} of {count}", i + 1))));
             continue;
         }
-        match neighbour {
-            Some(item) => {
+        match (neighbour, neighbour_key) {
+            (Some(item), Some(key)) => {
                 let _ = el.remove_attribute("disabled");
                 let _ = el.set_attribute("data-fx-step-item", &item.to_string());
+                let _ = el.set_attribute("data-fx-step-key", &key);
+                let _ = el.set_attribute("data-fx-step-at", at_ctx.as_deref().unwrap_or(""));
             }
-            None => {
+            _ => {
                 let _ = el.set_attribute("disabled", "");
                 let _ = el.remove_attribute("data-fx-step-item");
             }
@@ -361,6 +375,16 @@ pub fn handle(event: &web_sys::Event) -> bool {
     }
     if kind == "click" {
         let shift = event.dyn_ref::<web_sys::MouseEvent>().is_some_and(|m| m.shift_key());
+        // A step was taken (its own fx-on sends the neighbour): step on from
+        // there until the context shows it.
+        if let Some(el) = closest("[fx-view-step][data-fx-step-key]") {
+            let name = el.get_attribute("fx-view-step").unwrap_or_default();
+            let name = name.split(':').next().unwrap_or_default().to_string();
+            let at = el.get_attribute("data-fx-step-at").unwrap_or_default();
+            let to = el.get_attribute("data-fx-step-key").unwrap_or_default();
+            STEPPED.with(|st| st.borrow_mut().insert(name, (at, to)));
+            return true;
+        }
         if let Some(el) = closest("[fx-view-sort]") {
             let spec = el.get_attribute("fx-view-sort").unwrap_or_default();
             let Some((name, field)) = spec.split_once(':') else { return false };
