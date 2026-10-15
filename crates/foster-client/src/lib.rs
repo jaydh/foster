@@ -1,3 +1,5 @@
+mod view;
+
 use foster_core::{LocalMachineDef, MachineError, Snapshot};
 use serde::Deserialize;
 use serde_json::Value;
@@ -151,6 +153,35 @@ fn init_local(root: &Element, raw_attr: &str, def: LocalMachineDef, cache_key: &
         )
     });
     snap
+}
+
+/// The current snapshot of a `.local()` instance.
+fn local_snapshot(cache_key: &str) -> Option<Snapshot> {
+    LOCAL.with(|l| {
+        l.borrow().get(cache_key).map(|inst| Snapshot {
+            machine_id: inst.def.id.clone(),
+            state: inst.state.clone(),
+            context: inst.context.clone().into(),
+            version: inst.version,
+            last_event: None,
+        })
+    })
+}
+
+thread_local! {
+    /// Every machine root on the page and its cache key, for re-rendering
+    /// after a list view changes (no new snapshot involved).
+    static ROOTS: RefCell<Vec<(Element, String)>> = RefCell::new(Vec::new());
+}
+
+/// Re-render every root from what it already has: a list view changed.
+fn rerender_views(document: &Document) {
+    let roots = ROOTS.with(|r| r.borrow().clone());
+    for (root, cache_key) in roots {
+        if let Some(snap) = cached(&cache_key).or_else(|| local_snapshot(&cache_key)) {
+            render(document, &root, &snap, false);
+        }
+    }
 }
 
 fn is_local(cache_key: &str) -> bool {
@@ -368,6 +399,7 @@ async fn bootstrap() {
             // Local machine: no session, no network. Per-instance key so
             // `theme#a` / `theme#b` stay independent.
             let cache_key = format!("{machine_id}:local:{raw_attr}");
+            ROOTS.with(|r| r.borrow_mut().push((root.clone(), cache_key.clone())));
             save_for_templates(&root);
             let snap = init_local(&root, &raw_attr, def, &cache_key);
             apply_snapshot(&document, &root, &snap);
@@ -387,6 +419,7 @@ async fn bootstrap() {
         // Stamp the effective session so Playwright can discover it.
         let _ = root.set_attribute("data-fx-session", &effective_session);
 
+        ROOTS.with(|r| r.borrow_mut().push((root.clone(), cache_key.clone())));
         save_for_templates(&root);
         attach_triggers(document.clone(), root.clone(), machine_id.clone(), effective_session.clone(), cache_key.clone());
 
@@ -397,6 +430,7 @@ async fn bootstrap() {
     }
 
     attach_widgets(&document);
+    attach_view_controls(&document);
 
     // One SSE stream for every server machine on the page, opened *before*
     // fetching the initial snapshots. This closes the race window where a
@@ -508,7 +542,15 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> Strin
     let prev = root.get_attribute("data-fx-state").unwrap_or_default();
     root.set_attribute("data-fx-state",   &snap.state).unwrap();
     root.set_attribute("data-fx-version", &snap.version.to_string()).unwrap();
+    render(document, root, snap, true);
+    prev
+}
 
+/// Every render pass for `snap`. Lists first, so `$view` bindings see this
+/// render's rows. `fresh`: a new snapshot (vs. a list view's re-render),
+/// which also runs `fx-animate` and tells widgets.
+fn render(document: &Document, root: &Element, snap: &Snapshot, fresh: bool) {
+    apply_fx_for(document, root, &snap.context);
     apply_fx_show(root, &snap.state);
     apply_fx_if(root, &snap.context);
     apply_fx_text(root, &snap.context);
@@ -516,11 +558,39 @@ fn apply_snapshot(document: &Document, root: &Element, snap: &Snapshot) -> Strin
     apply_fx_state_label(root, &snap.state);
     apply_fx_value(root, &snap.state, &snap.context);
     apply_fx_class(root, &snap.state);
-    apply_fx_animate(root, &snap.state);
     apply_fx_bind_attr(root, &snap.state, &snap.context);
-    apply_fx_for(document, root, &snap.context);
-    notify_widgets(root, snap);
-    prev
+    view::render(document, root, &snap.context);
+    if fresh {
+        apply_fx_animate(root, &snap.state);
+        notify_widgets(root, snap);
+    }
+}
+
+/// A context value for a binding: `$view.field` (a list view's own values,
+/// see view.rs), else `context[key]`.
+fn ctx_get(ctx: &Value, key: &str) -> Option<Value> {
+    if key.starts_with('$') {
+        view::lookup(key)
+    } else {
+        ctx.get(key).cloned()
+    }
+}
+
+/// One listener for the list-view controls on the whole page.
+fn attach_view_controls(document: &Document) {
+    let doc = document.clone();
+    let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
+        if view::handle(&event) {
+            rerender_views(&doc);
+            if event.type_() == "keydown" {
+                view::reveal_focus(&doc);
+            }
+        }
+    });
+    for ev in ["click", "input", "keydown"] {
+        let _ = document.add_event_listener_with_callback(ev, cb.as_ref().unchecked_ref());
+    }
+    cb.forget();
 }
 
 /// Only apply if the incoming version is at least as new as what's displayed.
@@ -627,8 +697,11 @@ fn apply_fx_text(root: &Element, ctx: &Value) {
     let els = render_targets(root, "[fx-text]");
     for el in els {
         let key = el.get_attribute("fx-text").unwrap_or_default();
-        if let Some(val) = ctx.get(&key) {
-            el.set_text_content(Some(&val_to_string(val)));
+        if let Some(val) = ctx_get(ctx, &key) {
+            let text = val_to_string(&val);
+            if el.text_content().as_deref() != Some(text.as_str()) {
+                el.set_text_content(Some(&text));
+            }
         }
     }
 }
@@ -661,8 +734,8 @@ fn apply_fx_value(root: &Element, state: &str, ctx: &Value) {
     let els = render_targets(root, "[fx-value]");
     for el in els {
         let key = el.get_attribute("fx-value").unwrap_or_default();
-        let Some(val) = ctx.get(&key) else { continue };
-        let text = val_to_string(val);
+        let Some(val) = ctx_get(ctx, &key) else { continue };
+        let text = val_to_string(&val);
         let stamp = format!("{state}\u{1f}{text}");
         if el.get_attribute("data-fx-value-applied").as_deref() == Some(stamp.as_str()) {
             continue;
@@ -715,7 +788,7 @@ fn apply_fx_bind_attr(root: &Element, state: &str, ctx: &Value) {
             let mut parts = pair.splitn(2, '=');
             let (Some(target), Some(source)) = (parts.next(), parts.next()) else { continue };
             if let Some(key) = source.strip_prefix("ctx:") {
-                set_bound(&el, target, ctx.get(key));
+                set_bound(&el, target, ctx_get(ctx, key).as_ref());
             } else if let Some(target_state) = source.strip_prefix("state:") {
                 let on = Value::String(String::new());
                 set_bound(&el, target, (state == target_state).then_some(&on));
@@ -782,7 +855,7 @@ fn apply_fx_if(root: &Element, ctx: &Value) {
 fn eval_condition(attr: &str, ctx: &Value) -> bool {
     if let Ok(cond) = serde_json::from_str::<Value>(attr) {
         if let (Some(field), Some(op)) = (cond["field"].as_str(), cond["op"].as_str()) {
-            let lhs = &ctx[field];
+            let lhs = &ctx_get(ctx, field).unwrap_or(Value::Null);
             let rhs = &cond["value"];
             return match op {
                 "eq"  => lhs == rhs,
@@ -795,7 +868,7 @@ fn eval_condition(attr: &str, ctx: &Value) -> bool {
             };
         }
     }
-    is_truthy(&ctx[attr])
+    is_truthy(&ctx_get(ctx, attr).unwrap_or(Value::Null))
 }
 
 fn is_truthy(val: &Value) -> bool {
@@ -875,17 +948,17 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
         let Some(template_html) = container.get_attribute("data-fx-template-html") else {
             continue;
         };
+        // A list view (`fx-view`) filters and sorts in the browser.
+        let array = view::items(&container, ctx, &array);
 
         // Skip the rebuild when the (filtered) list is unchanged since the
-        // last render — most snapshots change other keys, and tearing down
-        // and re-creating every row is the dominant client cost on pages with
-        // live-updating machines.
+        // last render — most snapshots change other keys.
         let rendered = list_fingerprint(&array);
-        if container.get_attribute("data-fx-rendered").as_deref() == Some(rendered.as_str()) {
-            continue;
+        if container.get_attribute("data-fx-rendered").as_deref() != Some(rendered.as_str()) {
+            let _ = container.set_attribute("data-fx-rendered", &rendered);
+            reconcile_rows(document, &container, &template_html, &array);
         }
-        let _ = container.set_attribute("data-fx-rendered", &rendered);
-        reconcile_rows(document, &container, &template_html, &array);
+        view::mark_rows(&container);
     }
 }
 
@@ -898,13 +971,7 @@ fn apply_fx_for(document: &Document, root: &Element, ctx: &Value) {
 /// change took most of a second on a 2,000-row list.
 fn reconcile_rows(document: &Document, container: &Element, template_html: &str, items: &[Value]) {
     let key_field = container.get_attribute("fx-key");
-    let key_of = |item: &Value, i: usize| -> String {
-        match key_field.as_deref().and_then(|f| item.get(f)) {
-            Some(Value::String(s)) => s.clone(),
-            Some(v) => v.to_string(),
-            None => format!("#{i}"),
-        }
-    };
+    let key_of = |item: &Value, i: usize| view::key_of(key_field.as_deref(), item, i);
     // Current rows by key (the key is kept on the row as data-fx-key).
     let mut existing: HashMap<String, Element> = HashMap::new();
     let mut child = container.first_element_child();
@@ -1494,6 +1561,16 @@ fn build_payload(fx_on_el: &Element, root: &Element) -> Value {
         if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&item_json) {
             for (k, v) in obj { map.entry(k).or_insert(v); }
         }
+    }
+
+    // A `fx-view-step` element carries the neighbouring row's item.
+    if let Some(Ok(Value::Object(obj))) = fx_on_el.get_attribute("data-fx-step-item").map(|s| serde_json::from_str::<Value>(&s)) {
+        for (k, v) in obj { map.insert(k, v); }
+    }
+    // Inside `fx-view-payload`: that list view's selection and focused row.
+    if let Some((selected, focused)) = view::payload(fx_on_el) {
+        map.insert("selected".into(), selected);
+        map.insert("focused".into(), focused);
     }
 
     if let Some(payload_str) = fx_on_el.get_attribute("fx-payload") {

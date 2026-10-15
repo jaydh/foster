@@ -367,6 +367,21 @@ All attributes processed client-side by the WASM runtime.
 | `fx-on="click@outside->…"` | `fx-on="click@outside->close"` | Fire on a click anywhere outside the element (close a dropdown) |
 | `fx-on="…@document->…"` | `fx-on="keydown.Escape@document->close"` | Listen on the whole document (global shortcuts; closing a dialog whatever has focus). Keyboard events typed into an input/textarea/select/contenteditable are ignored |
 
+**List views (`fx-view`)** — filter, sort, selection and ↑/↓ focus for an `fx-for` list, kept in the browser (per tab, sessionStorage): no round trip, no server state. Full reference in `crates/foster-client/src/view.rs`.
+
+| Attribute | Where | Meaning |
+|-----------|-------|---------|
+| `fx-view="files"` | the `fx-for` container (needs `fx-key`) | rows shown filtered/sorted; rows get `selected` / `focused` classes. Lists sharing a name (a list and a grid) share the view |
+| `fx-view-filter-fields="name,title"` / `fx-view-group="is_dir"` / `fx-view-reset="path epoch"` | the container | fields the filter matches (default `name`) / rows with this field truthy sort first / context fields whose change resets filter, selection and focus |
+| `fx-view-filter="files"` | an input | filter text: every word in one of the filter fields |
+| `fx-view-sort="files:field"` | a button | sort by an item field (numbers numerically, text case-insensitively); again flips direction |
+| `fx-view-select="files"` / `fx-view-select-all` / `fx-view-clear` | in a row / anywhere | toggle the row (shift: range) / all shown rows / clear |
+| `fx-view-keys="files"` | a focusable element | ↑/↓ move the focused row |
+| `fx-view-payload="files"` | an ancestor of `fx-on` elements | their events carry `selected` (keys, view order) and `focused` (the row's item or null) |
+| `fx-view-step="files:1"` + `fx-view-from="ctx field"` (+ `fx-view-where="item field"`) | a button | disabled without a neighbour; its event carries the neighbouring row's item (prev/next in a viewer). `fx-view-pos` (no step) shows "3 of 12" |
+| `fx-view-inputs="files" data-name="path"` | in a `<form>` | hidden inputs for the selected keys |
+| `$files.shown` / `total` / `selected` / `all_selected` / `filtered` / `filter` / `sort_<field>` | any binding key | the view's own values (`sort_<field>`: ▲ / ▼ / "") |
+
 **`fx-bind-attr` format:** space-separated `attr=source:value` pairs.
 - `attr=ctx:key` — set from `context[key]`; removes attr if key absent
 - Booleans follow HTML boolean attributes: `true` → present (`hidden=""`), `false`/`null` → removed (`fx-bind-attr="hidden=item:no_preview"`)

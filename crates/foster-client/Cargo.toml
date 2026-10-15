@@ -51,6 +51,8 @@ features = [
     "Response",
     "Storage",
     "Window",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
 ]
 
 # The client is DOM glue shipped to every visitor — download size matters
