@@ -899,9 +899,13 @@ where
         let live = app.pubsub.subscribe(&session, &machine);
         // No instance yet (a new session, or one dropped as idle): send the
         // initial snapshot, as /state does, so a page that had an older
-        // instance learns it started over.
+        // instance learns it started over. Not for a request-event machine:
+        // its page got a fresh instance from /state, maybe from another
+        // replica (the store is per process), and a blank one here would
+        // wipe it.
         let current = match app.store.load(&session, &machine).await {
             Some(snap) => Some(snap),
+            None if app.request_events.contains_key(&machine) => None,
             None => Some(MachineInstance::new(app.machines[&machine].clone()).snapshot()),
         };
         streams.push(
@@ -1282,6 +1286,29 @@ mod tests {
         assert_eq!((first.state.as_str(), first.context["ua"].as_str()), ("traced", Some("probe/1")));
         let second: Snapshot = rmp_serde::from_slice(&app.clone().oneshot(req()).await.unwrap().into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert!(second.version > first.version, "fresh trace on each load");
+    }
+
+    #[tokio::test]
+    async fn request_event_stream_skips_blank_initial_snapshot() {
+        // /state ran on another replica, so this one has no instance: the
+        // stream must not send a blank one that would wipe the page's.
+        let app = traced();
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/events?subs=trace@s").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let mut body = resp.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(300), body.frame()).await;
+        assert!(frame.is_err(), "no snapshot for an unstored request-event machine");
+
+        // Once traced here, a (re)connecting stream gets the stored one.
+        app.clone().oneshot(Request::builder().uri("/state?machine=trace&session=s").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.clone()
+            .oneshot(Request::builder().uri("/events?subs=trace@s").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), resp.into_body().frame())
+            .await.expect("snapshot within 2s").unwrap().unwrap();
+        let text = String::from_utf8_lossy(frame.data_ref().unwrap()).to_string();
+        assert!(text.contains(r#""state":"traced""#), "{text}");
     }
 
     #[tokio::test]

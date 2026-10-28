@@ -87,7 +87,7 @@ Foster::new(machines)
 |---|---|
 | `GET /state?machine=&session=` | current snapshot (msgpack) |
 | `POST /transition` | `{machine, event, payload, session, reply}` → snapshot, or with `reply: "patch"` (what the client sends) a JSON Patch `{base, version, patch}` |
-| `GET /events?subs=m@s,…` | SSE: a full `snapshot` per sub on connect, then `patch`es (each with `base`) |
+| `GET /events?subs=m@s,…` | SSE: a full `snapshot` per sub on connect, then `patch`es (each with `base`). A request-event machine with no instance on this process gets none (its page's came from `/state`, maybe on another replica) |
 
 ## Client (foster-client)
 
